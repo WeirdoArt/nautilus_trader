@@ -118,7 +118,7 @@ where
 ///
 /// Tardis records do not always carry a venue-provided trade ID (some venues
 /// publish empty strings or omit the field entirely). This hash combines the
-/// symbol, timestamp, price, amount and side so replayed data yields the same
+/// symbol, timestamp, price, amount, and side so replayed data yields the same
 /// identifier across runs. FNV-1a is stable across architectures and crate
 /// versions; the 0x1f delimiter keeps variable-length fields from colliding.
 #[must_use]
@@ -276,8 +276,8 @@ pub fn parse_order_side(value: &str) -> OrderSide {
 #[must_use]
 pub fn parse_aggressor_side(value: &str) -> AggressorSide {
     match value {
-        "buy" => AggressorSide::Buyer,
-        "sell" => AggressorSide::Seller,
+        "buy" => AggressorSide::Buy,
+        "sell" => AggressorSide::Sell,
         _ => AggressorSide::NoAggressor,
     }
 }
@@ -541,8 +541,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case("buy", AggressorSide::Buyer)]
-    #[case("sell", AggressorSide::Seller)]
+    #[case("buy", AggressorSide::Buy)]
+    #[case("sell", AggressorSide::Sell)]
     #[case("unknown", AggressorSide::NoAggressor)]
     #[case("", AggressorSide::NoAggressor)]
     #[case("random", AggressorSide::NoAggressor)]

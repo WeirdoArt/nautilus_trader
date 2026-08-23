@@ -46,11 +46,20 @@ pub const BINANCE_NAUTILUS_FUTURES_BROKER_ID: &str = "aHRE4BCj";
 /// Binance Spot API base URL (live exchange).
 pub const BINANCE_SPOT_HTTP_URL: &str = "https://api.binance.com";
 
+/// Binance US Spot API base URL.
+pub const BINANCE_US_SPOT_HTTP_URL: &str = "https://api.binance.us";
+
 /// Binance USD-M Futures API base URL (live exchange).
 pub const BINANCE_FUTURES_USD_HTTP_URL: &str = "https://fapi.binance.com";
 
 /// Binance COIN-M Futures API base URL (live exchange).
 pub const BINANCE_FUTURES_COIN_HTTP_URL: &str = "https://dapi.binance.com";
+
+/// Default WebSocket heartbeat interval in seconds.
+///
+/// Binance caps ping/pong frames at 5 per second, so this sits well inside the limit while keeping
+/// the derived liveness window tight.
+pub const BINANCE_WS_HEARTBEAT_SECS: u64 = 20;
 
 /// Binance European Options API base URL (live exchange).
 pub const BINANCE_OPTIONS_HTTP_URL: &str = "https://eapi.binance.com";
@@ -78,6 +87,12 @@ pub const BINANCE_FUTURES_COIN_DEMO_HTTP_URL: &str = "https://demo-dapi.binance.
 
 /// Binance Spot WebSocket base URL (live exchange).
 pub const BINANCE_SPOT_WS_URL: &str = "wss://stream.binance.com:9443/ws";
+
+/// Binance US Spot public WebSocket base URL.
+pub const BINANCE_US_SPOT_WS_URL: &str = "wss://stream.binance.us:9443/ws";
+
+/// Binance US Spot user data WebSocket root URL.
+pub const BINANCE_US_SPOT_USER_WS_URL: &str = "wss://stream.binance.us:443";
 
 /// Binance USD-M Futures WebSocket base URL (live exchange).
 pub const BINANCE_FUTURES_USD_WS_URL: &str = "wss://fstream.binance.com/market/ws";
@@ -224,22 +239,22 @@ pub const BINANCE_FAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     },
 ];
 
-/// COIN-M Futures REST limits (default IP weights).
+/// COIN-M Futures REST limits (shared with USD-M Futures).
 ///
 /// References:
-/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/general-info#limits>
+/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/Important-CM-UM-Integration-Notice#a3-um-and-cm-share-the-same-rate-limit-pools>
 pub const BINANCE_DAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::RequestWeight,
         interval: BinanceRateLimitInterval::Minute,
         interval_num: 1,
-        limit: 1_200,
+        limit: 2_400,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
         interval: BinanceRateLimitInterval::Second,
-        interval_num: 1,
-        limit: 20,
+        interval_num: 10,
+        limit: 300,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,

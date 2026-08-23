@@ -25,7 +25,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -61,7 +61,8 @@ use nautilus_model::{
     instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::{SocketState, SocketStateSink, websocket::TransportBackend};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 const PERP_MARKET_INDEX: i16 = 0;
@@ -321,12 +322,16 @@ struct ClientHarness {
 
 impl ClientHarness {
     async fn build(addr: SocketAddr) -> Self {
+        Self::build_with_state_sink(addr, None).await
+    }
+
+    async fn build_with_state_sink(addr: SocketAddr, state_sink: Option<SocketStateSink>) -> Self {
         let registry = Arc::new(MarketRegistry::new());
         let perp = perp_instrument(PERP_MARKET_INDEX, PERP_VENUE_SYMBOL, &registry);
         let second = perp_instrument(SECOND_MARKET_INDEX, SECOND_VENUE_SYMBOL, &registry);
         let spot = spot_instrument(SPOT_MARKET_INDEX, SPOT_VENUE_SYMBOL, &registry);
 
-        let mut client = LighterWebSocketClient::new(
+        let client = LighterWebSocketClient::new(
             Some(format!("ws://{addr}/stream")),
             LighterEnvironment::Testnet,
             Arc::clone(&registry),
@@ -334,6 +339,10 @@ impl ClientHarness {
             5,
             None,
         );
+        let mut client = match state_sink {
+            Some(sink) => client.with_state_sink(sink),
+            None => client,
+        };
         client.cache_instruments(vec![
             (PERP_MARKET_INDEX, perp),
             (SECOND_MARKET_INDEX, second),
@@ -486,6 +495,49 @@ async fn test_websocket_connection_lifecycle() {
         Duration::from_secs(2),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_state_sink_reports_connection_loss_and_recovery() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&observed);
+    let sink = SocketStateSink::new(move |state| recorded.lock().unwrap().push(state));
+
+    let harness = ClientHarness::build_with_state_sink(addr, Some(sink)).await;
+    assert_eq!(*observed.lock().unwrap(), vec![SocketState::Connected]);
+
+    // The server acks this subscribe and then closes, so the client observes a
+    // connection loss rather than a graceful disconnect.
+    state
+        .drop_after_next_subscribe
+        .store(true, Ordering::Relaxed);
+    harness
+        .client
+        .subscribe_book(harness.instrument(PERP_MARKET_INDEX))
+        .await
+        .expect("subscribe_book");
+    await_subscribe_count(&state, 1).await;
+
+    wait_until_async(
+        || {
+            let observed = observed.clone();
+            async move { observed.lock().unwrap().len() >= 3 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![
+            SocketState::Connected,
+            SocketState::Disconnected,
+            SocketState::Connected,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1178,7 +1230,7 @@ async fn test_ticker_frame_resolves_via_channel_index() {
     let mut harness = ClientHarness::build(addr).await;
 
     // Use the existing fixture but rewrite `s` to a symbol that does NOT
-    // match any cached raw_symbol — verifies the handler resolves from the
+    // match any cached raw_symbol - verifies the handler resolves from the
     // channel field, not the payload symbol field.
     let mut frame = load_json("ws_ticker_update.json");
     frame["ticker"]["s"] = json!("UNRELATED");
@@ -1245,11 +1297,8 @@ async fn test_market_stats_frame_emits_mark_index_and_funding_updates() {
             NautilusWsMessage::FundingRate(update) => {
                 saw_funding = true;
                 assert_eq!(update.instrument_id, harness.instrument(PERP_MARKET_INDEX));
-                assert_eq!(update.rate.to_string(), "0.000001");
-                assert_eq!(
-                    update.next_funding_ns,
-                    Some(UnixNanos::from(1_774_886_400_000_000_000))
-                );
+                assert_eq!(update.rate, Decimal::new(1, 6));
+                assert_eq!(update.next_funding_ns, None);
             }
             _ => {}
         }
@@ -1773,7 +1822,7 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
     // Drain events until Reconnected lands. The network layer reconnects
     // after `RECONNECT_BASE_BACKOFF` (250 ms) plus jitter, so a few seconds
     // is plenty of headroom.
-    let mut saw_reconnected = false;
+    let mut reconnect_epoch = None;
 
     for _ in 0..20 {
         let Some(event) = next_event_within(&mut harness.client, Duration::from_secs(3)).await
@@ -1781,14 +1830,15 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
             break;
         };
 
-        if matches!(event, NautilusWsMessage::Reconnected) {
-            saw_reconnected = true;
+        if let NautilusWsMessage::Reconnected { connection_epoch } = event {
+            reconnect_epoch = Some(connection_epoch);
             break;
         }
     }
-    assert!(
-        saw_reconnected,
-        "expected Reconnected after server-driven close"
+    assert_eq!(
+        reconnect_epoch,
+        Some(1),
+        "first replacement connection must own epoch 1",
     );
 
     // The spawn loop replays both topics from `subscription_args`. Order is

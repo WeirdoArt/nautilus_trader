@@ -35,8 +35,8 @@ use nautilus_model::{
 use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TransportBackend,
+        WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -66,7 +66,7 @@ pub const KRAKEN_FUTURES_WS_TOPIC_DELIMITER: char = ':';
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.kraken", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -75,6 +75,7 @@ pub const KRAKEN_FUTURES_WS_TOPIC_DELIMITER: char = ':';
 pub struct KrakenFuturesWebSocketClient {
     url: String,
     heartbeat_secs: u64,
+    auth_timeout_secs: u64,
     signal: Arc<AtomicBool>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<FuturesHandlerCommand>>>,
@@ -100,6 +101,7 @@ impl Clone for KrakenFuturesWebSocketClient {
         Self {
             url: self.url.clone(),
             heartbeat_secs: self.heartbeat_secs,
+            auth_timeout_secs: self.auth_timeout_secs,
             signal: Arc::clone(&self.signal),
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
@@ -130,6 +132,7 @@ impl KrakenFuturesWebSocketClient {
             url,
             heartbeat_secs,
             None,
+            None,
             TransportBackend::default(),
             proxy_url,
         )
@@ -141,6 +144,7 @@ impl KrakenFuturesWebSocketClient {
         url: String,
         heartbeat_secs: u64,
         credential: Option<KrakenCredential>,
+        auth_timeout_secs: Option<u64>,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
@@ -151,6 +155,7 @@ impl KrakenFuturesWebSocketClient {
         Self {
             url,
             heartbeat_secs,
+            auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
             signal: Arc::new(AtomicBool::new(false)),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
@@ -259,7 +264,10 @@ impl KrakenFuturesWebSocketClient {
             .map_err(|e| KrakenWsError::ChannelError(e.to_string()))?;
 
         self.auth_tracker
-            .wait_for_result::<KrakenWsError>(tokio::time::Duration::from_secs(10), receiver)
+            .wait_for_result::<KrakenWsError>(
+                tokio::time::Duration::from_secs(self.auth_timeout_secs),
+                receiver,
+            )
             .await?;
 
         log::debug!("Futures WebSocket authentication successful");
@@ -277,14 +285,15 @@ impl KrakenFuturesWebSocketClient {
         let ws_config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: Some(self.heartbeat_secs),
-            heartbeat_msg: None, // Use WebSocket ping frames, not text messages
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: Some(self.heartbeat_secs),
+            heartbeat_payload: None, // Use WebSocket ping frames, not text messages
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -296,7 +305,7 @@ impl KrakenFuturesWebSocketClient {
         )];
 
         let ws_client =
-            WebSocketClient::connect(ws_config, Some(raw_handler), None, None, keyed_quotas, None)
+            WebSocketClient::connect(ws_config, Some(raw_handler), None, keyed_quotas, None)
                 .await
                 .map_err(|e| KrakenWsError::ConnectionError(e.to_string()))?;
 
@@ -1299,6 +1308,7 @@ mod tests {
             "wss://futures.kraken.com/ws/v1".to_string(),
             60,
             Some(test_credential()),
+            None,
             TransportBackend::default(),
             None,
         );
@@ -1341,6 +1351,7 @@ mod tests {
             "wss://futures.kraken.com/ws/v1".to_string(),
             60,
             Some(test_credential()),
+            None,
             TransportBackend::default(),
             None,
         );
@@ -1360,6 +1371,7 @@ mod tests {
             "wss://futures.kraken.com/ws/v1".to_string(),
             60,
             Some(test_credential()),
+            None,
             TransportBackend::default(),
             None,
         );
@@ -1387,6 +1399,7 @@ mod tests {
             "wss://futures.kraken.com/ws/v1".to_string(),
             60,
             Some(test_credential()),
+            None,
             TransportBackend::default(),
             None,
         );

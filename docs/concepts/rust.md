@@ -2,8 +2,8 @@
 
 Nautilus has a complete Rust implementation under the `crates/` directory.
 You can write actors, strategies, run backtests, and trade live without Python.
-The domain model is shared across all paths, and the v2 PyO3 path runs
-Python strategies on the Rust engine directly.
+The domain model is shared with the Python package, which runs user components
+on the same Rust engine through PyO3.
 
 :::warning
 The Rust API is under active development. Method signatures and trait
@@ -12,75 +12,74 @@ requirements may change between releases.
 
 ## System implementations
 
-Nautilus has three implementations. Understanding where each stands helps
-you choose the right one for your use case.
+Nautilus has two paths. Choose the one that matches how you want to author
+and deploy the system.
 
-- **v1 legacy**: Cython/Python classes under `nautilus_trader/`. Fully
-  featured with the broadest component coverage.
-- **v2 Rust**: Pure Rust under `crates/`. Runs without Python.
-- **v2 PyO3**: Python user-components (actors, strategies) running on
-  the Rust core via PyO3 bindings. Combines Python convenience with
-  Rust engine performance.
+- **Rust**: Pure Rust under `crates/`. Runs without Python.
+- **Python**: [Python user components](python.md) running on the Rust core through PyO3
+  bindings under `python/nautilus_trader/`.
 
 ### Capability matrix
 
-| Component             | v1 legacy (Cython) | v2 Rust        | v2 PyO3 (Python on Rust) |
-|-----------------------|--------------------|----------------|--------------------------|
-| Strategy              | ✓                  | ✓              | ✓                        |
-| Actor                 | ✓                  | ✓              | ✓                        |
-| DataEngine            | ✓                  | ✓              | ✓                        |
-| ExecutionEngine       | ✓                  | ✓              | ✓                        |
-| RiskEngine            | ✓                  | ✓              | ✓                        |
-| BacktestEngine        | ✓                  | ✓              | ✓                        |
-| BacktestNode          | ✓                  | ✓              | ✓                        |
-| LiveNode              | ✓                  | ✓              | ✓                        |
-| OrderEmulator         | ✓                  | ✓              | ✓                        |
-| Matching engine       | ✓                  | ✓              | ✓                        |
-| Portfolio             | ✓                  | ✓              | ✓                        |
-| Accounts              | ✓                  | ✓              | ✓                        |
-| Cache                 | ✓                  | ✓              | ✓                        |
-| MessageBus            | ✓                  | ✓              | ✓                        |
-| Data catalog          | ✓                  | ✓              | ✓                        |
-| Indicators            | ✓                  | ✓              | ✓                        |
-| Exec algorithms       | TWAP               | TWAP           | TWAP                     |
-| Controller            | ✓                  | -              | ✓                        |
-| Tearsheets            | ✓                  | -              | ✓                        |
-| Config serialization  | ✓                  | -              | -                        |
+| Component       | Rust | Python |
+| --------------- | ---- | ------ |
+| Strategy        | ✓    | ✓      |
+| Actor           | ✓    | ✓      |
+| DataEngine      | ✓    | ✓      |
+| ExecutionEngine | ✓    | ✓      |
+| RiskEngine      | ✓    | ✓      |
+| BacktestEngine  | ✓    | ✓      |
+| BacktestNode    | ✓    | ✓      |
+| LiveNode        | ✓    | ✓      |
+| OrderEmulator   | ✓    | ✓      |
+| Matching engine | ✓    | ✓      |
+| Portfolio       | ✓    | ✓      |
+| Accounts        | ✓    | ✓      |
+| Cache           | ✓    | ✓      |
+| MessageBus      | ✓    | ✓      |
+| Data catalog    | ✓    | ✓      |
+| Indicators      | ✓    | ✓      |
+| Exec algorithms | TWAP | TWAP   |
+| Controller      | -    | ✓      |
+| Tearsheets      | -    | ✓      |
+
+:::note
+The Controller runtime is implemented in Rust and powers the Python `Controller`
+base class. The matrix marks it absent for Rust because the supported
+registration path (importable controller configs) is Python-only.
+:::
 
 ### Adapters
 
-| Adapter             | v1 legacy (Cython) | v2 Rust | v2 PyO3 |
-|---------------------|--------------------|---------|---------|
-| Architect AX        | ✓                  | ✓       | ✓       |
-| Betfair             | ✓                  | ✓       | ✓       |
-| Binance             | ✓                  | ✓       | ✓       |
-| BitMEX              | ✓                  | ✓       | ✓       |
-| Blockchain          | -                  | ✓       | ✓       |
-| Bybit               | ✓                  | ✓       | ✓       |
-| Coinbase            | -                  | ✓       | ✓       |
-| Databento           | ✓                  | ✓       | ✓       |
-| Deribit             | ✓                  | ✓       | ✓       |
-| Derive              | -                  | ✓       | ✓       |
-| dYdX                | ✓                  | ✓       | ✓       |
-| Hyperliquid         | ✓                  | ✓       | ✓       |
-| Interactive Brokers | ✓                  | ✓       | ✓       |
-| Kraken              | ✓                  | ✓       | ✓       |
-| Lighter             | -                  | ✓       | ✓       |
-| OKX                 | ✓                  | ✓       | ✓       |
-| Polymarket          | ✓                  | ✓       | ✓       |
-| Sandbox             | ✓                  | ✓       | ✓       |
-| Tardis              | ✓                  | ✓       | ✓       |
+| Adapter             | Rust | Python |
+| ------------------- | ---- | ------ |
+| Architect AX        | ✓    | ✓      |
+| Betfair             | ✓    | ✓      |
+| Binance             | ✓    | ✓      |
+| BitMEX              | ✓    | ✓      |
+| Blockchain          | ✓    | ✓      |
+| Bybit               | ✓    | ✓      |
+| Coinbase            | ✓    | ✓      |
+| Databento           | ✓    | ✓      |
+| Deribit             | ✓    | ✓      |
+| Derive              | ✓    | ✓      |
+| dYdX                | ✓    | ✓      |
+| Hyperliquid         | ✓    | ✓      |
+| Interactive Brokers | ✓    | ✓      |
+| Kraken              | ✓    | ✓      |
+| Lighter             | ✓    | ✓      |
+| OKX                 | ✓    | ✓      |
+| Polymarket          | ✓    | ✓      |
+| Sandbox             | ✓    | ✓      |
+| Tardis              | ✓    | ✓      |
 
 ### Choosing a path
 
-- **v1 legacy** is the most complete today. Use it if you need the
-  Controller or config serialization.
-- **v2 Rust** gives native performance without a Python runtime. All core
+- **Rust** gives native performance without a Python runtime. All core
   trading functionality is available. Use it for latency-sensitive
   deployments or teams that prefer a compiled language.
-- **v2 PyO3**: Python user-components (actors, strategies) run on the
-  Rust core engine with Rust performance for data processing and
-  execution, while keeping the Python authoring experience.
+- **Python** keeps the Python authoring experience. User components (actors,
+  strategies) run on the Rust core for data processing and execution.
 
 ## Project setup
 
@@ -90,11 +89,11 @@ The Nautilus crates are published to
 
 ```toml
 [dependencies]
-nautilus-backtest = "0.60"
-nautilus-common = "0.60"
-nautilus-execution = "0.60"
-nautilus-model = { version = "0.60", features = ["stubs"] }
-nautilus-trading = { version = "0.60", features = ["examples"] }
+nautilus-backtest = "0.62"
+nautilus-common = "0.62"
+nautilus-execution = "0.62"
+nautilus-model = { version = "0.62", features = ["stubs"] }
+nautilus-trading = { version = "0.62", features = ["examples"] }
 
 anyhow = "1"
 log = "0.4"
@@ -104,8 +103,8 @@ For live trading, add the live crate and the adapter for your venue:
 
 ```toml
 [dependencies]
-nautilus-live = "0.60"
-nautilus-okx = "0.60"
+nautilus-live = "0.62"
+nautilus-okx = "0.62"
 ```
 
 To track the latest development branch, point all Nautilus dependencies at the
@@ -120,16 +119,16 @@ nautilus-model = { git = "https://github.com/nautechsystems/nautilus_trader.git"
 nautilus-trading = { git = "https://github.com/nautechsystems/nautilus_trader.git", branch = "develop", features = ["examples"] }
 ```
 
-The minimum supported Rust version (MSRV) is **1.97.1**.
+The minimum supported Rust version (MSRV) is **1.98.0**.
 
 ### Feature flags
 
 | Flag             | Crate               | Effect                                                        |
-|------------------|---------------------|---------------------------------------------------------------|
+| ---------------- | ------------------- | ------------------------------------------------------------- |
 | `high-precision` | `nautilus-model`    | 16-digit fixed precision (default is 9). Required for crypto. |
 | `stubs`          | `nautilus-model`    | Test instrument stubs (`audusd_sim`, etc.).                   |
 | `examples`       | `nautilus-trading`  | Example strategies (`EmaCross`, `GridMarketMaker`).           |
-| `streaming`      | `nautilus-backtest` | Catalog‑based data streaming via `BacktestNode`.              |
+| `streaming`      | `nautilus-backtest` | Catalog-based data streaming via `BacktestNode`.              |
 | `defi`           | `nautilus-model`    | DeFi data types. Implies `high-precision`.                    |
 
 :::tip
@@ -140,9 +139,8 @@ places (e.g. `0.00000001`).
 
 ### Memory allocator
 
-The Python wheels and the `nautilus` CLI use [mimalloc](https://crates.io/crates/mimalloc)
-for Rust allocations. A Rust binary chooses its own allocator, so add mimalloc to yours
-to match:
+The `nautilus` CLI and Python wheels use [mimalloc](https://crates.io/crates/mimalloc) for Rust
+allocations. A Rust binary chooses its own allocator, so add mimalloc to yours to match:
 
 ```toml
 [dependencies]
@@ -151,10 +149,19 @@ mimalloc = "0.1"
 
 ```rust
 use mimalloc::MiMalloc;
+use nautilus_common::logging::headers::register_allocator_mimalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+fn main() {
+    register_allocator_mimalloc();
+}
 ```
+
+Declaring `GLOBAL` selects mimalloc. Call `register_allocator_mimalloc` at the start of `main`,
+before constructing a Nautilus node, so the version header reports `allocator: mimalloc <version>`.
+Registration only updates the header metadata; it does not select the allocator.
 
 The default system allocator also works, but backtest throughput drops materially,
 especially on Windows, where allocator overhead can reach half of hot-loop run time.
@@ -176,7 +183,7 @@ data or event. All handlers have default no-op implementations, so you only
 override what you need.
 
 | Handler                | Receives                  |
-|------------------------|---------------------------|
+| ---------------------- | ------------------------- |
 | `on_start`             | Actor started.            |
 | `on_stop`              | Actor stopped.            |
 | `on_quote`             | `QuoteTick`               |
@@ -191,8 +198,6 @@ override what you need.
 | `on_option_greeks`     | `OptionGreeks`            |
 | `on_option_chain`      | `OptionChainSlice`        |
 | `on_instrument_status` | `InstrumentStatus`        |
-| `on_order_filled`      | `OrderFilled`             |
-| `on_order_canceled`    | `OrderCanceled`           |
 | `on_time_event`        | `TimeEvent`               |
 
 For a step-by-step walkthrough, see the
@@ -208,13 +213,15 @@ into the strategy runtime contract. `StrategyCore` stores the runtime strategy
 state; normal strategy logic reaches it through facade methods on `self`.
 Runtime registration requires the native wiring generated by the macro, but
 normal strategy logic uses `Strategy` methods and the facade methods on `self`.
+Strategies also override order event handlers on the `Strategy` trait, such as
+`on_order_filled` (`OrderFilled`) and `on_order_canceled` (`OrderCanceled`).
 
 ### Order management
 
 The `Strategy` trait provides order methods through the facade:
 
 | Method                | Action                                    |
-|-----------------------|-------------------------------------------|
+| --------------------- | ----------------------------------------- |
 | `submit_order`        | Submit a new order to the venue.          |
 | `submit_order_list`   | Submit a list of contingent orders.       |
 | `modify_order`        | Modify price, quantity, or trigger price. |
@@ -245,28 +252,17 @@ The `OrderApi` (accessed via `self.order()`) builds orders and order lists:
 Rust actors, strategies, and execution algorithms keep their runtime core as a
 struct field. The macros tell the traits where that field lives.
 
-| Macro                                          | Core field               | Generates                       |
-|------------------------------------------------|--------------------------|---------------------------------|
-| `nautilus_actor!(Type)`                        | `DataActorCore`          | Runtime wiring.                 |
-| `nautilus_strategy!(Type)`                     | `StrategyCore`           | Runtime wiring and `Strategy`.  |
-| `nautilus_execution_algorithm!(Type, { ... })` | `ExecutionAlgorithmCore` | Runtime wiring and algorithm.   |
+| Macro                                          | Core field               | Generates                      |
+| ---------------------------------------------- | ------------------------ | ------------------------------ |
+| `nautilus_actor!(Type)`                        | `DataActorCore`          | Runtime wiring.                |
+| `nautilus_strategy!(Type)`                     | `StrategyCore`           | Runtime wiring and `Strategy`. |
+| `nautilus_execution_algorithm!(Type, { ... })` | `ExecutionAlgorithmCore` | Runtime wiring and algorithm.  |
 
 The macros expect a field named `core`; pass a field name as the second
 argument when needed. They do not make the actor, strategy, or `StrategyCore`
 deref to runtime internals.
 The execution algorithm macro takes an `on_order()` implementation block because
 that method defines the algorithm's required order handling.
-Normal code uses facade methods such as:
-
-- `actor_id()`
-- `trader_id()`
-- `is_registered()`
-- `config()`
-- `strategy_id()`
-- `clock()`
-- `cache()`
-- `order()`
-- `portfolio()`
 
 ### Native traits
 
@@ -287,10 +283,10 @@ native-only access below that facade. This section documents engine, runtime, an
 latency-sensitive native Rust code, not the portable authoring path.
 
 | Authoring path            | Native traits?   | Normal API                          |
-|---------------------------|------------------|-------------------------------------|
+| ------------------------- | ---------------- | ----------------------------------- |
 | Native Rust binary        | Only when needed | `Strategy` and `DataActor` facades. |
 | Rust launched from Python | Only when needed | Same as native Rust.                |
-| Python‑authored component | No               | Facades only.                       |
+| Python-authored component | No               | Facades only.                       |
 
 Native traits expose borrowed core state, `Rc<RefCell<_>>`, and runtime
 references. Use them when native Rust code intentionally accepts those borrow
@@ -313,30 +309,30 @@ for normal strategy order construction. Reach for
 #### `DataActorNative` methods
 
 | Native method | Return shape             | Use when                        |
-|---------------|--------------------------|---------------------------------|
+| ------------- | ------------------------ | ------------------------------- |
 | `core()`      | `&DataActorCore`         | Read actor internals.           |
 | `core_mut()`  | `&mut DataActorCore`     | Mutate actor internals.         |
 | `clock_mut()` | `RefMut<'_, dyn Clock>`  | Need a mutable clock borrow.    |
 | `clock_rc()`  | `Rc<RefCell<dyn Clock>>` | Store or pass the shared clock. |
-| `cache_ref()` | `Ref<'_, Cache>`         | Need short live‑cache reads.    |
+| `cache_ref()` | `Ref<'_, Cache>`         | Need short live-cache reads.    |
 | `cache_rc()`  | `Rc<RefCell<Cache>>`     | Mutate, store, or pass cache.   |
 
 #### `StrategyNative` methods
 
-| Native method         | Return shape                 | Use when                          |
-|-----------------------|------------------------------|-----------------------------------|
-| `strategy_core()`     | `&StrategyCore`              | Read strategy internals.          |
-| `strategy_core_mut()` | `&mut StrategyCore`          | Mutate strategy internals.        |
-| `order_factory()`     | `RefMut<'_, OrderFactory>`   | Need raw mutable factory borrow.  |
-| `order_factory_rc()`  | `Rc<RefCell<OrderFactory>>`  | Store or pass the factory.        |
-| `portfolio_rc()`      | `Rc<RefCell<Portfolio>>`     | Store or pass the portfolio.      |
+| Native method         | Return shape                | Use when                         |
+| --------------------- | --------------------------- | -------------------------------- |
+| `strategy_core()`     | `&StrategyCore`             | Read strategy internals.         |
+| `strategy_core_mut()` | `&mut StrategyCore`         | Mutate strategy internals.       |
+| `order_factory()`     | `RefMut<'_, OrderFactory>`  | Need raw mutable factory borrow. |
+| `order_factory_rc()`  | `Rc<RefCell<OrderFactory>>` | Store or pass the factory.       |
+| `portfolio_rc()`      | `Rc<RefCell<Portfolio>>`    | Store or pass the portfolio.     |
 
 #### `ExecutionAlgorithmNative` methods
 
-| Native method               | Return shape                   | Use when                              |
-|-----------------------------|--------------------------------|---------------------------------------|
-| `exec_algorithm_core()`     | `&ExecutionAlgorithmCore`      | Read execution algorithm internals.   |
-| `exec_algorithm_core_mut()` | `&mut ExecutionAlgorithmCore`  | Mutate execution algorithm internals. |
+| Native method               | Return shape                  | Use when                              |
+| --------------------------- | ----------------------------- | ------------------------------------- |
+| `exec_algorithm_core()`     | `&ExecutionAlgorithmCore`     | Read execution algorithm internals.   |
+| `exec_algorithm_core_mut()` | `&mut ExecutionAlgorithmCore` | Mutate execution algorithm internals. |
 
 For a step-by-step walkthrough, see the
 [Write a Strategy (Rust)](../how_to/write_rust_strategy.md) how-to guide.
@@ -374,7 +370,7 @@ and tests. It is not a first-class extension path for adding native
 strategies. For custom native components, use pure Rust.
 
 ```python
-from nautilus_trader.core.nautilus_pyo3.trading import GridMarketMakerConfig
+from nautilus_trader.trading import GridMarketMakerConfig
 
 config = GridMarketMakerConfig(
     instrument_id=InstrumentId.from_str("BTC-USDT-SWAP.OKX"),
@@ -389,24 +385,24 @@ node.add_builtin_strategy("GridMarketMaker", config)
 
 Built-in strategy configs:
 
-| Config                         | Strategy                 |
-|--------------------------------|--------------------------|
-| `CompositeMarketMakerConfig`   | `CompositeMarketMaker`   |
-| `DeltaNeutralVolConfig`        | `DeltaNeutralVol`        |
-| `EmaCrossConfig`               | `EmaCross`               |
-| `ExecTesterConfig`             | `ExecTester`             |
-| `GridMarketMakerConfig`        | `GridMarketMaker`        |
-| `HurstVpinDirectionalConfig`   | `HurstVpinDirectional`   |
+| Config                       | Strategy               |
+| ---------------------------- | ---------------------- |
+| `CompositeMarketMakerConfig` | `CompositeMarketMaker` |
+| `DeltaNeutralVolConfig`      | `DeltaNeutralVol`      |
+| `EmaCrossConfig`             | `EmaCross`             |
+| `ExecTesterConfig`           | `ExecTester`           |
+| `GridMarketMakerConfig`      | `GridMarketMaker`      |
+| `HurstVpinDirectionalConfig` | `HurstVpinDirectional` |
 
 `add_builtin_actor` follows the same bundled-only rule for actors used by
 examples and tests.
 
 Built-in actor configs (via `add_builtin_actor`):
 
-| Config                     | Actor                 |
-|----------------------------|-----------------------|
-| `BookImbalanceActorConfig` | `BookImbalanceActor`  |
-| `DataTesterConfig`         | `DataTester`          |
+| Config                     | Actor                |
+| -------------------------- | -------------------- |
+| `BookImbalanceActorConfig` | `BookImbalanceActor` |
+| `DataTesterConfig`         | `DataTester`         |
 
 ## Backtesting
 
@@ -447,27 +443,27 @@ The `LiveNode` connects to real venues and data sources through adapter clients.
 pattern configures data and execution clients, then `run()` starts the async
 event loop. Each adapter provides its own factory and config types.
 
-| Adapter             | Example                                                |
-|---------------------|--------------------------------------------------------|
-| Architect AX        | `crates/adapters/architect_ax/examples/`               |
-| Betfair             | `crates/adapters/betfair/examples/`                    |
-| Binance             | `crates/adapters/binance/examples/`                    |
-| BitMEX              | `crates/adapters/bitmex/examples/`                     |
-| Blockchain          | `crates/adapters/blockchain/examples/`                 |
-| Bybit               | `crates/adapters/bybit/examples/`                      |
-| Coinbase            | `crates/adapters/coinbase/examples/`                   |
-| Databento           | `crates/adapters/databento/examples/`                  |
-| Deribit             | `crates/adapters/deribit/examples/`                    |
-| Derive              | `crates/adapters/derive/examples/`                     |
-| dYdX                | `crates/adapters/dydx/examples/`                       |
-| Hyperliquid         | `crates/adapters/hyperliquid/examples/`                |
-| Interactive Brokers | `crates/adapters/interactive_brokers/examples/`        |
-| Kraken              | `crates/adapters/kraken/examples/`                     |
-| Lighter             | `crates/adapters/lighter/examples/`                    |
-| OKX                 | `crates/adapters/okx/examples/`                        |
-| Polymarket          | `crates/adapters/polymarket/examples/`                 |
-| Sandbox             | `crates/adapters/sandbox/examples/`                    |
-| Tardis              | `crates/adapters/tardis/examples/`                     |
+| Adapter             | Example                                         |
+| ------------------- | ----------------------------------------------- |
+| Architect AX        | `crates/adapters/architect_ax/examples/`        |
+| Betfair             | `crates/adapters/betfair/examples/`             |
+| Binance             | `crates/adapters/binance/examples/`             |
+| BitMEX              | `crates/adapters/bitmex/examples/`              |
+| Blockchain          | `crates/adapters/blockchain/examples/`          |
+| Bybit               | `crates/adapters/bybit/examples/`               |
+| Coinbase            | `crates/adapters/coinbase/examples/`            |
+| Databento           | `crates/adapters/databento/examples/`           |
+| Deribit             | `crates/adapters/deribit/examples/`             |
+| Derive              | `crates/adapters/derive/examples/`              |
+| dYdX                | `crates/adapters/dydx/examples/`                |
+| Hyperliquid         | `crates/adapters/hyperliquid/examples/`         |
+| Interactive Brokers | `crates/adapters/interactive_brokers/examples/` |
+| Kraken              | `crates/adapters/kraken/examples/`              |
+| Lighter             | `crates/adapters/lighter/examples/`             |
+| OKX                 | `crates/adapters/okx/examples/`                 |
+| Polymarket          | `crates/adapters/polymarket/examples/`          |
+| Sandbox             | `crates/adapters/sandbox/examples/`             |
+| Tardis              | `crates/adapters/tardis/examples/`              |
 
 Most adapters include `node_data_tester.rs` and `node_exec_tester.rs`
 examples. These test data requests, streaming, and order execution
@@ -475,6 +471,7 @@ against live venues.
 
 ## Related guides
 
+- [Python](python.md) - Python ownership, runtime, and public API boundaries.
 - [Write an Actor (Rust)](../how_to/write_rust_actor.md) - Step-by-step actor walkthrough.
 - [Write a Strategy (Rust)](../how_to/write_rust_strategy.md) - Step-by-step strategy walkthrough.
 - [Run a Backtest (Rust)](../how_to/run_rust_backtest.md) - BacktestEngine and BacktestNode usage.

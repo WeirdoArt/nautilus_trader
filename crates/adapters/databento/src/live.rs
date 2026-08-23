@@ -46,7 +46,7 @@ use nautilus_core::{
     AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
-    data::{Data, InstrumentStatus, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API},
+    data::{Data, InstrumentStatus, OrderBookDelta, OrderBookDeltas},
     enums::RecordFlag,
     identifiers::{InstrumentId, Symbol, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -90,7 +90,7 @@ pub enum DatabentoMessage {
 
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.databento")
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento")
 )]
 #[cfg_attr(
     feature = "python",
@@ -901,7 +901,7 @@ impl DatabentoFeedHandler {
                             &mut buffering_start,
                             &mut buffered_deltas,
                         ) {
-                            Some(deltas) => data1 = Some(Data::Deltas(deltas)),
+                            Some(deltas) => data1 = Some(Data::Deltas(Box::new(deltas))),
                             None => continue,
                         }
                     } else {
@@ -926,7 +926,7 @@ impl DatabentoFeedHandler {
                             &mut buffering_start,
                             &mut buffered_deltas,
                         ) {
-                            self.send_msg(DatabentoMessage::Data(Data::Deltas(deltas)));
+                            self.send_msg(DatabentoMessage::Data(Data::Deltas(Box::new(deltas))));
                         }
 
                         continue;
@@ -1005,10 +1005,9 @@ fn handle_system_msg(msg: &dbn::SystemMsg, ts_received: UnixNanos) -> Option<Sub
 fn parse_ack_message(message: &str) -> String {
     // Format: "Subscription request N for <schema> data succeeded"
     message
-        .strip_prefix("Subscription request ")
+        .strip_circumfix("Subscription request ", " data succeeded")
         .and_then(|rest| rest.split_once(" for "))
-        .and_then(|(_, after_num)| after_num.strip_suffix(" data succeeded"))
-        .map(|schema| schema.trim().to_string())
+        .map(|(_, schema)| schema.trim().to_string())
         .unwrap_or_default()
 }
 
@@ -1320,7 +1319,7 @@ fn process_mbo_delta(
     flags: u8,
     buffering_start: &mut Option<UnixNanos>,
     buffered_deltas: &mut AHashMap<InstrumentId, Vec<OrderBookDelta>>,
-) -> Option<OrderBookDeltas_API> {
+) -> Option<OrderBookDeltas> {
     let is_last = RecordFlag::F_LAST.matches(flags);
     let is_snapshot = RecordFlag::F_SNAPSHOT.matches(flags);
 
@@ -1331,7 +1330,7 @@ fn process_mbo_delta(
         && !buffered_deltas.contains_key(&delta.instrument_id)
     {
         let deltas = OrderBookDeltas::new(delta.instrument_id, vec![delta]);
-        return Some(OrderBookDeltas_API::new(deltas));
+        return Some(deltas);
     }
 
     let buffer = buffered_deltas.entry(delta.instrument_id).or_default();
@@ -1363,7 +1362,7 @@ fn flush_mbo_event_boundary(
     flags: u8,
     buffering_start: &mut Option<UnixNanos>,
     buffered_deltas: &mut AHashMap<InstrumentId, Vec<OrderBookDelta>>,
-) -> Option<OrderBookDeltas_API> {
+) -> Option<OrderBookDeltas> {
     if !RecordFlag::F_LAST.matches(flags) || RecordFlag::F_SNAPSHOT.matches(flags) {
         return None;
     }
@@ -1383,7 +1382,7 @@ fn flush_mbo_event_boundary(
 
     let buffer = buffered_deltas.remove(&instrument_id)?;
     let deltas = OrderBookDeltas::new(instrument_id, buffer);
-    Some(OrderBookDeltas_API::new(deltas))
+    Some(deltas)
 }
 
 #[cfg(test)]
@@ -1423,7 +1422,7 @@ mod tests {
     #[rstest]
     fn test_boundary_flag_on_recordless_message_flushes_buffered_event() {
         // A non-terminal 'C' delta buffers; the event terminates on an 'N'
-        // record carrying F_LAST which decodes to no delta — the raw flag
+        // record carrying F_LAST which decodes to no delta - the raw flag
         // must still flush the buffer (follow-up to #4445).
         let instrument_id = InstrumentId::from("TEST.GLBX");
         let mut buffering_start = None;

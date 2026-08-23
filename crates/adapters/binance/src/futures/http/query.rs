@@ -46,6 +46,26 @@ pub struct BinanceTradesParams {
     pub limit: Option<u32>,
 }
 
+/// Query parameters for `GET /fapi/v1/aggTrades` or `GET /dapi/v1/aggTrades`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option), default)]
+pub struct BinanceAggTradesParams {
+    /// Trading symbol.
+    pub symbol: String,
+    /// Aggregate trade ID to begin from, inclusive.
+    #[serde(rename = "fromId", skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<i64>,
+    /// Start time in milliseconds, inclusive.
+    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<i64>,
+    /// End time in milliseconds, inclusive.
+    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<i64>,
+    /// Number of aggregate trades to return (default 500, max 1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// Query parameters for `GET /fapi/v1/klines` or `GET /dapi/v1/klines`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
 #[builder(setter(into, strip_option), default)]
@@ -174,6 +194,14 @@ pub struct BinancePositionRiskParams {
     /// Recv window override (ms).
     #[serde(rename = "recvWindow", skip_serializing_if = "Option::is_none")]
     pub recv_window: Option<u64>,
+}
+
+/// Query parameters for `GET /fapi/v1/commissionRate` or `GET /dapi/v1/commissionRate`.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into))]
+pub struct BinanceCommissionRateParams {
+    /// Trading symbol.
+    pub symbol: String,
 }
 
 /// Query parameters for `GET /fapi/v1/income` or `GET /dapi/v1/income`.
@@ -750,6 +778,24 @@ mod tests {
 
         let serialized = serde_urlencoded::to_string(&params).unwrap();
         assert_eq!(serialized, "symbol=BTCUSDT");
+    }
+
+    #[rstest]
+    fn test_agg_trades_params_serialization() {
+        let params = BinanceAggTradesParams {
+            symbol: "BTCUSDT".to_string(),
+            from_id: Some(123),
+            start_time: Some(1_700_000_000_001),
+            end_time: Some(1_700_000_000_999),
+            limit: Some(456),
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+
+        assert_eq!(
+            serialized,
+            "symbol=BTCUSDT&fromId=123&startTime=1700000000001&endTime=1700000000999&limit=456"
+        );
     }
 
     #[rstest]

@@ -29,7 +29,7 @@ use nautilus_model::{
         TrailingOffsetType, TriggerType,
     },
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
@@ -41,7 +41,7 @@ use ustr::Ustr;
 use crate::{
     common::{
         consts::BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        encoder::decode_broker_id,
+        encoder::decode_client_order_id,
         enums::{
             BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
             BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
@@ -49,9 +49,9 @@ use crate::{
             BinanceTradingStatus, BinanceWorkingType,
         },
         models::BinanceRateLimit,
-        parse::parse_required_decimal,
+        parse::{parse_millis, parse_required_decimal},
     },
-    futures::conversions::normalize_futures_asset,
+    futures::conversions::{normalize_futures_asset, parse_good_till_date},
 };
 
 /// Server time response from `GET /fapi/v1/time`.
@@ -77,6 +77,32 @@ pub struct BinanceFuturesTrade {
     /// Trade timestamp in milliseconds.
     pub time: i64,
     /// Whether the buyer is the maker.
+    pub is_buyer_maker: bool,
+}
+
+/// Aggregate public trade from `GET /fapi/v1/aggTrades` or `GET /dapi/v1/aggTrades`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BinanceFuturesAggTrade {
+    /// Aggregate trade ID.
+    #[serde(rename = "a")]
+    pub id: i64,
+    /// Trade price.
+    #[serde(rename = "p")]
+    pub price: String,
+    /// Trade quantity.
+    #[serde(rename = "q")]
+    pub qty: String,
+    /// First raw trade ID represented by this aggregate.
+    #[serde(rename = "f")]
+    pub first_trade_id: i64,
+    /// Last raw trade ID represented by this aggregate.
+    #[serde(rename = "l")]
+    pub last_trade_id: i64,
+    /// Trade timestamp in milliseconds.
+    #[serde(rename = "T")]
+    pub time: i64,
+    /// Whether the buyer is the maker.
+    #[serde(rename = "m")]
     pub is_buyer_maker: bool,
 }
 
@@ -201,7 +227,8 @@ pub struct BinanceFuturesUsdSymbol {
     pub symbol: Ustr,
     /// Trading pair (e.g., "BTCUSDT").
     pub pair: Ustr,
-    /// Contract type (PERPETUAL, CURRENT_QUARTER, NEXT_QUARTER).
+    /// Contract type (PERPETUAL, TRADIFI_PERPETUAL, CURRENT_MONTH, NEXT_MONTH,
+    /// CURRENT_QUARTER, NEXT_QUARTER).
     pub contract_type: String,
     /// Delivery date timestamp.
     pub delivery_date: i64,
@@ -775,6 +802,9 @@ pub struct BinanceUserTrade {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinanceFuturesAccountInfo {
+    /// Futures VIP fee tier.
+    #[serde(default)]
+    pub fee_tier: u8,
     /// Total initial margin required.
     #[serde(
         default,
@@ -875,6 +905,18 @@ pub struct BinanceFuturesAccountInfo {
     pub positions: Vec<BinanceAccountPosition>,
 }
 
+/// Account-specific Futures commission rates for one symbol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFuturesCommissionRate {
+    /// Venue symbol.
+    pub symbol: Ustr,
+    /// Maker commission rate.
+    pub maker_commission_rate: String,
+    /// Taker commission rate.
+    pub taker_commission_rate: String,
+}
+
 impl BinanceFuturesAccountInfo {
     /// Converts this Binance account info to a Nautilus [`AccountState`].
     ///
@@ -938,7 +980,9 @@ impl BinanceFuturesAccountInfo {
 
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
+            .map(|value| parse_millis(value, "Futures account update time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
         Ok(AccountState::new(
             account_id,
@@ -1072,7 +1116,7 @@ impl BinanceFuturesOrder {
     ///
     /// # Errors
     ///
-    /// Returns an error if quantity or price parsing fails.
+    /// Returns an error if client order ID, quantity, or price parsing fails.
     pub fn to_order_status_report(
         &self,
         account_id: AccountId,
@@ -1084,12 +1128,12 @@ impl BinanceFuturesOrder {
     ) -> anyhow::Result<OrderStatusReport> {
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
+            .map(|value| parse_millis(value, "Futures order update time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
-        let client_order_id = ClientOrderId::new(decode_broker_id(
-            &self.client_order_id,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        ));
+        let client_order_id =
+            decode_client_order_id(&self.client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
         let venue_order_id = VenueOrderId::new(self.order_id.to_string());
 
         let order_side = match self.side {
@@ -1141,6 +1185,10 @@ impl BinanceFuturesOrder {
 
         if let Some(price) = price {
             report = report.with_price(price);
+        }
+
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
         }
 
         report.avg_px = avg_px;
@@ -1227,7 +1275,7 @@ impl BinanceUserTrade {
         bnfcr_currency: Currency,
         ts_init: UnixNanos,
     ) -> anyhow::Result<FillReport> {
-        let ts_event = UnixNanos::from_millis(self.time as u64);
+        let ts_event = parse_millis(self.time, "Futures user trade time")?;
 
         let venue_order_id = VenueOrderId::new(self.order_id.to_string());
         let trade_id = TradeId::new(self.id.to_string());
@@ -1369,6 +1417,9 @@ pub struct BinanceFuturesAlgoOrder {
     /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
     #[serde(default)]
     pub callback_rate: Option<String>,
+    /// Good till date in milliseconds.
+    #[serde(default)]
+    pub good_till_date: Option<i64>,
     /// Order creation time in milliseconds.
     #[serde(default)]
     pub create_time: Option<i64>,
@@ -1394,7 +1445,8 @@ impl BinanceFuturesAlgoOrder {
     ///
     /// # Errors
     ///
-    /// Returns an error if quantity, price, trigger, or trailing fields cannot be parsed.
+    /// Returns an error if client order ID, quantity, price, trigger, or trailing fields cannot be
+    /// parsed.
     pub fn to_order_status_report(
         &self,
         account_id: AccountId,
@@ -1406,12 +1458,12 @@ impl BinanceFuturesAlgoOrder {
         let ts_event = self
             .update_time
             .or(self.create_time)
-            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
+            .map(|value| parse_millis(value, "Futures algo order time"))
+            .transpose()?
+            .unwrap_or(ts_init);
 
-        let client_order_id = ClientOrderId::new(decode_broker_id(
-            &self.client_algo_id,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        ));
+        let client_order_id =
+            decode_client_order_id(&self.client_algo_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID)?;
         let venue_order_id = self
             .actual_order_id
             .as_ref()
@@ -1513,8 +1565,13 @@ impl BinanceFuturesAlgoOrder {
             report = report.with_reduce_only(reduce_only);
         }
 
+        if let Some(expire_time) = parse_good_till_date(self.good_till_date)? {
+            report = report.with_expire_time(expire_time);
+        }
+
         if let Some(trigger_time) = self.trigger_time {
-            report = report.with_ts_triggered(UnixNanos::from_millis(trigger_time as u64));
+            report =
+                report.with_ts_triggered(parse_millis(trigger_time, "Futures algo trigger time")?);
         }
 
         Ok(report)
@@ -1590,6 +1647,7 @@ impl BinanceFuturesAlgoOrder {
         report.quantity = actual_report.quantity;
         report.filled_qty = actual_report.filled_qty;
         report.avg_px = actual_report.avg_px.or(report.avg_px);
+        report.expire_time = report.expire_time.or(actual_report.expire_time);
         report.ts_last = actual_report.ts_last;
 
         Ok(report)
@@ -1744,6 +1802,7 @@ pub struct BinanceFuturesAlgoOrderCancelResponse {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::identifiers::ClientOrderId;
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -2220,6 +2279,26 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_to_report_rejects_invalid_client_order_id() {
+        let mut order = order_with_price("50000.00");
+        order.client_order_id = String::new();
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            false,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid Binance client order ID ''"
+        );
+    }
+
+    #[rstest]
     #[case("0")]
     #[case("")]
     fn test_order_to_report_omits_missing_price(#[case] price: &str) {
@@ -2299,6 +2378,8 @@ mod tests {
         algo.avg_price = Some("49000.00".to_string());
         algo.reduce_only = Some(true);
         algo.trigger_time = Some(1_625_474_305_000);
+        algo.time_in_force = Some(BinanceTimeInForce::Gtd);
+        algo.good_till_date = Some(1_700_000_601_000);
 
         let mut actual = order_with_price("0");
         actual.order_id = 987654321;
@@ -2338,6 +2419,10 @@ mod tests {
         assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
         assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
         assert!(report.reduce_only);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
         assert_eq!(
             report.ts_triggered,
             Some(UnixNanos::from_millis(1_625_474_305_000))
@@ -2540,6 +2625,46 @@ mod tests {
         assert!(error.contains("invalid price"));
     }
 
+    #[rstest]
+    fn test_order_to_report_preserves_good_till_date() {
+        let mut order = order_with_price("50000.00");
+        order.time_in_force = BinanceTimeInForce::Gtd;
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, false, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
+    #[rstest]
+    fn test_algo_order_to_report_preserves_good_till_date() {
+        let mut order = algo_order_with_price(Some("50000.00"));
+        order.time_in_force = Some(BinanceTimeInForce::Gtd);
+        order.good_till_date = Some(1_700_000_601_000);
+        let account_id = AccountId::from("BINANCE-FUTURES-001");
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = order
+            .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
+            .unwrap();
+
+        assert_eq!(report.time_in_force, TimeInForce::Gtd);
+        assert_eq!(
+            report.expire_time,
+            Some(UnixNanos::from_millis(1_700_000_601_000)),
+        );
+    }
+
     fn order_with_price(price: &str) -> BinanceFuturesOrder {
         BinanceFuturesOrder {
             symbol: Ustr::from("BTCUSDT"),
@@ -2592,6 +2717,7 @@ mod tests {
             reduce_only: Some(false),
             activate_price: None,
             callback_rate: None,
+            good_till_date: Some(0),
             create_time: Some(1_625_474_304_765),
             update_time: Some(1_625_474_304_765),
             trigger_time: None,
@@ -2670,6 +2796,25 @@ mod tests {
     }
 
     #[rstest]
+    fn test_algo_order_to_report_rejects_invalid_client_order_id() {
+        let mut order = algo_order_with_price(None);
+        order.client_algo_id = "x-aHRE4BCj-R".to_string();
+
+        let result = order.to_order_status_report(
+            AccountId::from("BINANCE-FUTURES-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            UnixNanos::from(1_000_000_000u64),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "missing raw broker client order ID payload"
+        );
+    }
+
+    #[rstest]
     #[case(None, "123456789")]
     #[case(Some(""), "123456789")]
     #[case(Some("987654321"), "987654321")]
@@ -2696,6 +2841,7 @@ mod tests {
             reduce_only: Some(false),
             activate_price: None,
             callback_rate: None,
+            good_till_date: Some(0),
             create_time: Some(1_625_474_304_765),
             update_time: Some(1_625_474_304_765),
             trigger_time: None,

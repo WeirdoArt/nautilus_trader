@@ -13,9 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import inspect
 from decimal import Decimal
 
 import pytest
+from tests.providers import TestInstrumentProvider
 
 from nautilus_trader.model import AssetClass
 from nautilus_trader.model import BettingInstrument
@@ -33,6 +35,7 @@ from nautilus_trader.model import Equity
 from nautilus_trader.model import FuturesContract
 from nautilus_trader.model import FuturesSpread
 from nautilus_trader.model import IndexInstrument
+from nautilus_trader.model import InstrumentClass
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OptionContract
 from nautilus_trader.model import OptionKind
@@ -44,7 +47,58 @@ from nautilus_trader.model import Symbol
 from nautilus_trader.model import SyntheticInstrument
 from nautilus_trader.model import TokenizedAsset
 from nautilus_trader.model import Venue
-from tests.providers import TestInstrumentProvider
+
+
+GENERIC_INSTRUMENT_TYPES = (
+    BettingInstrument,
+    BinaryOption,
+    Cfd,
+    Commodity,
+    CryptoFuture,
+    CryptoFuturesSpread,
+    CryptoOption,
+    CryptoOptionSpread,
+    CryptoPerpetual,
+    CurrencyPair,
+    Equity,
+    FuturesContract,
+    FuturesSpread,
+    IndexInstrument,
+    OptionContract,
+    OptionSpread,
+    PerpetualContract,
+    TokenizedAsset,
+)
+
+GENERIC_INSTRUMENT_PROPERTIES = (
+    "asset_class",
+    "instrument_class",
+    "is_inverse",
+    "is_quanto",
+    "isin",
+    "lot_size",
+    "maker_fee",
+    "margin_init",
+    "margin_maint",
+    "max_notional",
+    "max_price",
+    "max_quantity",
+    "min_notional",
+    "min_price",
+    "min_quantity",
+    "multiplier",
+    "quote_currency",
+    "taker_fee",
+    "tick_scheme",
+)
+
+
+@pytest.mark.parametrize("instrument_type", GENERIC_INSTRUMENT_TYPES)
+def test_generic_instrument_inspection_contract(instrument_type):
+    for property_name in GENERIC_INSTRUMENT_PROPERTIES:
+        descriptor = inspect.getattr_static(instrument_type, property_name)
+
+        assert not callable(descriptor)
 
 
 def test_audusd_sim_construction():
@@ -550,6 +604,25 @@ def test_index_instrument_construction_and_roundtrip():
 
     assert idx.id == InstrumentId(Symbol("SPX"), Venue("CBOE"))
     assert idx.type_name == "IndexInstrument"
+    assert idx.asset_class == AssetClass.INDEX
+    assert idx.instrument_class == InstrumentClass.SPOT
+    assert idx.is_inverse is False
+    assert idx.is_quanto is False
+    assert idx.isin is None
+    assert idx.lot_size is None
+    assert idx.maker_fee == Decimal(0)
+    assert idx.margin_init == Decimal(0)
+    assert idx.margin_maint == Decimal(0)
+    assert idx.max_notional is None
+    assert idx.max_price is None
+    assert idx.max_quantity is None
+    assert idx.min_notional is None
+    assert idx.min_price is None
+    assert idx.min_quantity is None
+    assert idx.multiplier == Quantity.from_int(1)
+    assert idx.quote_currency == Currency.from_str("USD")
+    assert idx.taker_fee == Decimal(0)
+    assert idx.tick_scheme is None
 
     restored = IndexInstrument.from_dict(idx.to_dict())
 
@@ -750,6 +823,15 @@ def test_betting_instrument_construction_and_roundtrip():
     assert bi.selection_name == "Kansas City Chiefs"
     assert bi.selection_handicap == -9999999.0
     assert bi.betting_type == "ODDS"
+    assert bi.is_inverse is False
+    assert bi.is_quanto is False
+    assert bi.isin is None
+    assert bi.lot_size == Quantity.from_int(1)
+    assert bi.margin_init == Decimal(1)
+    assert bi.margin_maint == Decimal(1)
+    assert bi.multiplier == Quantity.from_int(1)
+    assert bi.quote_currency == Currency.from_str("GBP")
+    assert bi.tick_scheme == "BETFAIR"
 
     restored = BettingInstrument.from_dict(bi.to_dict())
 
@@ -925,6 +1007,103 @@ def test_notional_value_currency_pair():
 
     assert notional.currency == audusd.quote_currency
     assert notional.as_double() == pytest.approx(75_000.0)
+
+
+@pytest.mark.parametrize(
+    "instrument_type",
+    [CryptoFuture, CryptoOption, CryptoPerpetual, PerpetualContract],
+)
+@pytest.mark.parametrize(
+    ("settlement_code", "is_inverse", "is_quanto", "expected_amount", "expected_currency"),
+    [
+        ("USD", False, False, Decimal(2000), "USD"),
+        ("USDT", False, False, Decimal(2000), "USD"),
+        ("BTC", False, True, Decimal(2000), "BTC"),
+        ("ETH", True, False, Decimal("0.2"), "ETH"),
+    ],
+)
+def test_derivative_notional_value_contract(
+    instrument_type,
+    settlement_code,
+    is_inverse,
+    is_quanto,
+    expected_amount,
+    expected_currency,
+):
+    instrument = _make_derivative(instrument_type, settlement_code, is_inverse)
+    quantity = Quantity.from_int(2)
+    price = Price.from_str("100.00")
+
+    notional = instrument.notional_value(quantity, price)
+
+    assert instrument.is_quanto is is_quanto
+    assert notional.as_decimal() == expected_amount
+    assert notional.currency == Currency.from_str(expected_currency)
+
+    if is_inverse:
+        quote_notional = instrument.notional_value(quantity, price, use_quote_for_inverse=True)
+        assert quote_notional.as_decimal() == Decimal(2)
+        assert quote_notional.currency == Currency.from_str("USD")
+
+
+@pytest.mark.parametrize(
+    "instrument_type",
+    [CryptoFuture, CryptoOption, CryptoPerpetual, PerpetualContract],
+)
+def test_derivative_dict_roundtrip_preserves_fractional_lot_size(instrument_type):
+    original = _make_derivative(instrument_type, "USD", False)
+    values = original.to_dict()
+    values["lot_size"] = "0.25"
+
+    restored = instrument_type.from_dict(values)
+
+    assert restored.lot_size == Quantity.from_str("0.25")
+    assert restored.to_dict()["lot_size"] == "0.25"
+
+
+def _make_derivative(instrument_type, settlement_code, is_inverse):
+    common = {
+        "instrument_id": InstrumentId.from_str(f"{instrument_type.__name__.upper()}.SIM"),
+        "raw_symbol": Symbol(instrument_type.__name__.upper()),
+        "quote_currency": Currency.from_str("USD"),
+        "settlement_currency": Currency.from_str(settlement_code),
+        "is_inverse": is_inverse,
+        "price_precision": 2,
+        "size_precision": 0,
+        "price_increment": Price.from_str("0.01"),
+        "size_increment": Quantity.from_int(1),
+        "multiplier": Quantity.from_int(10),
+        "ts_event": 1,
+        "ts_init": 2,
+    }
+
+    if instrument_type is CryptoFuture:
+        return CryptoFuture(
+            **common,
+            underlying=Currency.from_str("ETH"),
+            activation_ns=3,
+            expiration_ns=4,
+        )
+    if instrument_type is CryptoOption:
+        return CryptoOption(
+            **common,
+            underlying=Currency.from_str("ETH"),
+            option_kind=OptionKind.CALL,
+            strike_price=Price.from_str("100.00"),
+            activation_ns=3,
+            expiration_ns=4,
+        )
+    if instrument_type is CryptoPerpetual:
+        return CryptoPerpetual(
+            **common,
+            base_currency=Currency.from_str("ETH"),
+        )
+    return PerpetualContract(
+        **common,
+        underlying="ETH",
+        asset_class=AssetClass.CRYPTOCURRENCY,
+        base_currency=Currency.from_str("ETH"),
+    )
 
 
 def test_synthetic_instrument_construction():

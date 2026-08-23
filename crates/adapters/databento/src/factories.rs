@@ -40,10 +40,7 @@ use crate::{
 #[derive(Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -62,6 +59,14 @@ pub struct DatabentoLiveClientConfig {
     /// Whether to timestamp bars on close.
     pub bars_timestamp_on_close: bool,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DatabentoLiveClientConfig {
+    publishers_filepath: PathBuf,
+    use_exchange_as_venue: bool,
+    bars_timestamp_on_close: bool,
+    venue_dataset_map: IndexMap<String, String>,
+});
 
 impl Debug for DatabentoLiveClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,10 +121,7 @@ impl ClientConfig for DatabentoLiveClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.databento",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

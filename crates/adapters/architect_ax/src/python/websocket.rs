@@ -34,12 +34,12 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{BarType, Data, InstrumentStatus, MarkPriceUpdate, OrderBookDeltas_API},
-    enums::{MarketStatusAction, OrderSide, OrderType, TimeInForce},
+    data::{BarType, Data, InstrumentStatus, MarkPriceUpdate},
+    enums::{MarketStatusAction, OrderSide, TimeInForce},
     events::OrderCancelRejected,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
+    python::{data::data_to_pyobject, instruments::pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
@@ -53,7 +53,8 @@ use crate::{
     },
     execution::{
         cleanup_terminal_order_tracking, create_order_accepted, create_order_canceled,
-        create_order_expired, create_order_filled, create_order_rejected,
+        create_order_expired, create_order_filled, create_order_rejected, create_order_updated,
+        replacement_venue_order_id,
     },
     http::models::AxOrderRejectReason,
     websocket::{
@@ -74,7 +75,7 @@ use crate::{
 /// at the Python boundary for parsing venue messages into Nautilus domain types.
 #[pyclass(
     name = "AxMdWebSocketClient",
-    module = "nautilus_trader.core.nautilus_pyo3.architect_ax"
+    module = "nautilus_trader.adapters.architect_ax"
 )]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.architect_ax")]
 pub struct PyAxMdWebSocketClient {
@@ -94,14 +95,20 @@ impl Debug for PyAxMdWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxMdWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, auth_token, heartbeat=30, proxy_url=None))]
-    fn py_new(url: String, auth_token: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
+    #[pyo3(signature = (url, auth_token, heartbeat=30, proxy_url=None, transport_backend=None))]
+    fn py_new(
+        url: String,
+        auth_token: String,
+        heartbeat: u64,
+        proxy_url: Option<String>,
+        transport_backend: Option<TransportBackend>,
+    ) -> Self {
         Self {
             inner: AxMdWebSocketClient::new(
                 url,
                 auth_token,
                 heartbeat,
-                TransportBackend::default(),
+                transport_backend.unwrap_or_default(),
                 proxy_url,
             ),
             instruments_cache: Arc::new(AtomicMap::new()),
@@ -110,13 +117,18 @@ impl PyAxMdWebSocketClient {
 
     #[staticmethod]
     #[pyo3(name = "without_auth")]
-    #[pyo3(signature = (url, heartbeat=30, proxy_url=None))]
-    fn py_without_auth(url: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
+    #[pyo3(signature = (url, heartbeat=30, proxy_url=None, transport_backend=None))]
+    fn py_without_auth(
+        url: String,
+        heartbeat: u64,
+        proxy_url: Option<String>,
+        transport_backend: Option<TransportBackend>,
+    ) -> Self {
         Self {
             inner: AxMdWebSocketClient::without_auth(
                 url,
                 heartbeat,
-                TransportBackend::default(),
+                transport_backend.unwrap_or_default(),
                 proxy_url,
             ),
             instruments_cache: Arc::new(AtomicMap::new()),
@@ -464,7 +476,7 @@ impl PyAxMdWebSocketClient {
 /// parsing at the Python boundary.
 #[pyclass(
     name = "AxOrdersWebSocketClient",
-    module = "nautilus_trader.core.nautilus_pyo3.architect_ax"
+    module = "nautilus_trader.adapters.architect_ax"
 )]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.architect_ax")]
 pub struct PyAxOrdersWebSocketClient {
@@ -483,13 +495,14 @@ impl Debug for PyAxOrdersWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxOrdersWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, account_id, trader_id, heartbeat=30, proxy_url=None))]
+    #[pyo3(signature = (url, account_id, trader_id, heartbeat=30, proxy_url=None, transport_backend=None))]
     fn py_new(
         url: String,
         account_id: AccountId,
         trader_id: TraderId,
         heartbeat: u64,
         proxy_url: Option<String>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         Self {
             inner: AxOrdersWebSocketClient::new(
@@ -497,7 +510,7 @@ impl PyAxOrdersWebSocketClient {
                 account_id,
                 trader_id,
                 heartbeat,
-                TransportBackend::default(),
+                transport_backend.unwrap_or_default(),
                 proxy_url,
             ),
         }
@@ -612,7 +625,7 @@ impl PyAxOrdersWebSocketClient {
                             log::debug!(
                                 "Open orders response: rid={}, count={}",
                                 resp.rid,
-                                resp.res.len()
+                                resp.res.orders.len()
                             );
                         }
                         AxOrdersWsMessage::Error(err) => {
@@ -644,11 +657,9 @@ impl PyAxOrdersWebSocketClient {
         instrument_id,
         client_order_id,
         order_side,
-        order_type,
         quantity,
         time_in_force,
-        price=None,
-        trigger_price=None,
+        price,
         post_only=false,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -660,11 +671,9 @@ impl PyAxOrdersWebSocketClient {
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         order_side: OrderSide,
-        order_type: OrderType,
         quantity: Quantity,
         time_in_force: TimeInForce,
-        price: Option<Price>,
-        trigger_price: Option<Price>,
+        price: Price,
         post_only: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
@@ -677,11 +686,9 @@ impl PyAxOrdersWebSocketClient {
                     instrument_id,
                     client_order_id,
                     order_side,
-                    order_type,
                     quantity,
                     time_in_force,
                     price,
-                    trigger_price,
                     post_only,
                 )
                 .await
@@ -790,11 +797,7 @@ fn handle_md_message(
 
             match parse_book_l2_deltas(&book, instrument, *sequence, ts_init) {
                 Ok(deltas) => {
-                    send_data_to_python(
-                        Data::Deltas(OrderBookDeltas_API::new(deltas)),
-                        call_soon,
-                        callback,
-                    );
+                    send_data_to_python(Data::Deltas(Box::new(deltas)), call_soon, callback);
                 }
                 Err(e) => log::error!("Failed to parse L2 deltas: {e}"),
             }
@@ -812,11 +815,7 @@ fn handle_md_message(
 
             match parse_book_l3_deltas(&book, instrument, *sequence, ts_init) {
                 Ok(deltas) => {
-                    send_data_to_python(
-                        Data::Deltas(OrderBookDeltas_API::new(deltas)),
-                        call_soon,
-                        callback,
-                    );
+                    send_data_to_python(Data::Deltas(Box::new(deltas)), call_soon, callback);
                 }
                 Err(e) => log::error!("Failed to parse L3 deltas: {e}"),
             }
@@ -882,11 +881,12 @@ fn handle_md_message(
             let mark_prices_subscribed = sdt_snap
                 .get(ticker.s.as_str())
                 .is_some_and(|e| e.mark_prices);
+
             if mark_prices_subscribed && let Some(mark_price) = ticker.m {
                 match Price::from_decimal_dp(mark_price, price_precision) {
                     Ok(price) => {
                         let update = MarkPriceUpdate::new(instrument_id, price, ts_event, ts_init);
-                        send_data_to_python(Data::MarkPriceUpdate(update), call_soon, callback);
+                        send_data_to_python(Data::MarkPrice(update), call_soon, callback);
                     }
                     Err(e) => {
                         log::error!("Failed to parse mark price for {}: {e}", ticker.s);
@@ -898,6 +898,7 @@ fn handle_md_message(
                 let status_subscribed = sdt_snap
                     .get(ticker.s.as_str())
                     .is_some_and(|e| e.instrument_status);
+
                 if status_subscribed {
                     let prev = instrument_states.insert(ticker.s, state);
                     if prev != Some(state) {
@@ -1000,14 +1001,23 @@ fn handle_order_event(
             }
         }
         AxWsOrderEvent::Replaced(msg) => {
-            let Some(order) = msg.updated_order() else {
-                log::warn!("Received AX replace event without order details");
-                return;
+            let replacement_venue_order_id = match replacement_venue_order_id(&msg) {
+                Ok(venue_order_id) => venue_order_id,
+                Err(e) => {
+                    log::warn!("Invalid AX replace event, awaiting reconciliation: {e}");
+                    return;
+                }
             };
 
-            if let Some(event) =
-                create_order_accepted(order, msg.ts, msg.tn, caches, account_id, clock)
-            {
+            if let Some(event) = create_order_updated(
+                &msg.no,
+                &msg.ro,
+                replacement_venue_order_id,
+                (msg.ts, msg.tn),
+                caches,
+                account_id,
+                clock,
+            ) {
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
@@ -1060,9 +1070,9 @@ fn drain_status_invalidations(
 }
 
 fn send_data_to_python(data: Data, call_soon: &Py<PyAny>, callback: &Py<PyAny>) {
-    Python::attach(|py| {
-        let py_obj = data_to_pycapsule(py, data);
-        call_python_threadsafe(py, call_soon, callback, py_obj);
+    Python::attach(|py| match data_to_pyobject(py, data) {
+        Ok(py_obj) => call_python_threadsafe(py, call_soon, callback, py_obj),
+        Err(e) => log::error!("Failed to convert data to Python object: {e}"),
     });
 }
 

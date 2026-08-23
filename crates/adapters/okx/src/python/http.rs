@@ -15,7 +15,7 @@
 
 //! Python bindings exposing OKX HTTP helper functions and data conversions.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_core::python::{
     IntoPyObjectNautilusExt, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err,
 };
@@ -35,7 +35,7 @@ use pyo3::{
 use super::{extract_optional_string, extract_optional_trigger_type};
 use crate::{
     common::enums::{
-        OKXEnvironment, OKXInstrumentType, OKXOrderStatus, OKXPositionMode, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXEnvironment, OKXInstrumentType, OKXPositionMode, OKXTradeMode,
     },
     http::{
         client::OKXHttpClient,
@@ -267,9 +267,12 @@ impl OKXHttpClient {
 
     /// Requests all instruments for the `instrument_type` from OKX.
     ///
+    /// Option requests require `instrument_family` (OKX `instFamily`), for example `BTC-USD`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP request fails or instrument parsing fails.
+    /// Returns an error if `instrument_type` is option and `instrument_family` is missing,
+    /// the HTTP request fails, or instrument parsing fails.
     ///
     /// # Returns
     ///
@@ -514,8 +517,8 @@ impl OKXHttpClient {
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -554,7 +557,7 @@ impl OKXHttpClient {
     /// - History endpoint (`/api/v5/market/history-candles`): ≤ 100 rows/call, ≤ 20 req/2s
     ///   - Used when: start is Some AND age > 100 days
     ///
-    /// Age is calculated as `Utc::now() - start` at the time of the first request.
+    /// Age is calculated as `Timestamp::now() - start` at the time of the first request.
     ///
     /// # Supported Aggregations
     ///
@@ -583,8 +586,8 @@ impl OKXHttpClient {
         &self,
         py: Python<'py>,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -642,8 +645,8 @@ impl OKXHttpClient {
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -788,8 +791,8 @@ impl OKXHttpClient {
         account_id: AccountId,
         instrument_type: Option<OKXInstrumentType>,
         instrument_id: Option<InstrumentId>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         open_only: bool,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -836,7 +839,7 @@ impl OKXHttpClient {
         instrument_id: Option<InstrumentId>,
         algo_id: Option<String>,
         algo_client_order_id: Option<ClientOrderId>,
-        state: Option<OKXOrderStatus>,
+        state: Option<OKXAlgoOrderStatus>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -912,8 +915,8 @@ impl OKXHttpClient {
         account_id: AccountId,
         instrument_type: Option<OKXInstrumentType>,
         instrument_id: Option<InstrumentId>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -1079,6 +1082,9 @@ impl OKXHttpClient {
                     speed_bump,
                     outcome,
                     slippage_pct,
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;
@@ -1574,6 +1580,13 @@ impl From<OKXHttpError> for PyErr {
             OKXHttpError::UnexpectedStatus { status, body } => {
                 to_pyruntime_err(format!("Unexpected HTTP status code {status}: {body}"))
             }
+            OKXHttpError::OperationTimeout { timeout_ms } => {
+                to_pyruntime_err(format!("Operation timed out after {timeout_ms}ms"))
+            }
+            OKXHttpError::RetryBudgetExceeded(msg) => {
+                to_pyruntime_err(format!("Retry budget exceeded: {msg}"))
+            }
+            OKXHttpError::EmptyResponse => to_pyruntime_err("Empty response"),
             // Validation/configuration errors
             OKXHttpError::MissingCredentials => {
                 to_pyvalue_err("Missing credentials for authenticated request")

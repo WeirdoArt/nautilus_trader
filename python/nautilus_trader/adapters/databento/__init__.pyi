@@ -8,18 +8,14 @@ import typing
 from nautilus_trader import model
 
 __all__ = [
-    "DatabentoDataClient",
     "DatabentoDataClientFactory",
     "DatabentoDataLoader",
-    "DatabentoHistoricalClient",
     "DatabentoImbalance",
-    "DatabentoLiveClient",
     "DatabentoLiveClientConfig",
     "DatabentoPublisher",
     "DatabentoStatisticType",
     "DatabentoStatisticUpdateAction",
     "DatabentoStatistics",
-    "DatabentoSubscriptionAck",
     "get_databento_arrow_schema_map",
 ]
 
@@ -83,111 +79,54 @@ class DatabentoDataLoader:
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.OrderBookDelta]: ...
-    def load_order_book_deltas_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-        include_trades: bool | None = None,
-    ) -> typing.Any: ...
     def load_order_book_depth10(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.OrderBookDepth10]: ...
-    def load_order_book_depth10_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_quotes(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.QuoteTick]: ...
-    def load_quotes_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-        include_trades: bool | None = None,
-    ) -> typing.Any: ...
     def load_bbo_quotes(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.QuoteTick]: ...
-    def load_bbo_quotes_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_cmbp_quotes(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.QuoteTick]: ...
-    def load_cmbp_quotes_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-        include_trades: bool | None = None,
-    ) -> typing.Any: ...
     def load_cbbo_quotes(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.QuoteTick]: ...
-    def load_cbbo_quotes_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_tbbo_trades(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.TradeTick]: ...
-    def load_tbbo_trades_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_tcbbo_trades(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.TradeTick]: ...
-    def load_tcbbo_trades_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_trades(
         self,
         filepath: str | os.PathLike | pathlib.Path,
         instrument_id: model.InstrumentId | None = None,
         price_precision: int | None = None,
     ) -> list[model.TradeTick]: ...
-    def load_trades_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-    ) -> typing.Any: ...
     def load_bars(
         self,
         filepath: str | os.PathLike | pathlib.Path,
@@ -195,13 +134,6 @@ class DatabentoDataLoader:
         price_precision: int | None = None,
         timestamp_on_close: bool = True,
     ) -> list[model.Bar]: ...
-    def load_bars_as_pycapsule(
-        self,
-        filepath: str | os.PathLike | pathlib.Path,
-        instrument_id: model.InstrumentId | None = None,
-        price_precision: int | None = None,
-        timestamp_on_close: bool = True,
-    ) -> typing.Any: ...
     def load_status(
         self,
         filepath: str | os.PathLike | pathlib.Path,
@@ -373,6 +305,14 @@ class DatabentoLiveClient:
 
 @typing.final
 class DatabentoLiveClientConfig:
+    @property
+    def publishers_filepath(self) -> pathlib.Path: ...
+    @property
+    def use_exchange_as_venue(self) -> bool: ...
+    @property
+    def bars_timestamp_on_close(self) -> bool: ...
+    @property
+    def venue_dataset_map(self) -> dict[str, str]: ...
     def __init__(
         self,
         api_key: str,

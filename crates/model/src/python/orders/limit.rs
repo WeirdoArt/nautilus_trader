@@ -400,7 +400,7 @@ impl LimitOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
     #[getter]
@@ -644,7 +644,7 @@ impl LimitOrder {
             |x| {
                 dict.set_item(
                     "tags",
-                    x.iter().map(|x| x.to_string()).collect::<Vec<String>>(),
+                    x.iter().map(ToString::to_string).collect::<Vec<String>>(),
                 )
             },
         )?;
@@ -670,7 +670,7 @@ impl LimitOrder {
         )?;
         self.avg_px.map_or_else(
             || dict.set_item("avg_px", py.None()),
-            |x| dict.set_item("avg_px", x),
+            |x| dict.set_item("avg_px", x.to_string()),
         )?;
         Ok(dict.into())
     }

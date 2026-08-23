@@ -31,7 +31,7 @@ use crate::common::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -84,6 +84,23 @@ pub struct BybitDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitDataClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: Option<u64>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for BybitDataClientConfig {
     fn default() -> Self {
@@ -159,7 +176,7 @@ impl BybitDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -197,8 +214,11 @@ pub struct BybitExecClientConfig {
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
     /// Heartbeat interval in seconds for WebSocket clients.
-    #[builder(default = 5)]
+    #[builder(default = 20)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication wait timeout (seconds), defaulting to
+    /// the client default when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
@@ -207,6 +227,11 @@ pub struct BybitExecClientConfig {
     /// Whether to generate position reports from wallet balances for SPOT positions.
     #[builder(default)]
     pub use_spot_position_reports: bool,
+    /// Whether to automatically repay SPOT margin borrows after BUY orders tracked by
+    /// this client and reported on the standard `execution` channel (not `execution.fast`)
+    /// fully fill.
+    #[builder(default)]
+    pub auto_repay_spot_borrows: bool,
     /// Leverage configuration for futures (symbol -> leverage).
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Position mode configuration for symbols (symbol -> mode).
@@ -217,6 +242,27 @@ pub struct BybitExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitExecClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_private: Option<String>,
+    base_url_ws_trade: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    recv_window_ms: u64,
+    account_id: Option<AccountId>,
+    use_spot_position_reports: bool,
+    auto_repay_spot_borrows: bool,
+    margin_mode: Option<BybitMarginMode>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for BybitExecClientConfig {
     fn default() -> Self {
@@ -386,7 +432,7 @@ mod tests {
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_types, vec![BybitProductType::Linear]);
         assert_eq!(config.http_timeout_secs, 60);
-        assert_eq!(config.heartbeat_interval_secs, 5);
+        assert_eq!(config.heartbeat_interval_secs, 20);
     }
 
     #[rstest]

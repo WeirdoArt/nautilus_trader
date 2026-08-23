@@ -21,18 +21,22 @@
 //! downstream reconciliation.
 
 use std::{
-    collections::VecDeque,
+    fmt::Debug,
     hash::Hash,
     sync::{Arc, Mutex},
 };
 
 use ahash::AHashMap;
 use dashmap::DashMap;
+use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
 use nautilus_core::{AtomicMap, MUTEX_POISONED, UUID4, UnixNanos, time::AtomicTime};
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{
+    ExecutionEventEmitter,
+    execution::{context::OrderIdentity, failure::CommandFailure},
+};
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType},
-    events::{OrderAccepted, OrderEventAny, OrderFilled, OrderRejected},
+    enums::OrderStatus,
+    events::{OrderAccepted, OrderEventAny, OrderFilled, OrderRejected, OrderUpdated},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
@@ -49,7 +53,8 @@ use crate::{
             OKX_FIELD_CLORDID, OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_FIELD_SUBCODE,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUCCESS_CODE,
         },
-        enums::OKXOrderStatus,
+        enums::{OKXOrderStatus, OKXOrderType},
+        failure::{classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
             is_market_price, parse_client_order_id, parse_millisecond_timestamp, parse_price,
             parse_quantity,
@@ -59,7 +64,7 @@ use crate::{
     websocket::{
         client::PendingOrderInfo,
         enums::OKXWsOperation,
-        handler::is_post_only_auto_cancel,
+        handler::{is_post_only_auto_cancel, is_unfilled_rpi_cancel},
         messages::{ExecutionReport, OKXOrderMsg, OKXWsMessage},
         parse::{
             OrderStateSnapshot, ParsedOrderEvent, parse_algo_order_msg, parse_order_event,
@@ -72,102 +77,35 @@ use crate::{
 /// Maximum entries held by the dedup sets before the oldest is evicted.
 const DEDUP_CAPACITY: usize = 10_000;
 
-/// Bounded deduplication set with FIFO eviction.
-///
-/// Insertions are tagged with a sequence number so a stale marker left
-/// behind by `remove` or by re-insertion of the same key cannot evict the
-/// live entry when it reaches the front of the queue.
 #[derive(Debug)]
-pub struct BoundedDedup<K> {
-    inner: Mutex<BoundedDedupInner<K>>,
-    capacity: usize,
-}
-
-#[derive(Debug)]
-struct BoundedDedupInner<K> {
-    set: AHashMap<K, u64>,
-    queue: VecDeque<(K, u64)>,
-    next_seq: u64,
-}
-
-impl<K> BoundedDedup<K>
+struct DedupCache<K>
 where
-    K: Eq + Hash + Clone,
+    K: Clone + Debug + Eq + Hash,
 {
-    /// Creates a new dedup set with the given maximum capacity.
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            inner: Mutex::new(BoundedDedupInner {
-                set: AHashMap::with_capacity(capacity),
-                queue: VecDeque::with_capacity(capacity),
-                next_seq: 0,
-            }),
-            capacity,
-        }
-    }
-
-    /// Returns `true` if the key is currently present.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
-    pub fn contains(&self, key: &K) -> bool {
-        self.inner
-            .lock()
-            .expect(MUTEX_POISONED)
-            .set
-            .contains_key(key)
-    }
-
-    /// Inserts the key. Returns `true` when the key was already present
-    /// (duplicate) and `false` when this call was the first insertion.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
-    pub fn check_and_insert(&self, key: K) -> bool {
-        let mut inner = self.inner.lock().expect(MUTEX_POISONED);
-        if inner.set.contains_key(&key) {
-            return true;
-        }
-        let seq = inner.next_seq;
-        inner.next_seq = inner.next_seq.wrapping_add(1);
-        inner.set.insert(key.clone(), seq);
-        inner.queue.push_back((key, seq));
-        while inner.queue.len() > self.capacity
-            && let Some((old_key, old_seq)) = inner.queue.pop_front()
-        {
-            // Skip if a fresher insertion has superseded this marker.
-            if inner.set.get(&old_key) == Some(&old_seq) {
-                inner.set.remove(&old_key);
-            }
-        }
-        false
-    }
-
-    /// Inserts the key without reporting whether it was already present.
-    pub fn insert(&self, key: K) {
-        let _ = self.check_and_insert(key);
-    }
-
-    /// Drops the key from the set if present. Returns `true` if it was found.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
-    pub fn remove(&self, key: &K) -> bool {
-        self.inner
-            .lock()
-            .expect(MUTEX_POISONED)
-            .set
-            .remove(key)
-            .is_some()
-    }
+    inner: Mutex<FifoCache<K, DEDUP_CAPACITY>>,
 }
 
-/// Order identity context stored at submission time, used by the WS dispatch
-/// task to produce proper order events without Cache access.
-///
-/// These fields are immutable for the lifetime of an order and are used to
-/// construct proper order events (OrderAccepted, OrderFilled, etc.) instead
-/// of execution reports.
-#[derive(Debug, Clone)]
-pub struct OrderIdentity {
-    pub instrument_id: InstrumentId,
-    pub strategy_id: StrategyId,
-    pub order_side: OrderSide,
-    pub order_type: OrderType,
+impl<K> DedupCache<K>
+where
+    K: Clone + Debug + Eq + Hash,
+{
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(FifoCache::new()),
+        }
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.inner.lock().expect(MUTEX_POISONED).contains(key)
+    }
+
+    fn insert(&self, key: K) -> bool {
+        self.inner.lock().expect(MUTEX_POISONED).insert(key)
+    }
+
+    fn remove(&self, key: &K) {
+        self.inner.lock().expect(MUTEX_POISONED).remove(key);
+    }
 }
 
 /// Shared state for cross-stream event deduplication between the private
@@ -175,28 +113,30 @@ pub struct OrderIdentity {
 #[derive(Debug)]
 pub struct WsDispatchState {
     pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
-    pub emitted_accepted: BoundedDedup<ClientOrderId>,
-    pub triggered_orders: BoundedDedup<ClientOrderId>,
-    pub filled_orders: BoundedDedup<ClientOrderId>,
-    pub terminal_orders: BoundedDedup<ClientOrderId>,
-    pub emitted_trades: BoundedDedup<TradeId>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    accepted_venue_order_ids: Mutex<FifoCacheMap<ClientOrderId, VenueOrderId, DEDUP_CAPACITY>>,
+    triggered_orders: DedupCache<ClientOrderId>,
+    filled_orders: DedupCache<ClientOrderId>,
+    terminal_orders: DedupCache<ClientOrderId>,
+    emitted_trades: DedupCache<TradeId>,
+    post_only_rejections: DedupCache<Ustr>,
 }
 
 impl Default for WsDispatchState {
     fn default() -> Self {
         Self {
             order_identities: DashMap::new(),
-            emitted_accepted: BoundedDedup::new(DEDUP_CAPACITY),
-            triggered_orders: BoundedDedup::new(DEDUP_CAPACITY),
-            filled_orders: BoundedDedup::new(DEDUP_CAPACITY),
-            terminal_orders: BoundedDedup::new(DEDUP_CAPACITY),
-            emitted_trades: BoundedDedup::new(DEDUP_CAPACITY),
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
+            accepted_venue_order_ids: Mutex::new(FifoCacheMap::new()),
+            triggered_orders: DedupCache::new(),
+            filled_orders: DedupCache::new(),
+            terminal_orders: DedupCache::new(),
+            emitted_trades: DedupCache::new(),
+            post_only_rejections: DedupCache::new(),
         }
     }
 }
@@ -219,26 +159,98 @@ impl WsDispatchState {
 }
 
 impl WsDispatchState {
-    pub(crate) fn insert_accepted(&self, cid: ClientOrderId) {
-        self.emitted_accepted.insert(cid);
+    /// Returns whether acceptance was already emitted for the order.
+    #[must_use]
+    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    pub fn contains_accepted(&self, cid: &ClientOrderId) -> bool {
+        self.accepted_venue_order_ids
+            .lock()
+            .expect(MUTEX_POISONED)
+            .contains_key(cid)
     }
 
-    pub(crate) fn insert_triggered(&self, cid: ClientOrderId) {
-        self.triggered_orders.insert(cid);
+    /// Records that acceptance was emitted for the order.
+    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    pub fn insert_accepted(&self, cid: ClientOrderId, venue_order_id: VenueOrderId) {
+        self.accepted_venue_order_ids
+            .lock()
+            .expect(MUTEX_POISONED)
+            .insert(cid, venue_order_id);
     }
 
-    pub(crate) fn insert_filled(&self, cid: ClientOrderId) {
-        self.filled_orders.insert(cid);
+    fn accepted_venue_order_id(&self, cid: &ClientOrderId) -> Option<VenueOrderId> {
+        self.accepted_venue_order_ids
+            .lock()
+            .expect(MUTEX_POISONED)
+            .get(cid)
+            .copied()
     }
 
-    pub(crate) fn insert_terminal(&self, cid: ClientOrderId) {
-        self.terminal_orders.insert(cid);
+    /// Returns whether the order was already triggered.
+    #[must_use]
+    pub fn contains_triggered(&self, cid: &ClientOrderId) -> bool {
+        self.triggered_orders.contains(cid)
+    }
+
+    /// Records that the order was triggered.
+    pub fn insert_triggered(&self, cid: ClientOrderId) {
+        let _ = self.triggered_orders.insert(cid);
+    }
+
+    /// Returns whether the order was already filled.
+    #[must_use]
+    pub fn contains_filled(&self, cid: &ClientOrderId) -> bool {
+        self.filled_orders.contains(cid)
+    }
+
+    /// Records that the order was filled.
+    pub fn insert_filled(&self, cid: ClientOrderId) {
+        let _ = self.filled_orders.insert(cid);
+    }
+
+    /// Returns whether the order already reached a terminal state.
+    #[must_use]
+    pub fn contains_terminal(&self, cid: &ClientOrderId) -> bool {
+        self.terminal_orders.contains(cid)
+    }
+
+    /// Records that the order reached a terminal state.
+    pub fn insert_terminal(&self, cid: ClientOrderId) {
+        let _ = self.terminal_orders.insert(cid);
     }
 
     /// Returns `true` if this trade was already emitted (duplicate).
     /// Uses atomic insert to avoid TOCTOU races between concurrent streams.
     pub fn check_and_insert_trade(&self, trade_id: TradeId) -> bool {
-        self.emitted_trades.check_and_insert(trade_id)
+        !self.emitted_trades.insert(trade_id)
+    }
+
+    #[must_use]
+    pub fn contains_trade(&self, trade_id: &TradeId) -> bool {
+        self.emitted_trades.contains(trade_id)
+    }
+
+    fn remove_accepted(&self, cid: &ClientOrderId) {
+        self.accepted_venue_order_ids
+            .lock()
+            .expect(MUTEX_POISONED)
+            .remove(cid);
+    }
+
+    fn remove_triggered(&self, cid: &ClientOrderId) {
+        self.triggered_orders.remove(cid);
+    }
+
+    fn remove_filled(&self, cid: &ClientOrderId) {
+        self.filled_orders.remove(cid);
+    }
+
+    fn insert_post_only_rejection(&self, order_id: Ustr) {
+        let _ = self.post_only_rejections.insert(order_id);
+    }
+
+    fn contains_post_only_rejection(&self, order_id: &Ustr) -> bool {
+        self.post_only_rejections.contains(order_id)
     }
 }
 
@@ -410,7 +422,7 @@ pub fn dispatch_ws_message(
                 let Some(ident) = state
                     .order_identities
                     .get(&client_order_id)
-                    .map(|entry| entry.clone())
+                    .map(|entry| *entry)
                 else {
                     log::warn!(
                         "Order response error for untracked order: \
@@ -424,6 +436,24 @@ pub fn dispatch_ws_message(
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(VenueOrderId::new);
+
+                match classify_okx_venue_code(s_code, reason.clone()) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "Ambiguous order response for {client_order_id}, awaiting reconciliation: \
+                             op={op:?} s_code={s_code} {reason}"
+                        );
+                        continue;
+                    }
+                    CommandFailure::NotSent(_) => {
+                        log::warn!(
+                            "Unexpected NotSent classification for venue order response: \
+                             op={op:?} cl_ord_id={cl_ord_id} s_code={s_code}"
+                        );
+                        continue;
+                    }
+                    CommandFailure::VenueRejected(_) => {}
+                }
 
                 match op {
                     OKXWsOperation::Order | OKXWsOperation::BatchOrders => {
@@ -479,17 +509,19 @@ pub fn dispatch_ws_message(
         }
         OKXWsMessage::SendFailed {
             request_id,
-            client_order_id,
+            client_order_ids,
             op,
             error,
         } => {
+            let failure = classify_okx_ws_failure(&error);
+            let is_ambiguous = matches!(failure, CommandFailure::Ambiguous(_));
             log::warn!(
                 "WebSocket send failed without structured venue response: \
-                 request_id={request_id}, client_order_id={client_order_id:?}, \
-                 op={op:?}, awaiting reconciliation: {error}"
+                 request_id={request_id}, client_order_ids={client_order_ids:?}, \
+                 op={op:?}, {failure:?}"
             );
 
-            if let Some(client_order_id) = client_order_id {
+            for client_order_id in client_order_ids {
                 let key = client_order_id.as_str();
 
                 match op {
@@ -498,7 +530,10 @@ pub fn dispatch_ws_message(
                         | OKXWsOperation::BatchOrders
                         | OKXWsOperation::OrderAlgo,
                     ) => {
-                        state.pending_orders.remove(key);
+                        if !is_ambiguous {
+                            state.pending_orders.remove(key);
+                        }
+                        emit_send_failed_submit(&failure, state, emitter, clock, client_order_id);
                     }
                     Some(
                         OKXWsOperation::CancelOrder
@@ -506,10 +541,15 @@ pub fn dispatch_ws_message(
                         | OKXWsOperation::MassCancel
                         | OKXWsOperation::CancelAlgos,
                     ) => {
-                        state.pending_cancels.remove(key);
+                        if !is_ambiguous {
+                            state.pending_cancels.remove(key);
+                        }
                     }
                     Some(OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders) => {
-                        state.pending_amends.remove(key);
+                        if !is_ambiguous {
+                            state.pending_amends.remove(key);
+                        }
+                        emit_send_failed_modify(&failure, state, emitter, clock, client_order_id);
                     }
                     _ => {}
                 }
@@ -518,7 +558,33 @@ pub fn dispatch_ws_message(
         OKXWsMessage::ChannelData { channel, .. } => {
             log::debug!("Ignoring data channel message on execution client: {channel:?}");
         }
-        OKXWsMessage::BookData { .. } | OKXWsMessage::Instruments(_) => {
+        OKXWsMessage::SubscriptionFailed {
+            channel,
+            inst_id,
+            code,
+            msg,
+        } => {
+            log::error!(
+                "OKX rejected {channel:?} subscription for {inst_id:?} \
+                 (code={code}, msg={msg}); execution updates for it will not flow"
+            );
+        }
+        OKXWsMessage::LiquidationWarnings(warnings) => {
+            for warning in warnings {
+                log::warn!(
+                    "Liquidation warning: inst_id={}, pos_side={:?}, pos={}, mgn_ratio={}, mark_px={}, mgn_mode={:?}",
+                    warning.inst_id,
+                    warning.pos_side,
+                    warning.pos,
+                    warning.mgn_ratio,
+                    warning.mark_px,
+                    warning.mgn_mode,
+                );
+            }
+        }
+        OKXWsMessage::BookData { .. }
+        | OKXWsMessage::RpiBookData { .. }
+        | OKXWsMessage::Instruments(_) => {
             log::debug!("Ignoring data message on execution client");
         }
         OKXWsMessage::Error(e) => {
@@ -558,9 +624,32 @@ fn dispatch_order_messages(
             continue;
         };
 
-        let Some(client_order_id) = parse_client_order_id(&msg.cl_ord_id) else {
+        let direct_client_order_id = parse_client_order_id(&msg.cl_ord_id);
+        let parent_client_order_id = msg
+            .algo_cl_ord_id
+            .as_deref()
+            .and_then(parse_client_order_id);
+
+        // Triggered child orders may have a generated or empty cl_ord_id.
+        // Resolve the tracked parent before falling back to a report.
+        let resolved = [direct_client_order_id, parent_client_order_id]
+            .into_iter()
+            .flatten()
+            .find_map(|client_order_id| {
+                state
+                    .order_identities
+                    .get(&client_order_id)
+                    .map(|identity| (client_order_id, Some(*identity)))
+            })
+            .or_else(|| {
+                direct_client_order_id
+                    .or(parent_client_order_id)
+                    .map(|client_order_id| (client_order_id, None))
+            });
+
+        let Some((client_order_id, identity)) = resolved else {
             log::debug!(
-                "Order without client_order_id (ord_id={}), sending as report",
+                "Order without client or algo client order ID (ord_id={}), sending as report",
                 msg.ord_id
             );
             dispatch_order_msg_as_report(
@@ -576,45 +665,32 @@ fn dispatch_order_messages(
             continue;
         };
 
-        // Resolve identity: check direct match first, then fall back to the
-        // parent algo order ID for triggered child orders. OKX assigns a new
-        // cl_ord_id to child orders when an algo/stop triggers, preserving the
-        // parent's client order ID in algo_cl_ord_id.
-        let (client_order_id, identity) = match state
-            .order_identities
-            .get(&client_order_id)
-            .map(|r| r.clone())
-        {
-            Some(ident) => (client_order_id, Some(ident)),
-            None => {
-                if let Some(parent_id) = msg
-                    .algo_cl_ord_id
-                    .as_deref()
-                    .and_then(parse_client_order_id)
-                {
-                    let parent_ident = state.order_identities.get(&parent_id).map(|r| r.clone());
-
-                    if parent_ident.is_some() {
-                        (parent_id, parent_ident)
-                    } else {
-                        (client_order_id, None)
-                    }
-                } else {
-                    (client_order_id, None)
-                }
-            }
-        };
-
         if let Some(ident) = identity {
-            if is_post_only_auto_cancel(msg) {
+            let is_post_only_cancel = is_post_only_auto_cancel(msg);
+
+            if is_post_only_cancel
+                || (!state.contains_accepted(&client_order_id) && is_unfilled_rpi_cancel(msg))
+            {
+                if is_post_only_cancel {
+                    state.insert_post_only_rejection(msg.ord_id);
+                }
+
                 let ts_event = parse_millisecond_timestamp(msg.u_time);
+                let reason = if msg.ord_type == OKXOrderType::Rpi {
+                    msg.cancel_source_reason
+                        .as_deref()
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("RPI order canceled before acceptance")
+                } else {
+                    "Post-only order would have taken liquidity"
+                };
                 let rejected = OrderRejected::new(
                     emitter.trader_id(),
                     ident.strategy_id,
                     instrument.id(),
                     client_order_id,
                     account_id,
-                    Ustr::from("Post-only order would have taken liquidity"),
+                    Ustr::from(reason),
                     UUID4::new(),
                     ts_event,
                     ts_init,
@@ -646,14 +722,7 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
-                    update_order_caches(
-                        msg,
-                        instrument,
-                        client_order_id,
-                        fee_cache,
-                        filled_qty_cache,
-                        order_state_cache,
-                    );
+                    update_order_state_cache(msg, instrument, client_order_id, order_state_cache);
                     dispatch_parsed_order_event(
                         event,
                         client_order_id,
@@ -667,9 +736,15 @@ fn dispatch_order_messages(
                         order_state_cache,
                         ts_init,
                     );
+                    update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
                 }
                 Err(e) => log::error!("Failed to parse order event for {client_order_id}: {e}"),
             }
+        } else if is_post_only_auto_cancel(msg) && state.contains_post_only_rejection(&msg.ord_id) {
+            log::debug!(
+                "Skipping replayed post-only rejection for {client_order_id}: ord_id={}",
+                msg.ord_id
+            );
         } else {
             log::debug!(
                 "Untracked order {client_order_id} (ord_id={}), sending as report for reconciliation",
@@ -726,10 +801,7 @@ fn dispatch_spread_order_messages(
             continue;
         };
 
-        let identity = state
-            .order_identities
-            .get(&client_order_id)
-            .map(|r| r.clone());
+        let identity = state.order_identities.get(&client_order_id).map(|r| *r);
 
         if let Some(ident) = identity {
             if is_spread_post_only_auto_cancel(msg) {
@@ -772,11 +844,10 @@ fn dispatch_spread_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
-                    update_spread_order_caches(
+                    update_spread_order_state_cache(
                         msg,
                         instrument,
                         client_order_id,
-                        filled_qty_cache,
                         order_state_cache,
                     );
                     dispatch_parsed_order_event(
@@ -792,6 +863,7 @@ fn dispatch_spread_order_messages(
                         order_state_cache,
                         ts_init,
                     );
+                    update_spread_fill_cache(msg, instrument, filled_qty_cache);
                 }
                 Err(e) => {
                     log::error!("Failed to parse spread order event for {client_order_id}: {e}");
@@ -838,20 +910,38 @@ fn dispatch_parsed_order_event(
 
     match event {
         ParsedOrderEvent::Accepted(e) => {
-            if state.emitted_accepted.contains(&client_order_id)
-                || state.filled_orders.contains(&client_order_id)
-                || state.triggered_orders.contains(&client_order_id)
-                || state.terminal_orders.contains(&client_order_id)
+            if state.contains_filled(&client_order_id) || state.contains_terminal(&client_order_id)
             {
                 log::debug!("Skipping duplicate Accepted for {client_order_id}");
                 return;
             }
-            state.insert_accepted(client_order_id);
+
+            if state.contains_accepted(&client_order_id) {
+                emit_venue_order_id_update_if_changed(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    identity,
+                    e.ts_event,
+                    emitter,
+                    state,
+                    order_state_cache,
+                    ts_init,
+                );
+                return;
+            }
+
+            if state.contains_triggered(&client_order_id) {
+                log::debug!("Skipping duplicate Accepted for {client_order_id}");
+                return;
+            }
+
+            state.insert_accepted(client_order_id, venue_order_id);
             is_terminal = false;
             emitter.send_order_event(OrderEventAny::Accepted(e));
         }
         ParsedOrderEvent::Triggered(e) => {
-            if state.filled_orders.contains(&client_order_id) {
+            if state.contains_filled(&client_order_id) {
                 log::debug!("Skipping stale Triggered for {client_order_id} (already filled)");
                 return;
             }
@@ -888,8 +978,8 @@ fn dispatch_parsed_order_event(
                 state,
                 ts_init,
             );
-            state.triggered_orders.remove(&client_order_id);
-            state.filled_orders.remove(&client_order_id);
+            state.remove_triggered(&client_order_id);
+            state.remove_filled(&client_order_id);
             is_terminal = true;
             emitter.send_order_event(OrderEventAny::Canceled(e));
         }
@@ -903,8 +993,8 @@ fn dispatch_parsed_order_event(
                 state,
                 ts_init,
             );
-            state.triggered_orders.remove(&client_order_id);
-            state.filled_orders.remove(&client_order_id);
+            state.remove_triggered(&client_order_id);
+            state.remove_filled(&client_order_id);
             is_terminal = true;
             emitter.send_order_event(OrderEventAny::Expired(e));
         }
@@ -922,15 +1012,25 @@ fn dispatch_parsed_order_event(
             emitter.send_order_event(OrderEventAny::Updated(e));
         }
         ParsedOrderEvent::Fill(fill_report) => {
-            let is_duplicate = state.check_and_insert_trade(fill_report.trade_id);
             is_terminal = venue_status == OKXOrderStatus::Filled;
 
-            if is_duplicate {
+            if state.check_and_insert_trade(fill_report.trade_id) {
                 log::debug!(
                     "Skipping duplicate fill for {client_order_id}: trade_id={}",
                     fill_report.trade_id
                 );
             } else {
+                emit_venue_order_id_update_if_changed(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    identity,
+                    fill_report.ts_event,
+                    emitter,
+                    state,
+                    order_state_cache,
+                    ts_init,
+                );
                 ensure_accepted_emitted(
                     client_order_id,
                     account_id,
@@ -941,7 +1041,7 @@ fn dispatch_parsed_order_event(
                     ts_init,
                 );
                 state.insert_filled(client_order_id);
-                state.triggered_orders.remove(&client_order_id);
+                state.remove_triggered(&client_order_id);
                 let filled = fill_report_to_order_filled(
                     &fill_report,
                     emitter.trader_id(),
@@ -964,7 +1064,7 @@ fn dispatch_parsed_order_event(
     if is_terminal {
         state.insert_terminal(client_order_id);
         state.order_identities.remove(&client_order_id);
-        state.emitted_accepted.remove(&client_order_id);
+        state.remove_accepted(&client_order_id);
         order_state_cache.remove(&client_order_id);
         // Keep fee_cache and filled_qty_cache entries: replayed terminal
         // messages go through the untracked report path and need prior
@@ -983,10 +1083,10 @@ fn ensure_accepted_emitted(
     state: &WsDispatchState,
     ts_init: UnixNanos,
 ) {
-    if state.emitted_accepted.contains(&client_order_id) {
+    if state.contains_accepted(&client_order_id) {
         return;
     }
-    state.insert_accepted(client_order_id);
+    state.insert_accepted(client_order_id, venue_order_id);
     let accepted = OrderAccepted::new(
         emitter.trader_id(),
         identity.strategy_id,
@@ -1000,6 +1100,50 @@ fn ensure_accepted_emitted(
         false,
     );
     emitter.send_order_event(OrderEventAny::Accepted(accepted));
+}
+
+#[expect(clippy::too_many_arguments)]
+fn emit_venue_order_id_update_if_changed(
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    venue_order_id: VenueOrderId,
+    identity: &OrderIdentity,
+    ts_event: UnixNanos,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    order_state_cache: &AHashMap<ClientOrderId, OrderStateSnapshot>,
+    ts_init: UnixNanos,
+) {
+    let Some(accepted_venue_order_id) = state.accepted_venue_order_id(&client_order_id) else {
+        return;
+    };
+
+    if accepted_venue_order_id == venue_order_id {
+        return;
+    }
+    let Some(snapshot) = order_state_cache.get(&client_order_id) else {
+        return;
+    };
+
+    state.insert_accepted(client_order_id, venue_order_id);
+    let updated = OrderUpdated::new(
+        emitter.trader_id(),
+        identity.strategy_id,
+        identity.instrument_id,
+        client_order_id,
+        snapshot.quantity,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        false,
+        Some(venue_order_id),
+        Some(account_id),
+        snapshot.price,
+        None,
+        None,
+        false,
+    );
+    emitter.send_order_event(OrderEventAny::Updated(updated));
 }
 
 /// Converts a [`FillReport`] into an [`OrderFilled`] event using tracked identity.
@@ -1056,10 +1200,11 @@ fn dispatch_order_msg_as_report(
         ts_init,
     ) {
         Ok(report) => {
+            dispatch_execution_reports(vec![report], emitter, state);
+
             if let Some(instrument) = instruments.get(&msg.inst_id) {
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
-            dispatch_execution_reports(vec![report], emitter, state);
         }
         Err(e) => log::error!("Failed to parse order message as report: {e}"),
     }
@@ -1076,26 +1221,23 @@ fn dispatch_spread_order_msg_as_report(
 ) {
     match parse_spread_order_msg(msg, account_id, instruments, filled_qty_cache, ts_init) {
         Ok(report) => {
+            dispatch_execution_reports(vec![report], emitter, state);
+
             if let Some(instrument) = instruments.get(&msg.sprd_id) {
                 update_spread_fill_cache(msg, instrument, filled_qty_cache);
             }
-            dispatch_execution_reports(vec![report], emitter, state);
         }
         Err(e) => log::error!("Failed to parse spread order message as report: {e}"),
     }
 }
 
 /// Updates fee, fill, and order state caches from a raw OKX order message.
-fn update_order_caches(
+fn update_order_state_cache(
     msg: &OKXOrderMsg,
     instrument: &InstrumentAny,
     client_order_id: ClientOrderId,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
 ) {
-    update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
-
     let venue_order_id = VenueOrderId::new(msg.ord_id);
     let quantity = parse_quantity(&msg.sz, instrument.size_precision()).unwrap_or_default();
     let price = if is_market_price(&msg.px) {
@@ -1114,15 +1256,12 @@ fn update_order_caches(
     );
 }
 
-fn update_spread_order_caches(
+fn update_spread_order_state_cache(
     msg: &OKXSpreadOrder,
     instrument: &InstrumentAny,
     client_order_id: ClientOrderId,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
 ) {
-    update_spread_fill_cache(msg, instrument, filled_qty_cache);
-
     let venue_order_id = VenueOrderId::new(msg.ord_id.as_str());
     let quantity = parse_quantity(&msg.sz, instrument.size_precision()).unwrap_or_default();
     let price = if is_market_price(&msg.px) {
@@ -1174,9 +1313,9 @@ pub fn dispatch_execution_reports(
                         // Guard form reformats awkwardly across multiple lines
                         #[allow(clippy::collapsible_match)]
                         OrderStatus::Accepted => {
-                            if state.terminal_orders.contains(&cid)
-                                || state.filled_orders.contains(&cid)
-                                || state.triggered_orders.contains(&cid)
+                            if state.contains_terminal(&cid)
+                                || state.contains_filled(&cid)
+                                || state.contains_triggered(&cid)
                             {
                                 log::debug!(
                                     "Skipping stale OrderStatusReport(Accepted) \
@@ -1184,9 +1323,13 @@ pub fn dispatch_execution_reports(
                                 );
                                 continue;
                             }
+
+                            if !state.contains_accepted(&cid) {
+                                state.insert_accepted(cid, order_report.venue_order_id);
+                            }
                         }
                         OrderStatus::Triggered => {
-                            if state.filled_orders.contains(&cid) {
+                            if state.contains_filled(&cid) {
                                 log::debug!(
                                     "Skipping stale OrderStatusReport(Triggered) \
                                      for {cid} (already filled)"
@@ -1198,12 +1341,12 @@ pub fn dispatch_execution_reports(
                         OrderStatus::Filled => {
                             state.insert_filled(cid);
                             state.insert_terminal(cid);
-                            state.triggered_orders.remove(&cid);
+                            state.remove_triggered(&cid);
                         }
                         OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => {
                             state.insert_terminal(cid);
-                            state.triggered_orders.remove(&cid);
-                            state.filled_orders.remove(&cid);
+                            state.remove_triggered(&cid);
+                            state.remove_filled(&cid);
                         }
                         _ => {}
                     }
@@ -1221,12 +1364,69 @@ pub fn dispatch_execution_reports(
 
                 if let Some(cid) = fill_report.client_order_id {
                     state.insert_filled(cid);
-                    state.triggered_orders.remove(&cid);
+                    state.remove_triggered(&cid);
                 }
                 emitter.send_fill_report(fill_report);
             }
         }
     }
+}
+
+fn emit_send_failed_submit(
+    failure: &CommandFailure,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    client_order_id: ClientOrderId,
+) {
+    let (CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason)) = failure else {
+        return;
+    };
+    let Some(ident) = state
+        .order_identities
+        .get(&client_order_id)
+        .map(|entry| *entry)
+    else {
+        return;
+    };
+
+    state.order_identities.remove(&client_order_id);
+    emitter.emit_order_rejected_event(
+        ident.strategy_id,
+        ident.instrument_id,
+        client_order_id,
+        reason,
+        clock.get_time_ns(),
+        false,
+    );
+}
+
+fn emit_send_failed_modify(
+    failure: &CommandFailure,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    client_order_id: ClientOrderId,
+) {
+    let (CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason)) = failure else {
+        return;
+    };
+    let Some(ident) = state
+        .order_identities
+        .get(&client_order_id)
+        .map(|entry| *entry)
+    else {
+        return;
+    };
+
+    emitter.emit_order_modify_rejected_event(
+        ident.strategy_id,
+        ident.instrument_id,
+        client_order_id,
+        None,
+        reason,
+        clock.get_time_ns(),
+    );
 }
 
 fn format_order_response_reason(s_code: &str, s_msg: &str, sub_code: &str) -> String {
@@ -1264,6 +1464,27 @@ pub fn emit_algo_cancel_rejections(
 
         let msg = item.s_msg.as_deref().unwrap_or("");
 
+        if matches!(
+            classify_okx_venue_code(code, msg),
+            CommandFailure::Ambiguous(_) | CommandFailure::NotSent(_)
+        ) {
+            if let Some(ctx) = contexts.get(i) {
+                log::warn!(
+                    "Ambiguous algo cancel response for {}, awaiting reconciliation: \
+                     algo_id={} sCode={code} sMsg={msg}",
+                    ctx.client_order_id,
+                    item.algo_id
+                );
+            } else {
+                log::warn!(
+                    "Ambiguous algo cancel response without context at index {i}: \
+                     algo_id={} sCode={code} sMsg={msg}",
+                    item.algo_id
+                );
+            }
+            continue;
+        }
+
         if let Some(ctx) = contexts.get(i) {
             let ts = clock.get_time_ns();
             emitter.emit_order_cancel_rejected_event(
@@ -1300,9 +1521,12 @@ pub fn emit_batch_cancel_failure(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_model::enums::{AccountType, OrderSide, OrderType};
     use rstest::rstest;
 
-    use super::{BoundedDedup, format_order_response_reason};
+    use super::*;
+    use crate::websocket::error::OKXWsError;
 
     #[rstest]
     #[case("51000", "Rejected", "", "Rejected")]
@@ -1324,76 +1548,79 @@ mod tests {
     }
 
     #[rstest]
-    fn test_bounded_dedup_check_and_insert_returns_false_on_first_insert() {
-        let dedup = BoundedDedup::<u32>::new(4);
-        assert!(!dedup.check_and_insert(1));
-        assert!(dedup.contains(&1));
-    }
+    #[case::ambiguous(OKXWsError::SendFailed("connection reset".to_string()), true)]
+    #[case::not_sent(OKXWsError::NoActiveClient, false)]
+    fn send_failure_preserves_only_ambiguous_pending_orders(
+        #[case] error: OKXWsError,
+        #[case] expected_pending: bool,
+    ) {
+        let client_order_ids = [
+            ClientOrderId::from("O-batch-pending-1"),
+            ClientOrderId::from("O-batch-pending-2"),
+        ];
+        let state = WsDispatchState::default();
+        let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+        let strategy_id = StrategyId::from("STRATEGY-001");
 
-    #[rstest]
-    fn test_bounded_dedup_check_and_insert_returns_true_on_duplicate() {
-        let dedup = BoundedDedup::<u32>::new(4);
-        dedup.insert(1);
-        assert!(dedup.check_and_insert(1));
-    }
-
-    #[rstest]
-    fn test_bounded_dedup_evicts_oldest_on_overflow() {
-        let dedup = BoundedDedup::<u32>::new(3);
-        dedup.insert(1);
-        dedup.insert(2);
-        dedup.insert(3);
-        dedup.insert(4);
-
-        assert!(!dedup.contains(&1));
-        assert!(dedup.contains(&2));
-        assert!(dedup.contains(&3));
-        assert!(dedup.contains(&4));
-    }
-
-    #[rstest]
-    fn test_bounded_dedup_evicted_key_is_not_treated_as_duplicate() {
-        let dedup = BoundedDedup::<u32>::new(2);
-        dedup.insert(1);
-        dedup.insert(2);
-        dedup.insert(3);
-
-        assert!(!dedup.check_and_insert(1));
-        assert!(dedup.contains(&1));
-    }
-
-    #[rstest]
-    fn test_bounded_dedup_remove_drops_entry() {
-        let dedup = BoundedDedup::<u32>::new(4);
-        dedup.insert(1);
-        assert!(dedup.remove(&1));
-        assert!(!dedup.contains(&1));
-        assert!(!dedup.remove(&1));
-    }
-
-    #[rstest]
-    fn test_bounded_dedup_remove_then_reinsert_does_not_double_count() {
-        let dedup = BoundedDedup::<u32>::new(2);
-        for k in 0u32..1000 {
-            dedup.insert(k);
-            dedup.remove(&k);
+        for client_order_id in client_order_ids {
+            state.pending_orders.insert(
+                client_order_id.to_string(),
+                PendingOrderInfo {
+                    trader_id: TraderId::from("TRADER-001"),
+                    strategy_id,
+                    instrument_id,
+                },
+            );
+            state.order_identities.insert(
+                client_order_id,
+                OrderIdentity {
+                    client_order_id,
+                    instrument_id,
+                    strategy_id,
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                },
+            );
         }
-        assert!(!dedup.contains(&0));
-        assert!(!dedup.contains(&500));
-    }
 
-    #[rstest]
-    fn test_bounded_dedup_reinsert_survives_stale_marker_eviction() {
-        let dedup = BoundedDedup::<u32>::new(3);
-        dedup.insert(1);
-        dedup.remove(&1);
+        let clock = get_atomic_clock_realtime();
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TRADER-001"),
+            AccountId::from("OKX-001"),
+            AccountType::Margin,
+            None,
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
+        let instruments = AtomicMap::new();
+        let mut fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
+        let mut order_state_cache = AHashMap::new();
 
-        dedup.insert(2);
-        dedup.insert(3);
-        dedup.insert(1);
+        dispatch_ws_message(
+            OKXWsMessage::SendFailed {
+                request_id: "req-batch-send-failure".to_string(),
+                client_order_ids: client_order_ids.to_vec(),
+                op: Some(OKXWsOperation::BatchOrders),
+                error,
+            },
+            &emitter,
+            &state,
+            AccountId::from("OKX-001"),
+            &instruments,
+            &mut fee_cache,
+            &mut filled_qty_cache,
+            &mut order_state_cache,
+            clock,
+        );
 
-        assert!(dedup.contains(&1));
-        assert!(dedup.contains(&2));
-        assert!(dedup.contains(&3));
+        for client_order_id in client_order_ids {
+            assert_eq!(
+                state.pending_orders.contains_key(client_order_id.as_str()),
+                expected_pending,
+                "pending state mismatch for {client_order_id}"
+            );
+        }
     }
 }

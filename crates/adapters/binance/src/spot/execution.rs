@@ -24,10 +24,11 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
+use jiff::Timestamp;
 use nautilus_common::{
     cache::fifo::FifoCache,
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -37,14 +38,14 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
-    datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_nanos},
+    MUTEX_POISONED, Params, UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MILLISECOND, checked_mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType},
+    enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType, TimeInForce},
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
         OrderExpired, OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
@@ -76,19 +77,22 @@ use crate::{
         consts::{
             BINANCE_GTX_ORDER_REJECT_CODE, BINANCE_NAUTILUS_SPOT_BROKER_ID,
             BINANCE_NEW_ORDER_REJECTED_CODE, BINANCE_SPOT_POST_ONLY_REJECT_MSG,
-            BINANCE_STATUS_UNKNOWN_CODE, BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
+            BINANCE_SPOT_SBE_WS_API_DEMO_URL, BINANCE_SPOT_SBE_WS_API_TESTNET_URL,
+            BINANCE_SPOT_SBE_WS_API_URL, BINANCE_STATUS_UNKNOWN_CODE,
+            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS,
         },
         credential::resolve_credentials,
         dispatch::{
             OrderIdentity, PendingOperation, PendingRequest, WsDispatchState,
             ensure_accepted_emitted,
         },
-        encoder::{decode_broker_id, encode_broker_id},
-        enums::{BinanceSide, BinanceTimeInForce},
+        encoder::{decode_client_order_id, encode_broker_id},
+        enums::{BinanceEnvironment, BinanceSide, BinanceTimeInForce},
         parse::{
-            parse_required_decimal, parse_required_price_at_precision,
+            parse_millis_or_init, parse_required_decimal, parse_required_price_at_precision,
             parse_required_quantity_at_precision,
         },
+        urls::{get_http_base_url_with_us, get_spot_user_stream_url},
     },
     config::BinanceExecClientConfig,
     spot::{
@@ -112,12 +116,13 @@ const ACCOUNT_TRADES_MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 const ACCOUNT_TRADES_PAGE_LIMIT: u32 = 1_000;
 
+const WS_RECONNECT_SETUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Live execution client for Binance Spot trading.
 ///
 /// Implements the [`ExecutionClient`] trait for order management on Binance Spot
-/// and Spot Margin markets. Uses WebSocket API as the primary transport for order
-/// operations (lowest latency), with HTTP API fallback when the WS connection is
-/// unavailable. The WebSocket User Data Stream provides real-time execution events.
+/// and Spot Margin markets. Uses WebSocket or HTTP for order commands. The WebSocket
+/// User Data Stream is required for successful execution lifecycle events.
 #[derive(Debug)]
 pub struct BinanceSpotExecutionClient {
     core: ExecutionClientCore,
@@ -127,10 +132,15 @@ pub struct BinanceSpotExecutionClient {
     dispatch_state: Arc<WsDispatchState>,
     http_client: BinanceSpotHttpClient,
     ws_trading_client: Option<BinanceSpotWsTradingClient>,
-    ws_trading_handle: Mutex<Option<JoinHandle<()>>>,
+    ws_trading_handle: Option<JoinHandle<()>>,
+    ws_user_data_client: Option<BinanceSpotWsTradingClient>,
+    ws_user_data_handle: Option<JoinHandle<()>>,
+    listen_key_keepalive_handle: Option<JoinHandle<()>>,
+    listen_key: Option<String>,
+    us_credentials: Option<(String, String)>,
     ws_authenticated: Arc<tokio::sync::Notify>,
     ws_user_data_subscribed: Arc<tokio::sync::Notify>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
 }
 
 impl BinanceSpotExecutionClient {
@@ -140,6 +150,7 @@ impl BinanceSpotExecutionClient {
     ///
     /// Returns an error if the HTTP client fails to initialize or credentials are missing.
     pub fn new(core: ExecutionClientCore, config: BinanceExecClientConfig) -> anyhow::Result<Self> {
+        config.validate()?;
         let (api_key, api_secret) = resolve_credentials(
             config.api_key.clone(),
             config.api_secret.clone(),
@@ -148,16 +159,22 @@ impl BinanceSpotExecutionClient {
         )?;
 
         let clock = get_atomic_clock_realtime();
+        let base_url_http = config.base_url_http.clone().or_else(|| {
+            config.us.then(|| {
+                get_http_base_url_with_us(config.product_type, config.environment, true).to_string()
+            })
+        });
 
-        let http_client = BinanceSpotHttpClient::new(
+        let http_client = BinanceSpotHttpClient::new_with_json_responses(
             config.environment,
             clock,
             Some(api_key.clone()),
             Some(api_secret.clone()),
-            config.base_url_http.clone(),
-            None, // recv_window
+            base_url_http,
+            Some(config.recv_window_ms),
             None, // timeout_secs
-            None, // proxy_url
+            config.proxy_url.clone(),
+            config.us,
         )
         .context("failed to construct Binance Spot HTTP client")?;
         let emitter = ExecutionEventEmitter::new(
@@ -168,17 +185,26 @@ impl BinanceSpotExecutionClient {
             core.base_currency,
         );
 
-        let ws_trading_client = if config.use_ws_trading {
-            Some(BinanceSpotWsTradingClient::new(
-                config.base_url_ws_trading.clone(),
-                api_key,
-                api_secret,
-                None, // heartbeat
-                config.transport_backend,
-            ))
-        } else {
+        let ws_trading_client = if config.us {
             None
+        } else {
+            let url = Some(Self::resolve_ws_trading_url(
+                config.base_url_ws_trading.clone(),
+                config.environment,
+            ));
+            Some(
+                BinanceSpotWsTradingClient::new(
+                    url,
+                    api_key.clone(),
+                    api_secret.clone(),
+                    Some(BINANCE_WS_HEARTBEAT_SECS),
+                    config.transport_backend,
+                )
+                .with_proxy(config.proxy_url.clone())
+                .with_recv_window(Some(config.recv_window_ms)),
+            )
         };
+        let us_credentials = config.us.then_some((api_key, api_secret));
 
         Ok(Self {
             core,
@@ -188,10 +214,26 @@ impl BinanceSpotExecutionClient {
             dispatch_state: Arc::new(WsDispatchState::default()),
             http_client,
             ws_trading_client,
-            ws_trading_handle: Mutex::new(None),
+            ws_trading_handle: None,
+            ws_user_data_client: None,
+            ws_user_data_handle: None,
+            listen_key_keepalive_handle: None,
+            listen_key: None,
+            us_credentials,
             ws_authenticated: Arc::new(tokio::sync::Notify::new()),
             ws_user_data_subscribed: Arc::new(tokio::sync::Notify::new()),
-            pending_tasks: Mutex::new(Vec::new()),
+            pending_tasks: TaskHandles::default(),
+        })
+    }
+
+    fn resolve_ws_trading_url(base_url: Option<String>, environment: BinanceEnvironment) -> String {
+        base_url.unwrap_or_else(|| {
+            match environment {
+                BinanceEnvironment::Live => BINANCE_SPOT_SBE_WS_API_URL,
+                BinanceEnvironment::Testnet => BINANCE_SPOT_SBE_WS_API_TESTNET_URL,
+                BinanceEnvironment::Demo => BINANCE_SPOT_SBE_WS_API_DEMO_URL,
+            }
+            .to_string()
         })
     }
 
@@ -215,24 +257,45 @@ impl BinanceSpotExecutionClient {
                 account_state.margins.clone(),
                 account_state.is_reported,
                 ts_now,
+                account_state.info,
             );
             Ok(())
         });
     }
 
-    /// Returns whether the WS trading client is connected and active.
-    fn ws_trading_active(&self) -> bool {
-        let dispatch_running = self
-            .ws_trading_handle
-            .lock()
-            .expect(MUTEX_POISONED)
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished());
+    fn ws_user_data_active(&self) -> bool {
+        let dispatch_running = if self.config.us {
+            self.ws_user_data_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        } else {
+            self.ws_trading_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        };
+        let user_data_active = if self.config.us {
+            self.ws_user_data_client
+                .as_ref()
+                .is_some_and(BinanceSpotWsTradingClient::is_user_data_active)
+        } else {
+            self.ws_trading_client
+                .as_ref()
+                .is_some_and(BinanceSpotWsTradingClient::is_user_data_active)
+        };
 
-        self.ws_trading_client
-            .as_ref()
-            .is_some_and(|client| client.is_active())
-            && dispatch_running
+        user_data_active && dispatch_running
+    }
+
+    fn ensure_ws_user_data_active(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ws_user_data_active(),
+            "Binance Spot user data stream is not active",
+        );
+        Ok(())
+    }
+
+    fn ws_order_transport_active(&self) -> bool {
+        self.config.use_ws_trading && self.ws_trading_client.is_some() && self.ws_user_data_active()
     }
 
     fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
@@ -253,6 +316,7 @@ impl BinanceSpotExecutionClient {
         let is_post_only = order.is_post_only();
         let is_quote_quantity = order.is_quote_quantity();
         let display_qty = order.display_qty();
+        let use_gtd = self.config.use_gtd;
         let clock = self.clock;
         let ts_init = self.clock.get_time_ns();
 
@@ -269,11 +333,16 @@ impl BinanceSpotExecutionClient {
             },
         );
 
-        if self.ws_trading_active() {
+        if self.ws_order_transport_active() {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
-            let params =
-                build_new_order_params(&order, client_order_id, is_post_only, is_quote_quantity)?;
+            let params = build_new_order_params(
+                &order,
+                client_order_id,
+                is_post_only,
+                is_quote_quantity,
+                use_gtd,
+            )?;
 
             // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
@@ -319,26 +388,15 @@ impl BinanceSpotExecutionClient {
                         is_post_only,
                         is_quote_quantity,
                         display_qty,
+                        use_gtd,
                     )
                     .await;
 
                 match result {
-                    Ok(report) => {
-                        dispatch_state.insert_accepted(client_order_id);
-                        let accepted = OrderAccepted::new(
-                            trader_id,
-                            strategy_id,
-                            instrument_id,
-                            client_order_id,
-                            report.venue_order_id,
-                            account_id,
-                            UUID4::new(),
-                            ts_init,
-                            ts_init,
-                            false,
-                        );
-                        event_emitter.send_order_event(OrderEventAny::Accepted(accepted));
-                    }
+                    Ok(report) => handle_spot_order_submit_success(
+                        client_order_id,
+                        report.venue_order_id,
+                    ),
                     Err(e) => {
                         if is_ambiguous_submit_error(&e) {
                             log::warn!(
@@ -387,7 +445,7 @@ impl BinanceSpotExecutionClient {
         let clock = self.clock;
         let command = cmd.clone();
 
-        if self.ws_trading_active() {
+        if self.ws_order_transport_active() {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
             let params = build_cancel_order_params(&command);
@@ -497,20 +555,130 @@ impl BinanceSpotExecutionClient {
         crate::common::execution::abort_pending_tasks(&self.pending_tasks);
     }
 
-    async fn enter_http_only_execution_mode(
+    async fn ws_setup_failure(
         &mut self,
         mut ws_trading: BinanceSpotWsTradingClient,
-        reason: &str,
-    ) {
-        log::error!(
-            "{reason}; entering Spot HTTP-only execution mode. Order commands use HTTP responses; execution reconciliation requires explicit queries until WS trading is re-enabled"
-        );
+        reason: String,
+    ) -> anyhow::Error {
+        ws_trading.mark_user_data_inactive();
+        log::error!("{reason}; Binance Spot private user data is required for execution");
 
-        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_trading_handle.take() {
             handle.abort();
         }
         ws_trading.disconnect().await;
         self.ws_trading_client = Some(ws_trading);
+        anyhow::anyhow!(reason)
+    }
+
+    async fn connect_us_user_data(&mut self) -> anyhow::Result<()> {
+        let (api_key, api_secret) = self
+            .us_credentials
+            .clone()
+            .context("Binance US user data credentials are unavailable")?;
+        let listen_key = self
+            .http_client
+            .inner()
+            .create_listen_key()
+            .await
+            .context("failed to create Binance US listen key")?
+            .listen_key;
+        let url = get_spot_user_stream_url(self.config.base_url_ws.as_deref(), &listen_key);
+        let mut ws_user_data = BinanceSpotWsTradingClient::new(
+            Some(url),
+            api_key,
+            api_secret,
+            Some(BINANCE_WS_HEARTBEAT_SECS),
+            self.config.transport_backend,
+        )
+        .with_proxy(self.config.proxy_url.clone());
+        ws_user_data
+            .connect()
+            .await
+            .context("failed to connect Binance US user data stream")?;
+
+        let ws_clone = ws_user_data.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+        let http_client = self.http_client.clone();
+        let dispatch_state = self.dispatch_state.clone();
+        let treat_expired_as_canceled = self.config.treat_expired_as_canceled;
+        let ws_authenticated = self.ws_authenticated.clone();
+        let ws_user_data_subscribed = self.ws_user_data_subscribed.clone();
+        let (setup_error_tx, _setup_error_rx) = tokio::sync::mpsc::unbounded_channel();
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+
+        let handle = get_runtime().spawn(async move {
+            while let Some(message) = ws_clone.recv().await {
+                if matches!(&message, BinanceSpotWsTradingMessage::Reconnected) {
+                    ws_clone.mark_user_data_active();
+                }
+                dispatch_ws_trading_message(
+                    message,
+                    &emitter,
+                    &http_client,
+                    account_id,
+                    treat_expired_as_canceled,
+                    clock,
+                    &dispatch_state,
+                    &ws_authenticated,
+                    &ws_user_data_subscribed,
+                    &setup_error_tx,
+                    &seen_trade_ids,
+                );
+            }
+            log::warn!("Binance US user data dispatch loop ended");
+        });
+        self.ws_user_data_handle = Some(handle);
+
+        let keepalive_http = self.http_client.clone();
+        let keepalive_key = listen_key.clone();
+
+        let keepalive = get_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                if let Err(e) = keepalive_http
+                    .inner()
+                    .extend_listen_key(&keepalive_key)
+                    .await
+                {
+                    log::warn!("Binance US listen key keepalive failed: {e}");
+                }
+            }
+        });
+        self.listen_key_keepalive_handle = Some(keepalive);
+
+        self.listen_key = Some(listen_key);
+        ws_user_data.mark_user_data_active();
+        self.ws_user_data_client = Some(ws_user_data);
+        Ok(())
+    }
+
+    async fn disconnect_us_user_data(&mut self) {
+        if let Some(handle) = self.ws_user_data_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.listen_key_keepalive_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(client) = self.ws_user_data_client.as_mut() {
+            client.mark_user_data_inactive();
+            client.disconnect().await;
+        }
+
+        if let Some(listen_key) = self.listen_key.take()
+            && let Err(e) = self.http_client.inner().close_listen_key(&listen_key).await
+        {
+            log::warn!("Failed to close Binance US listen key: {e}");
+        }
+        self.ws_user_data_client = None;
     }
 }
 
@@ -545,11 +713,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        let ws_setup_timeout = Duration::from_millis(self.config.ws_trading_setup_timeout_ms);
+
         // Load instruments if not already done
         if !self.core.instruments_initialized() {
             let instruments = self
                 .http_client
-                .request_instruments()
+                .request_instruments_with_config(&self.config.instrument_provider, self.config.us)
                 .await
                 .context("failed to request Binance Spot instruments")?;
 
@@ -582,7 +752,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         crate::common::execution::await_account_registered(&self.core, self.core.account_id, 30.0)
             .await?;
 
-        // Connect WS trading client (primary order transport)
+        if self.config.us {
+            self.connect_us_user_data().await?;
+        }
+
         if let Some(mut ws_trading) = self.ws_trading_client.take() {
             match ws_trading.connect().await {
                 Ok(()) => {
@@ -602,9 +775,79 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     let seen_trade_ids = std::sync::Arc::new(Mutex::new(FifoCache::new()));
 
                     let handle = get_runtime().spawn(async move {
+                        let mut resubscribing = false;
+
                         loop {
                             match ws_trading_clone.recv().await {
                                 Some(msg) => {
+                                    match &msg {
+                                        BinanceSpotWsTradingMessage::Reconnected => {
+                                            ws_trading_clone.mark_user_data_inactive();
+                                            resubscribing = true;
+                                            if let Err(e) = ws_trading_clone.session_logon().await {
+                                                resubscribing = false;
+                                                log::error!(
+                                                    "Failed to re-authenticate Binance Spot user data stream: {e}"
+                                                );
+                                            }
+                                        }
+                                        BinanceSpotWsTradingMessage::Authenticated if resubscribing => {
+                                            if let Err(e) =
+                                                ws_trading_clone.subscribe_user_data().await
+                                            {
+                                                resubscribing = false;
+                                                log::error!(
+                                                    "Failed to resubscribe Binance Spot user data stream: {e}"
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        BinanceSpotWsTradingMessage::UserDataSubscribed { .. } => {
+                                            let was_resubscribing = resubscribing;
+                                            resubscribing = false;
+                                            ws_trading_clone.mark_user_data_active();
+
+                                            if was_resubscribing {
+                                                continue;
+                                            }
+                                        }
+                                        BinanceSpotWsTradingMessage::AuthenticationRejected(reason)
+                                            if resubscribing =>
+                                        {
+                                            log::warn!(
+                                                "Binance Spot reconnect authentication failed; retrying: {reason}"
+                                            );
+                                            tokio::time::sleep(WS_RECONNECT_SETUP_RETRY_DELAY).await;
+
+                                            if let Err(e) = ws_trading_clone.session_logon().await {
+                                                resubscribing = false;
+                                                log::error!(
+                                                    "Failed to retry Binance Spot reconnect authentication: {e}"
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        BinanceSpotWsTradingMessage::UserDataSubscriptionRejected(reason)
+                                            if resubscribing =>
+                                        {
+                                            log::warn!(
+                                                "Binance Spot reconnect user data subscription failed; retrying: {reason}"
+                                            );
+                                            tokio::time::sleep(WS_RECONNECT_SETUP_RETRY_DELAY).await;
+
+                                            if let Err(e) =
+                                                ws_trading_clone.subscribe_user_data().await
+                                            {
+                                                resubscribing = false;
+                                                log::error!(
+                                                    "Failed to retry Binance Spot user data subscription: {e}"
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+
                                     dispatch_ws_trading_message(
                                         msg,
                                         &emitter,
@@ -627,15 +870,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         }
                     });
 
-                    *self.ws_trading_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+                    self.ws_trading_handle = Some(handle);
 
                     if let Err(e) = ws_trading.session_logon().await {
                         let reason = format!("WS session logon failed: {e}");
-                        self.enter_http_only_execution_mode(ws_trading, &reason)
-                            .await;
+                        return Err(self.ws_setup_failure(ws_trading, reason).await);
                     } else {
                         let auth_result = wait_for_ws_setup_response(
-                            Duration::from_secs(10),
+                            ws_setup_timeout,
                             self.ws_authenticated.notified(),
                             &mut ws_setup_error_rx,
                             "WS session authentication timed out",
@@ -643,15 +885,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         .await;
 
                         if let Err(e) = auth_result {
-                            self.enter_http_only_execution_mode(ws_trading, &e.to_string())
-                                .await;
+                            return Err(self.ws_setup_failure(ws_trading, e.to_string()).await);
                         } else if let Err(e) = ws_trading.subscribe_user_data().await {
                             let reason = format!("WS user data subscribe failed: {e}");
-                            self.enter_http_only_execution_mode(ws_trading, &reason)
-                                .await;
+                            return Err(self.ws_setup_failure(ws_trading, reason).await);
                         } else {
                             let subscribe_result = wait_for_ws_setup_response(
-                                Duration::from_secs(10),
+                                ws_setup_timeout,
                                 self.ws_user_data_subscribed.notified(),
                                 &mut ws_setup_error_rx,
                                 "WS user data subscription timed out",
@@ -659,8 +899,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             .await;
 
                             if let Err(e) = subscribe_result {
-                                self.enter_http_only_execution_mode(ws_trading, &e.to_string())
-                                    .await;
+                                return Err(self.ws_setup_failure(ws_trading, e.to_string()).await);
                             } else {
                                 self.ws_trading_client = Some(ws_trading);
                             }
@@ -669,10 +908,37 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 }
                 Err(e) => {
                     let reason = format!("Failed to connect WS trading API: {e}");
-                    self.enter_http_only_execution_mode(ws_trading, &reason)
-                        .await;
+                    return Err(self.ws_setup_failure(ws_trading, reason).await);
                 }
             }
+        }
+
+        let refresh_secs = self.config.instrument_refresh_interval_secs;
+        if refresh_secs > 0 {
+            let http_client = self.http_client.clone();
+            let provider = self.config.instrument_provider.clone();
+            let us = self.config.us;
+            self.spawn_task("instrument_refresh", async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                interval.tick().await;
+
+                loop {
+                    interval.tick().await;
+
+                    match http_client
+                        .request_instruments_with_config(&provider, us)
+                        .await
+                    {
+                        Ok(instruments) => log::debug!(
+                            "Refreshed Binance Spot execution instruments: count={}",
+                            instruments.len()
+                        ),
+                        Err(e) => {
+                            log::warn!("Binance Spot execution instrument refresh failed: {e}");
+                        }
+                    }
+                }
+            });
         }
 
         self.core.set_connected();
@@ -685,14 +951,24 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        if let Some(client) = self.ws_trading_client.as_ref() {
+            client.mark_user_data_inactive();
+        }
+
+        if let Some(client) = self.ws_user_data_client.as_ref() {
+            client.mark_user_data_inactive();
+        }
+
         // Abort WS trading task and disconnect
-        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_trading_handle.take() {
             handle.abort();
         }
 
         if let Some(ref mut ws_trading) = self.ws_trading_client {
             ws_trading.disconnect().await;
         }
+
+        self.disconnect_us_user_data().await;
 
         self.abort_pending_tasks();
 
@@ -749,9 +1025,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -765,9 +1042,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
 
         // Spawn instrument bootstrap task
         let http_client = self.http_client.clone();
+        let provider = self.config.instrument_provider.clone();
+        let us = self.config.us;
 
         get_runtime().spawn(async move {
-            match http_client.request_instruments().await {
+            match http_client
+                .request_instruments_with_config(&provider, us)
+                .await
+            {
                 Ok(instruments) => {
                     if instruments.is_empty() {
                         log::warn!("No instruments returned for Binance Spot");
@@ -798,8 +1080,24 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        if let Some(client) = self.ws_trading_client.as_ref() {
+            client.mark_user_data_inactive();
+        }
+
+        if let Some(client) = self.ws_user_data_client.as_ref() {
+            client.mark_user_data_inactive();
+        }
+
         // Abort WS trading task
-        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+        if let Some(handle) = self.ws_trading_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.ws_user_data_handle.take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.listen_key_keepalive_handle.take() {
             handle.abort();
         }
 
@@ -962,7 +1260,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 loop {
                     let start = if from_id.is_none() {
                         Some(
-                            chrono::DateTime::from_timestamp_millis(window_start)
+                            Timestamp::from_millisecond(window_start)
                                 .context("invalid Binance Spot account-trades start time")?,
                         )
                     } else {
@@ -970,7 +1268,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     };
                     let end = if from_id.is_none() {
                         Some(
-                            chrono::DateTime::from_timestamp_millis(window_end)
+                            Timestamp::from_millisecond(window_end)
                                 .context("invalid Binance Spot account-trades end time")?,
                         )
                     } else {
@@ -1101,10 +1399,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
 
         let ts_now = self.clock.get_time_ns();
 
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins_to_nanos(mins);
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = if let Some(mins) = lookback_mins {
+            let lookback_ns = checked_mins_to_nanos(mins)
+                .context("lookback minutes exceed the nanosecond range")?;
+            Some(UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns)))
+        } else {
+            None
+        };
 
         // Binance requires instrument_id for historical orders (open_only=false).
         // Use open_only=true for mass status to get all open orders across instruments.
@@ -1201,6 +1502,12 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        if order.time_in_force() == TimeInForce::Gtd && self.config.use_gtd {
+            time_in_force_to_binance_spot(order.time_in_force(), self.config.use_gtd)?;
+        }
+
+        self.ensure_ws_user_data_active()?;
+
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
         self.emitter.emit_order_submitted(&order);
 
@@ -1213,6 +1520,8 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
+        self.ensure_ws_user_data_active()?;
+
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
         if let Some(order) = orders.iter().find(|order| order.is_closed()) {
@@ -1223,7 +1532,11 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             return Ok(());
         }
 
-        let params = match build_spot_order_list_params(cmd.order_list.id.as_ref(), &orders) {
+        let params = match build_spot_order_list_params(
+            cmd.order_list.id.as_ref(),
+            &orders,
+            self.config.use_gtd,
+        ) {
             Ok(request) => request,
             Err(reason) => {
                 for order in &orders {
@@ -1252,60 +1565,20 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let trader_id = self.core.trader_id;
         let account_id = self.core.account_id;
         let clock = self.clock;
-        let ts_init = self.clock.get_time_ns();
         let http_client = self.http_client.clone();
         let dispatch_state = self.dispatch_state.clone();
 
         self.spawn_task("submit_order_list_http", async move {
-            let response = http_client.submit_oco_order_list(&params).await;
-
-            match response {
-                Ok(response) => {
-                    for order in &orders {
-                        let encoded_client_order_id = encode_broker_id(
-                            &order.client_order_id(),
-                            BINANCE_NAUTILUS_SPOT_BROKER_ID,
-                        );
-                        let Some(report) = response
-                            .orders
-                            .iter()
-                            .find(|report| report.client_order_id == encoded_client_order_id)
-                        else {
-                            log::warn!(
-                                "OCO response missing leg for {}, awaiting reconciliation",
-                                order.client_order_id()
-                            );
-                            continue;
-                        };
-
-                        let client_order_id = order.client_order_id();
-                        dispatch_state.insert_accepted(client_order_id);
-                        let accepted = OrderAccepted::new(
-                            trader_id,
-                            order.strategy_id(),
-                            order.instrument_id(),
-                            client_order_id,
-                            VenueOrderId::from(report.order_id.to_string().as_str()),
-                            account_id,
-                            UUID4::new(),
-                            ts_init,
-                            clock.get_time_ns(),
-                            false,
-                        );
-                        event_emitter.send_order_event(OrderEventAny::Accepted(accepted));
-                    }
-                }
-                Err(e) => {
-                    handle_spot_order_list_submit_error(
-                        &event_emitter,
-                        &dispatch_state,
-                        trader_id,
-                        account_id,
-                        clock,
-                        &orders,
-                        e,
-                    )?;
-                }
+            if let Err(e) = submit_spot_order_list(&http_client, &params).await {
+                handle_spot_order_list_submit_error(
+                    &event_emitter,
+                    &dispatch_state,
+                    trader_id,
+                    account_id,
+                    clock,
+                    &orders,
+                    e,
+                )?;
             }
 
             Ok(())
@@ -1358,12 +1631,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let order_type = order.order_type();
         let time_in_force = order.time_in_force();
         let quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let use_gtd = self.config.use_gtd;
 
-        if self.ws_trading_active() {
+        if self.ws_order_transport_active() {
             let command = cmd;
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
-            let params = build_cancel_replace_params(&command, &order, quantity)?;
+            let params = build_cancel_replace_params(&command, &order, quantity, use_gtd)?;
 
             // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
@@ -1409,6 +1683,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                                 quantity,
                                 time_in_force,
                                 command.price,
+                                use_gtd,
                             )
                             .await
                     }
@@ -1484,7 +1759,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         let account_id = self.core.account_id;
         let clock = self.clock;
 
-        if self.ws_trading_active() {
+        if self.ws_order_transport_active() {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let symbol = cmd.instrument_id.symbol.to_string();
 
@@ -1960,6 +2235,10 @@ fn dispatch_ws_trading_message(
             log::debug!("WS trading API authenticated");
             ws_authenticated.notify_one();
         }
+        BinanceSpotWsTradingMessage::AuthenticationRejected(reason) => {
+            log::error!("WS trading API authentication failed: {reason}");
+            let _ = ws_setup_error_tx.send(reason);
+        }
         BinanceSpotWsTradingMessage::Reconnected => {
             log::info!("WS trading API reconnected");
         }
@@ -1972,6 +2251,10 @@ fn dispatch_ws_trading_message(
             log::error!("WS trading API error: {err}");
             let _ = ws_setup_error_tx.send(err);
         }
+        BinanceSpotWsTradingMessage::UserDataSubscriptionRejected(reason) => {
+            log::error!("WS trading API user data subscription failed: {reason}");
+            let _ = ws_setup_error_tx.send(reason);
+        }
     }
 }
 
@@ -1980,6 +2263,7 @@ fn build_new_order_params(
     client_order_id: ClientOrderId,
     is_post_only: bool,
     is_quote_quantity: bool,
+    use_gtd: bool,
 ) -> anyhow::Result<NewOrderParams> {
     let binance_side = BinanceSide::try_from(order.order_side())?;
     let binance_order_type = order_type_to_binance_spot(order.order_type(), is_post_only)?;
@@ -2002,8 +2286,9 @@ fn build_new_order_params(
             | BinanceSpotOrderType::StopLossLimit
             | BinanceSpotOrderType::TakeProfitLimit
     );
+    let binance_tif = time_in_force_to_binance_spot(order.time_in_force(), use_gtd)?;
     let binance_tif = if supports_tif {
-        Some(time_in_force_to_binance_spot(order.time_in_force())?)
+        Some(binance_tif)
     } else {
         None
     };
@@ -2039,11 +2324,12 @@ fn build_new_order_params(
 fn build_spot_order_list_params(
     order_list_id: &str,
     orders: &[OrderAny],
+    use_gtd: bool,
 ) -> Result<NewOcoOrderListParams, String> {
     let has_grouped_order = orders.iter().any(is_grouped_order);
 
     if has_grouped_order {
-        return build_spot_oco_order_list_params(order_list_id, orders);
+        return build_spot_oco_order_list_params(order_list_id, orders, use_gtd);
     }
 
     Err("Binance Spot order-list submission currently supports only OCO lists".to_string())
@@ -2052,6 +2338,7 @@ fn build_spot_order_list_params(
 fn build_spot_oco_order_list_params(
     order_list_id: &str,
     orders: &[OrderAny],
+    use_gtd: bool,
 ) -> Result<NewOcoOrderListParams, String> {
     if orders.len() != 2 {
         return Err(format!(
@@ -2092,9 +2379,14 @@ fn build_spot_oco_order_list_params(
     let mut below = None;
 
     for order in orders {
-        let params =
-            build_new_order_params(order, order.client_order_id(), order.is_post_only(), false)
-                .map_err(|e| e.to_string())?;
+        let params = build_new_order_params(
+            order,
+            order.client_order_id(),
+            order.is_post_only(),
+            false,
+            use_gtd,
+        )
+        .map_err(|e| e.to_string())?;
 
         match spot_oco_leg_position(params.side, params.order_type)? {
             SpotOcoLegPosition::Above => {
@@ -2188,6 +2480,25 @@ fn is_grouped_order(order: &OrderAny) -> bool {
         .is_some_and(|linked_order_ids| !linked_order_ids.is_empty())
 }
 
+fn handle_spot_order_submit_success(client_order_id: ClientOrderId, venue_order_id: VenueOrderId) {
+    log::debug!(
+        "Order submit succeeded: client_order_id={client_order_id}, venue_order_id={venue_order_id}",
+    );
+}
+
+async fn submit_spot_order_list(
+    http_client: &BinanceSpotHttpClient,
+    params: &NewOcoOrderListParams,
+) -> Result<(), BinanceSpotHttpError> {
+    let response = http_client.submit_oco_order_list(params).await?;
+    log::debug!(
+        "Order list submit succeeded: order_list_id={}, order_count={}",
+        response.order_list_id,
+        response.orders.len(),
+    );
+    Ok(())
+}
+
 fn handle_spot_order_list_submit_error(
     event_emitter: &ExecutionEventEmitter,
     dispatch_state: &WsDispatchState,
@@ -2262,10 +2573,11 @@ fn build_cancel_replace_params(
     cmd: &ModifyOrder,
     order: &impl Order,
     quantity: Quantity,
+    use_gtd: bool,
 ) -> anyhow::Result<CancelReplaceOrderParams> {
     let binance_side = BinanceSide::try_from(order.order_side())?;
     let binance_order_type = order_type_to_binance_spot(order.order_type(), false)?;
-    let binance_tif = time_in_force_to_binance_spot(order.time_in_force())?;
+    let binance_tif = time_in_force_to_binance_spot(order.time_in_force(), use_gtd)?;
 
     let cancel_order_id: Option<i64> = cmd
         .venue_order_id
@@ -2323,10 +2635,14 @@ fn dispatch_execution_report(
         .get_instrument(&symbol)
         .map_or((8, 8), |i| (i.price_precision(), i.size_precision()));
 
-    let client_order_id = ClientOrderId::new(decode_broker_id(
-        &report.client_order_id,
-        BINANCE_NAUTILUS_SPOT_BROKER_ID,
-    ));
+    let client_order_id =
+        match decode_client_order_id(&report.client_order_id, BINANCE_NAUTILUS_SPOT_BROKER_ID) {
+            Ok(client_order_id) => client_order_id,
+            Err(e) => {
+                log::warn!("Skipping Spot execution report with invalid client order ID: {e}");
+                return;
+            }
+        };
 
     let identity = dispatch_state
         .order_identities
@@ -2381,7 +2697,7 @@ fn dispatch_tracked_execution_report(
     ts_init: UnixNanos,
 ) {
     let venue_order_id = VenueOrderId::new(report.order_id.to_string());
-    let ts_event = UnixNanos::from_millis(report.event_time as u64);
+    let ts_event = parse_millis_or_init(report.event_time, "Spot execution event time", ts_init);
 
     match report.execution_type {
         BinanceSpotExecutionType::New => {
@@ -2862,6 +3178,33 @@ mod tests {
     use crate::common::enums::BinanceEnvironment;
 
     #[rstest]
+    #[case::live(BinanceEnvironment::Live, BINANCE_SPOT_SBE_WS_API_URL)]
+    #[case::testnet(BinanceEnvironment::Testnet, BINANCE_SPOT_SBE_WS_API_TESTNET_URL)]
+    #[case::demo(BinanceEnvironment::Demo, BINANCE_SPOT_SBE_WS_API_DEMO_URL)]
+    fn test_resolve_ws_trading_url_uses_environment_default(
+        #[case] environment: BinanceEnvironment,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            BinanceSpotExecutionClient::resolve_ws_trading_url(None, environment),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_ws_trading_url_preserves_override() {
+        let expected = "wss://example.com/ws-api/v3";
+
+        assert_eq!(
+            BinanceSpotExecutionClient::resolve_ws_trading_url(
+                Some(expected.to_string()),
+                BinanceEnvironment::Testnet,
+            ),
+            expected
+        );
+    }
+
+    #[rstest]
     fn test_dispatch_ws_trading_message_emits_cancel_rejected_and_clears_pending_request() {
         let clock = get_atomic_clock_realtime();
         let (emitter, mut rx) = create_test_emitter(clock);
@@ -3148,6 +3491,53 @@ mod tests {
     }
 
     #[rstest]
+    fn test_http_submit_success_defers_acceptance_to_user_stream() {
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let client_order_id = ClientOrderId::from("O-20200101-000000-000-000-0");
+        let instrument_id = InstrumentId::from("ETHUSDT.BINANCE");
+        let dispatch_state = Arc::new(create_tracked_dispatch_state(
+            client_order_id,
+            instrument_id,
+        ));
+        handle_spot_order_submit_success(client_order_id, VenueOrderId::from("12345678"));
+
+        assert!(!dispatch_state.has_emitted_accepted(&client_order_id));
+        assert!(rx.try_recv().is_err());
+        let new_json = crate::common::testing::load_fixture_string(
+            "spot/user_data_json/execution_report_new.json",
+        );
+        let report: BinanceSpotExecutionReport = serde_json::from_str(&new_json).unwrap();
+        let identity = dispatch_state
+            .order_identities
+            .get(&client_order_id)
+            .unwrap()
+            .clone();
+        dispatch_tracked_execution_report(
+            &report,
+            &emitter,
+            AccountId::from("BINANCE-001"),
+            false,
+            &dispatch_state,
+            &Arc::new(Mutex::new(FifoCache::new())),
+            client_order_id,
+            &identity,
+            instrument_id,
+            2,
+            8,
+            clock.get_time_ns(),
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExecutionEvent::Order(OrderEventAny::Accepted(event)))
+                if event.client_order_id == client_order_id
+                    && event.venue_order_id == VenueOrderId::from("12345678")
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
     #[case::gtx(
         BinanceSpotHttpError::BinanceError {
             code: BINANCE_GTX_ORDER_REJECT_CODE,
@@ -3326,6 +3716,34 @@ mod tests {
                 .all(|e| !matches!(e, ExecutionEvent::Order(OrderEventAny::Filled(_)))),
             "invalid fill quantity must not emit OrderFilled",
         );
+    }
+
+    #[rstest]
+    fn test_dispatch_execution_report_invalid_client_order_id_emits_nothing() {
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = WsDispatchState::default();
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+        let json = crate::common::testing::load_fixture_string(
+            "spot/user_data_json/execution_report_new.json",
+        );
+        let mut report: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+        report.client_order_id = "x-TD67BGP9-R".to_string();
+
+        dispatch_execution_report(
+            &report,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            false,
+            &dispatch_state,
+            &seen_trade_ids,
+            clock.get_time_ns(),
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(dispatch_state.order_identities.is_empty());
     }
 
     #[rstest]

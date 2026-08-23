@@ -9,13 +9,13 @@ Examples include `AAPL.XNAS`, `MSFT.XNAS`, and venue-specific ETF symbols.
 ## Fields
 
 | Field             | Rust type          | Python type        | Required/default | Notes                                    |
-|-------------------|--------------------|--------------------|------------------|------------------------------------------|
+| ----------------- | ------------------ | ------------------ | ---------------- | ---------------------------------------- |
 | `instrument_id`   | `InstrumentId`     | `InstrumentId`     | Required         | Stored as `id` in Rust.                  |
 | `raw_symbol`      | `Symbol`           | `Symbol`           | Required         | Native venue symbol.                     |
 | `currency`        | `Currency`         | `Currency`         | Required         | Quote and settlement currency.           |
 | `price_precision` | `u8`               | `int`              | Required         | Decimal places allowed for prices.       |
 | `price_increment` | `Price`            | `Price`            | Required         | Smallest valid price step.               |
-| `lot_size`        | `Option<Quantity>` | `Quantity \| None` | `None`           | Board lot or whole‑share lot size.       |
+| `lot_size`        | `Option<Quantity>` | `Quantity \| None` | `None`           | Board lot or whole-share lot size.       |
 | `ts_event`        | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
 | `ts_init`         | `UnixNanos`        | `int`              | Required         | Initialization timestamp in nanoseconds. |
 | `isin`            | `Option<Ustr>`     | `str \| None`      | `None`           | International Securities ID when known.  |
@@ -91,7 +91,7 @@ aapl = Equity(
 Representative adapters that create or consume `Equity` instruments include:
 
 - [Databento](../../integrations/databento.md) for listed US equities and ETFs.
-- [Interactive Brokers](../../integrations/ib.md) for listed equity contracts.
+- [Interactive Brokers](../../integrations/interactive_brokers.md) for listed equity contracts.
 
 ## Related guides
 

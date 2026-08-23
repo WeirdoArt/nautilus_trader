@@ -19,5 +19,22 @@ from nautilus_trader._fixup import fixup_module_names
 from nautilus_trader._libnautilus.polymarket import *  # noqa: F403 (undefined-local-with-import-star)
 
 
+__all__ = [
+    "POLYMARKET",
+    "POLYMARKET_CLIENT_ID",
+    "POLYMARKET_VENUE",
+    "PolymarketDataClientConfig",
+    "PolymarketDataClientFactory",
+    "PolymarketDataLoader",
+    "PolymarketExecClientConfig",
+    "PolymarketExecutionClientFactory",
+    "PolymarketFeeModel",
+    "PolymarketInstrumentProviderConfig",
+    "PolymarketRtdsCryptoPrice",
+    "PolymarketRtdsEquityPrice",
+    "PolymarketUpDownEventSlugConfig",
+    "SignatureType",
+]
+
 fixup_module_names(globals(), __name__)
 del fixup_module_names

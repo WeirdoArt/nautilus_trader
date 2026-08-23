@@ -36,6 +36,11 @@ pub struct MyStrategy {
 appended to all client order IDs from this strategy, preventing collisions
 when multiple strategies trade the same instrument.
 
+The tag cannot contain a hyphen, because the runtime reads it back from the
+final hyphen-separated part of the strategy ID. `StrategyCore::new` panics on
+an invalid tag; use `StrategyCore::new_checked` to handle it as an error
+instead.
+
 ```rust
 impl MyStrategy {
     pub fn new(instrument_id: InstrumentId) -> Self {
@@ -169,7 +174,7 @@ nautilus_strategy!(MyStrategy, {
 The `Strategy` trait provides these facade methods:
 
 | Method                | Action                                          |
-|-----------------------|-------------------------------------------------|
+| --------------------- | ----------------------------------------------- |
 | `submit_order`        | Submit a new order to the venue.                |
 | `submit_order_list`   | Submit a list of contingent orders.             |
 | `modify_order`        | Modify price, quantity, or trigger price.       |

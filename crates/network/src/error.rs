@@ -22,12 +22,25 @@ use thiserror::Error;
 /// Error type for send operations in network clients.
 #[derive(Error, Debug)]
 pub enum SendError {
+    /// The send input is invalid.
+    #[error("send failed: invalid input ({0})")]
+    InvalidInput(String),
     /// The client has been closed or is disconnecting.
     #[error("send failed: client closed or disconnecting")]
     Closed,
     /// Timed out waiting for the client to become active.
     #[error("send failed: timeout waiting for active state")]
     Timeout,
+    /// Timed out while writing to the transport, so delivery is undetermined.
+    ///
+    /// Unlike [`SendError::Timeout`], which reports that a send never started, the write was
+    /// cancelled after it began: the peer may or may not have received the message. Callers must
+    /// not treat this as a plain retry.
+    #[error("send failed: timed out writing to transport, delivery undetermined")]
+    WriteTimeout,
+    /// The connection changed before an ownership-bound message reached the writer.
+    #[error("send failed: connection changed before write")]
+    ConnectionChanged,
     /// Failed to send because the writer channel is closed.
     #[error("send failed: broken pipe ({0})")]
     BrokenPipe(String),

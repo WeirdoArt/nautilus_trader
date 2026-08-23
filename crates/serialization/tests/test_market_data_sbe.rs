@@ -28,7 +28,7 @@ use nautilus_model::{
         OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         stubs::{
             stub_bar, stub_delta, stub_deltas, stub_depth10, stub_instrument_close,
-            stub_instrument_status, stub_trade_ethusdt_buyer,
+            stub_instrument_status, stub_trade_ethusdt_buy,
         },
     },
     enums::{
@@ -60,7 +60,7 @@ macro_rules! sbe_roundtrip_test {
 sbe_roundtrip_test!(test_quote_tick_roundtrip, QuoteTick::default(), QuoteTick);
 sbe_roundtrip_test!(
     test_trade_tick_roundtrip,
-    stub_trade_ethusdt_buyer(),
+    stub_trade_ethusdt_buy(),
     TradeTick
 );
 sbe_roundtrip_test!(
@@ -110,6 +110,23 @@ fn test_book_order_roundtrip() {
 }
 
 #[rstest]
+fn test_sbe_resolved_raw_width_roundtrip() {
+    // Price and Quantity raws exceed 64 bits only under high precision, so this pins decode to
+    // the model's resolved alias rather than this crate's own feature.
+    let value = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("50000.00"),
+        Quantity::from("20000.00"),
+        123_456,
+    );
+
+    let bytes = value.to_sbe().unwrap();
+    let decoded = BookOrder::from_sbe(&bytes).unwrap();
+
+    assert_book_order_fields(&value, &decoded);
+}
+
+#[rstest]
 fn test_order_book_delta_roundtrip() {
     let value = stub_delta();
 
@@ -131,9 +148,14 @@ fn test_order_book_deltas_roundtrip() {
 
 #[rstest]
 fn test_order_book_deltas_preserve_delta_instrument_ids() {
-    let value = OrderBookDeltas::new(
-        InstrumentId::from("AAPL.XNAS"),
-        vec![
+    // Built as a literal because `OrderBookDeltas::new` rejects children whose
+    // instrument ID differs from the wrapper's. The heterogeneity is the point
+    // here: SBE encodes each child's own ID, and this pins that it survives a
+    // round trip. Wrapper metadata matches what the constructor derives from
+    // the last child.
+    let value = OrderBookDeltas {
+        instrument_id: InstrumentId::from("AAPL.XNAS"),
+        deltas: vec![
             OrderBookDelta::new(
                 InstrumentId::from("AAPL.XNAS"),
                 BookAction::Add,
@@ -163,7 +185,11 @@ fn test_order_book_deltas_preserve_delta_instrument_ids() {
                 13.into(),
             ),
         ],
-    );
+        flags: 1,
+        sequence: 2,
+        ts_event: 12.into(),
+        ts_init: 13.into(),
+    };
 
     let bytes = value.to_sbe().unwrap();
     let decoded = OrderBookDeltas::from_sbe(&bytes).unwrap();
@@ -258,6 +284,48 @@ fn test_funding_rate_update_zero_values_roundtrip() {
 
     assert_eq!(decoded.interval, Some(0));
     assert_eq!(decoded.next_funding_ns, Some(0.into()));
+}
+
+#[rstest]
+fn test_funding_rate_update_reserved_interval_returns_encode_error() {
+    let value = FundingRateUpdate::new(
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        dec!(0.0001),
+        Some(u16::MAX),
+        None,
+        9876543210.into(),
+        9876543211.into(),
+    );
+
+    let result = value.to_sbe();
+
+    assert_eq!(
+        result,
+        Err(SbeEncodeError::ReservedValue {
+            field: "FundingRateUpdate.interval",
+        })
+    );
+}
+
+#[rstest]
+fn test_funding_rate_update_reserved_next_funding_returns_encode_error() {
+    let value = FundingRateUpdate::new(
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        dec!(0.0001),
+        None,
+        Some(u64::MAX.into()),
+        9876543210.into(),
+        9876543211.into(),
+    );
+
+    let result = value.to_sbe();
+
+    assert_eq!(
+        result,
+        Err(SbeEncodeError::ReservedValue {
+            field: "FundingRateUpdate.next_funding_ns",
+        })
+    );
 }
 
 #[rstest]
@@ -493,7 +561,7 @@ fn test_data_any_quote_roundtrip() {
 
 #[rstest]
 fn test_data_any_trade_roundtrip() {
-    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(stub_trade_ethusdt_buyer()));
+    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(stub_trade_ethusdt_buy()));
 }
 
 #[rstest]

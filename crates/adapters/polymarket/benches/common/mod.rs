@@ -15,9 +15,9 @@
 
 //! Shared utilities for polymarket criterion benches.
 //!
-//! Fixtures live as inline `&'static str` consts shaped exactly like the venue
-//! wire format. Keeping them inline (rather than reading from `test_data/`)
-//! makes each bench self-contained and removes filesystem variance.
+//! Fixtures are compile-time `&'static str` consts shaped exactly like the venue
+//! wire format. Most are inline; shared HTTP and user-channel fixtures use
+//! `include_str!` from `test_data/`. Neither form reads the filesystem at runtime.
 //!
 //! Each criterion bench is a separate compilation unit that pulls in this
 //! module, but uses only a subset of the helpers and fixtures. Without the
@@ -134,9 +134,8 @@ pub(crate) fn instrument_precisions() -> (u8, u8) {
 }
 
 pub(crate) mod fixtures {
-    //! Inline WS / REST frame strings shaped exactly like the venue wire
-    //! format. Each fixture exercises one envelope or report variant
-    //! end-to-end and is kept small enough to be obvious at a glance.
+    //! WS / REST frame strings shaped exactly like the venue wire format. Each
+    //! fixture exercises one envelope or report variant end-to-end.
 
     /// WS market `book` snapshot (tagged with `event_type: book`).
     pub(crate) const MARKET_BOOK: &str = r#"{
@@ -162,10 +161,8 @@ pub(crate) mod fixtures {
 
     /// WS market `price_change` (tagged with `event_type: price_change`).
     ///
-    /// Single-change frame: production splits each `price_changes` entry into
-    /// its own one-element `PolymarketQuotes` and calls `parse_book_deltas`
-    /// per change (see `src/data.rs` `MarketWsMessage::PriceChange` handler),
-    /// so the bench unit is one change, not the multi-change envelope.
+    /// Single-change frame for the inbound parser benchmark. The dispatch
+    /// benchmark uses a separate interleaved multi-instrument fixture.
     pub(crate) const MARKET_PRICE_CHANGE: &str = r#"{
         "event_type": "price_change",
         "market": "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917",
@@ -194,6 +191,18 @@ pub(crate) mod fixtures {
         "size": "25.0",
         "timestamp": "1703875202000"
     }"#;
+
+    pub(crate) const USER_ORDER: &str = include_str!("../../test_data/ws_user_order_msg.json");
+
+    pub(crate) const USER_ORDER_CAPTURED: &str =
+        include_str!("../../test_data/ws_user_order_fok_killed.json");
+
+    pub(crate) const USER_TRADE: &str = include_str!("../../test_data/ws_user_trade_msg.json");
+
+    pub(crate) const USER_BATCH: &str = include_str!("../../test_data/ws_user_batch_msg.json");
+
+    /// HTTP REST `GET /book` response used by the market-submit pipeline.
+    pub(crate) const HTTP_BOOK: &str = include_str!("../../test_data/clob_book_response.json");
 
     /// HTTP REST `GET /orders` row used by `parse_order_status_report`.
     pub(crate) const HTTP_OPEN_ORDER: &str = r#"{

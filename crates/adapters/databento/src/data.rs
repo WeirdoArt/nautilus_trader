@@ -33,7 +33,7 @@ use databento::{dbn, live::Subscription};
 use indexmap::IndexMap;
 use nautilus_common::{
     clients::DataClient,
-    live::{runner::get_data_event_sender, runtime::get_runtime},
+    live::{runner::get_data_event_sender, runtime::get_runtime, task::TaskHandles},
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -58,7 +58,6 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, Symbol, Venue},
     instruments::{Instrument, InstrumentAny},
 };
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -177,7 +176,7 @@ pub struct DatabentoDataClient {
     /// Feed handler command senders per dataset.
     cmd_channels: Arc<Mutex<AHashMap<String, tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>>,
     /// Task handles for lifecycle management.
-    task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    task_handles: Arc<TaskHandles>,
     /// Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// Publisher to venue mapping.
@@ -234,7 +233,7 @@ impl DatabentoDataClient {
             historical,
             loader,
             cmd_channels: Arc::new(Mutex::new(AHashMap::new())),
-            task_handles: Arc::new(Mutex::new(Vec::new())),
+            task_handles: Arc::new(TaskHandles::default()),
             cancellation_token: CancellationToken::new(),
             publisher_venue_map: Arc::new(publisher_venue_map),
             symbol_venue_map: Arc::new(AtomicMap::new()),
@@ -321,14 +320,7 @@ impl DatabentoDataClient {
     }
 
     fn abort_active_tasks(&self) {
-        let handles = {
-            let mut task_handles = self.task_handles.lock().expect(MUTEX_POISONED);
-            std::mem::take(&mut *task_handles)
-        };
-
-        for handle in handles {
-            handle.abort();
-        }
+        self.task_handles.abort_all();
     }
 
     /// Initializes the live feed handler for streaming data.
@@ -432,11 +424,8 @@ impl DatabentoDataClient {
             }
         });
 
-        {
-            let mut handles = self.task_handles.lock().expect(MUTEX_POISONED);
-            handles.push(feed_handle);
-            handles.push(msg_handle);
-        }
+        self.task_handles.push(feed_handle);
+        self.task_handles.push(msg_handle);
 
         cmd_tx
     }
@@ -513,12 +502,7 @@ impl DataClient for DatabentoDataClient {
         self.send_close_to_active_feeds();
         self.clear_feed_channels();
 
-        let handles = {
-            let mut task_handles = self.task_handles.lock().expect(MUTEX_POISONED);
-            std::mem::take(&mut *task_handles)
-        };
-
-        for handle in handles {
+        for handle in self.task_handles.take_all() {
             if let Err(e) = handle.await
                 && !e.is_cancelled()
             {
@@ -1228,7 +1212,7 @@ impl DataClient for DatabentoDataClient {
             match historical_client.get_range_order_book_deltas(params).await {
                 Ok(deltas) => {
                     log::debug!("Retrieved {} order book deltas", deltas.len());
-                    let response = DataResponse::BookDeltas(BookDeltasResponse::new(
+                    let response = BookDeltasResponse::new(
                         request_id,
                         client_id,
                         instrument_id,
@@ -1237,9 +1221,15 @@ impl DataClient for DatabentoDataClient {
                         end_nanos,
                         get_atomic_clock_realtime().get_time_ns(),
                         request_params,
-                    ));
+                    );
 
-                    send_data_response(&data_sender, response, "book deltas");
+                    for response in partition_book_deltas_response(response) {
+                        send_data_response(
+                            &data_sender,
+                            DataResponse::BookDeltas(response),
+                            "book deltas",
+                        );
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to request order book deltas: {e}");
@@ -1357,6 +1347,31 @@ fn send_data_response(
     }
 }
 
+fn partition_book_deltas_response(mut response: BookDeltasResponse) -> Vec<BookDeltasResponse> {
+    if response.data.is_empty() {
+        return vec![response];
+    }
+
+    let mut partitions = IndexMap::new();
+
+    for delta in std::mem::take(&mut response.data) {
+        partitions
+            .entry(delta.instrument_id)
+            .or_insert_with(Vec::new)
+            .push(delta);
+    }
+
+    partitions
+        .into_iter()
+        .map(|(instrument_id, data)| {
+            let mut child = response.clone();
+            child.instrument_id = instrument_id;
+            child.data = data;
+            child
+        })
+        .collect()
+}
+
 fn requested_instrument(
     instruments: Vec<InstrumentAny>,
     instrument_id: InstrumentId,
@@ -1437,6 +1452,7 @@ mod tests {
     use nautilus_common::live::runner::replace_data_event_sender;
     use nautilus_core::UUID4;
     use nautilus_model::{
+        data::OrderBookDelta,
         identifiers::{ClientId, InstrumentId},
         instruments::{CurrencyPair, InstrumentAny},
         types::{Currency, Price, Quantity},
@@ -1480,15 +1496,12 @@ mod tests {
         let mut client = test_data_client();
 
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
-        {
-            let mut handles = client.task_handles.lock().expect(MUTEX_POISONED);
-            handles.push(handle);
-        }
+        client.task_handles.push(handle);
         client.is_connected.store(true, Ordering::Relaxed);
 
         client.stop().unwrap();
 
-        assert!(client.task_handles.lock().expect(MUTEX_POISONED).is_empty());
+        assert!(client.task_handles.is_empty());
         assert!(client.is_disconnected());
     }
 
@@ -1689,6 +1702,111 @@ mod tests {
         let result = price_precision_from_params(Some(&params));
 
         assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_partition_book_deltas_response_by_child_instrument() {
+        let correlation_id = UUID4::new();
+        let client_id = ClientId::from("DATABENTO-TEST");
+        let parent = InstrumentId::from("ES.FUT.GLBX");
+        let child_a = InstrumentId::from("ESM6.GLBX");
+        let child_b = InstrumentId::from("ESU6.GLBX");
+        let deltas = vec![
+            OrderBookDelta::clear(child_a, 1, UnixNanos::from(1_000), UnixNanos::from(1_000)),
+            OrderBookDelta::clear(child_b, 2, UnixNanos::from(2_000), UnixNanos::from(2_000)),
+            OrderBookDelta::clear(child_a, 3, UnixNanos::from(3_000), UnixNanos::from(3_000)),
+        ];
+        let mut params = Params::new();
+        params.insert(PRICE_PRECISION_PARAM.to_string(), json!(5));
+        let response = BookDeltasResponse::new(
+            correlation_id,
+            client_id,
+            parent,
+            deltas.clone(),
+            Some(UnixNanos::from(500)),
+            Some(UnixNanos::from(4_000)),
+            UnixNanos::from(5_000),
+            Some(params.clone()),
+        );
+
+        let responses = partition_book_deltas_response(response);
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].correlation_id, correlation_id);
+        assert_eq!(responses[1].correlation_id, correlation_id);
+        assert_eq!(responses[0].client_id, client_id);
+        assert_eq!(responses[1].client_id, client_id);
+        assert_eq!(responses[0].instrument_id, child_a);
+        assert_eq!(responses[1].instrument_id, child_b);
+        assert_eq!(responses[0].data, vec![deltas[0], deltas[2]]);
+        assert_eq!(responses[1].data, vec![deltas[1]]);
+        assert_eq!(responses[0].start, Some(UnixNanos::from(500)));
+        assert_eq!(responses[1].start, Some(UnixNanos::from(500)));
+        assert_eq!(responses[0].end, Some(UnixNanos::from(4_000)));
+        assert_eq!(responses[1].end, Some(UnixNanos::from(4_000)));
+        assert_eq!(responses[0].ts_init, UnixNanos::from(5_000));
+        assert_eq!(responses[1].ts_init, UnixNanos::from(5_000));
+        assert_eq!(responses[0].params, Some(params.clone()));
+        assert_eq!(responses[1].params, Some(params));
+    }
+
+    #[rstest]
+    fn test_partition_book_deltas_response_preserves_homogeneous_response() {
+        let correlation_id = UUID4::new();
+        let client_id = ClientId::from("DATABENTO-TEST");
+        let instrument_id = InstrumentId::from("ESM6.GLBX");
+        let delta = OrderBookDelta::clear(
+            instrument_id,
+            1,
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+        );
+        let response = BookDeltasResponse::new(
+            correlation_id,
+            client_id,
+            instrument_id,
+            vec![delta],
+            Some(UnixNanos::from(500)),
+            Some(UnixNanos::from(1_500)),
+            UnixNanos::from(2_000),
+            None,
+        );
+
+        let responses = partition_book_deltas_response(response);
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].correlation_id, correlation_id);
+        assert_eq!(responses[0].client_id, client_id);
+        assert_eq!(responses[0].instrument_id, instrument_id);
+        assert_eq!(responses[0].data, vec![delta]);
+        assert_eq!(responses[0].start, Some(UnixNanos::from(500)));
+        assert_eq!(responses[0].end, Some(UnixNanos::from(1_500)));
+        assert_eq!(responses[0].ts_init, UnixNanos::from(2_000));
+        assert_eq!(responses[0].params, None);
+    }
+
+    #[rstest]
+    fn test_partition_book_deltas_response_preserves_empty_parent_response() {
+        let correlation_id = UUID4::new();
+        let parent = InstrumentId::from("ES.FUT.GLBX");
+        let response = BookDeltasResponse::new(
+            correlation_id,
+            ClientId::from("DATABENTO-TEST"),
+            parent,
+            Vec::new(),
+            None,
+            None,
+            UnixNanos::from(1_000),
+            None,
+        );
+
+        let responses = partition_book_deltas_response(response);
+
+        assert_eq!(responses.len(), 1);
+        let response = &responses[0];
+        assert_eq!(response.correlation_id, correlation_id);
+        assert_eq!(response.instrument_id, parent);
+        assert!(response.data.is_empty());
     }
 
     #[rstest]

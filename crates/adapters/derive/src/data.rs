@@ -22,6 +22,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -31,7 +32,7 @@ use dashmap::DashMap;
 use nautilus_common::{
     cache::{InstrumentLookupError, quote::QuoteCache},
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender},
+    live::{get_runtime, runner::get_data_event_sender, task::TaskHandles},
     messages::{
         DataEvent,
         data::{
@@ -54,7 +55,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Bar, Data, ForwardPrice, OrderBookDeltas_API, QuoteTick},
+    data::{Bar, Data, ForwardPrice, QuoteTick},
     enums::{AggregationSource, BookType, PriceType},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -86,8 +87,8 @@ use crate::{
         bar_spec_to_derive_period, orderbook_channel, parse_candle_record, parse_funding_rate,
         parse_funding_rate_history_record, parse_index_price, parse_mark_price,
         parse_option_greeks, parse_orderbook_deltas, parse_orderbook_depth10, parse_public_ws_data,
-        parse_ticker_quote, parse_ticker_quote_from_rest, parse_trade_tick, ticker_channel,
-        trades_channel,
+        parse_ticker_quote, parse_ticker_quote_from_rest, parse_trade_tick,
+        parse_trade_tick_from_rest, ticker_channel, ticker_ts_event, trades_channel,
     },
 };
 
@@ -101,8 +102,8 @@ pub struct DeriveDataClient {
     ws_client: DeriveWebSocketClient,
     is_connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    ws_stream_handle: Mutex<Option<JoinHandle<()>>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    ws_stream_handle: Option<JoinHandle<()>>,
+    pending_tasks: TaskHandles,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
@@ -140,12 +141,16 @@ impl DeriveDataClient {
             config.currencies.clone(),
             config.include_expired,
         );
-        let ws_client = DeriveWebSocketClient::new(
+        let mut ws_client = DeriveWebSocketClient::new(
             Some(config.ws_url()),
             config.environment,
             config.transport_backend,
             config.proxy_url.clone(),
         );
+
+        if let Some(secs) = config.ws_timeout_secs {
+            ws_client.set_request_timeout(Duration::from_secs(secs));
+        }
 
         Ok(Self {
             client_id,
@@ -155,8 +160,8 @@ impl DeriveDataClient {
             ws_client,
             is_connected: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
-            ws_stream_handle: Mutex::new(None),
-            pending_tasks: Mutex::new(Vec::new()),
+            ws_stream_handle: None,
+            pending_tasks: TaskHandles::default(),
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
             active_book_delta_channels: Arc::new(AtomicMap::new()),
@@ -188,19 +193,16 @@ impl DeriveDataClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        // Prune finished handles before pushing so the Vec doesn't grow
-        // unboundedly across long-running sessions.
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
-    /// Aborts every tracked pending task; used by `disconnect` and `reset`.
-    fn abort_pending_tasks(&self) {
-        let tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.iter() {
+    /// Drains and aborts every tracked pending task.
+    fn abort_pending_tasks(&self) -> Vec<JoinHandle<()>> {
+        let tasks = self.pending_tasks.take_all();
+        for handle in &tasks {
             handle.abort();
         }
+        tasks
     }
 
     /// Clears every local subscription map. Called from `disconnect` and
@@ -222,7 +224,7 @@ impl DeriveDataClient {
         self.quote_cache.lock().expect(MUTEX_POISONED).clear();
     }
 
-    fn spawn_stream_task(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
+    fn spawn_stream_task(&mut self, mut rx: tokio::sync::mpsc::UnboundedReceiver<DeriveWsMessage>) {
         let ctx = WsMessageContext {
             clock: self.clock,
             data_sender: self.data_sender.clone(),
@@ -267,8 +269,7 @@ impl DeriveDataClient {
             }
         });
 
-        let mut slot = self.ws_stream_handle.lock().expect(MUTEX_POISONED);
-        *slot = Some(handle);
+        self.ws_stream_handle = Some(handle);
     }
 
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
@@ -331,7 +332,7 @@ impl DeriveDataClient {
                         ts_init,
                     ) {
                         Ok(deltas) => {
-                            Self::send_data(ctx, Data::Deltas(OrderBookDeltas_API::new(deltas)));
+                            Self::send_data(ctx, Data::Deltas(Box::new(deltas)));
                         }
                         Err(e) => log::warn!("Failed to parse Derive orderbook deltas: {e}"),
                     }
@@ -412,7 +413,7 @@ impl DeriveDataClient {
 
                 if ctx.active_mark_subs.contains(&instrument_id) {
                     match parse_mark_price(&msg, price_precision, ts_init) {
-                        Ok(Some(update)) => Self::send_data(ctx, Data::MarkPriceUpdate(update)),
+                        Ok(Some(update)) => Self::send_data(ctx, Data::MarkPrice(update)),
                         Ok(None) => {}
                         Err(e) => log::warn!("Failed to parse Derive mark price: {e}"),
                     }
@@ -420,7 +421,7 @@ impl DeriveDataClient {
 
                 if ctx.active_index_subs.contains(&instrument_id) {
                     match parse_index_price(&msg, price_precision, ts_init) {
-                        Ok(Some(update)) => Self::send_data(ctx, Data::IndexPriceUpdate(update)),
+                        Ok(Some(update)) => Self::send_data(ctx, Data::IndexPrice(update)),
                         Ok(None) => {}
                         Err(e) => log::warn!("Failed to parse Derive index price: {e}"),
                     }
@@ -645,9 +646,9 @@ impl DataClient for DeriveDataClient {
         log::info!("Resetting Derive data client: {}", self.client_id);
         self.cancellation_token.cancel();
 
-        self.abort_pending_tasks();
+        drop(self.abort_pending_tasks());
 
-        if let Some(handle) = self.ws_stream_handle.lock().expect(MUTEX_POISONED).as_ref() {
+        if let Some(handle) = self.ws_stream_handle.as_ref() {
             handle.abort();
         }
 
@@ -683,15 +684,15 @@ impl DataClient for DeriveDataClient {
             if let Err(e) = self.ws_client.disconnect().await {
                 log::debug!("Error tearing down WebSocket on reconnect: {e}");
             }
-            let ws_handle = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take();
+            let ws_handle = self.ws_stream_handle.take();
             if let Some(handle) = ws_handle
                 && let Err(e) = handle.await
                 && !e.is_cancelled()
             {
                 log::error!("Error joining prior Derive WebSocket data task: {e:?}");
             }
-            self.abort_pending_tasks();
-            self.join_pending_tasks().await;
+            let pending_tasks = self.abort_pending_tasks();
+            self.join_pending_tasks(pending_tasks).await;
             self.clear_subscription_state();
             self.channel_subscriptions.clear_transitions();
             self.cancellation_token = CancellationToken::new();
@@ -737,14 +738,14 @@ impl DataClient for DeriveDataClient {
         // Await the WS consumption loop so its sender is dropped before we
         // return; abort the request-handler tasks since they don't observe
         // the cancellation token and would otherwise outlive the client.
-        let ws_handle = self.ws_stream_handle.lock().expect(MUTEX_POISONED).take();
+        let ws_handle = self.ws_stream_handle.take();
         if let Some(handle) = ws_handle
             && let Err(e) = handle.await
         {
             log::error!("Error joining Derive WebSocket data task: {e:?}");
         }
-        self.abort_pending_tasks();
-        self.join_pending_tasks().await;
+        let pending_tasks = self.abort_pending_tasks();
+        self.join_pending_tasks(pending_tasks).await;
 
         // Aborting in-flight subscribe tasks skips their on-error rollback,
         // so any `active_*` entries staged before spawn would leak across
@@ -1101,9 +1102,9 @@ impl DataClient for DeriveDataClient {
         let limit = request.limit.map(NonZeroUsize::get);
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
-        let from_timestamp = start.map(|dt| dt.timestamp_millis());
+        let from_timestamp = start.map(|dt| dt.as_millisecond());
         let to_timestamp = Some(match end {
-            Some(dt) => dt.timestamp_millis(),
+            Some(dt) => dt.as_millisecond(),
             None => i64::try_from(clock.get_time_ms())
                 .context("Derive current time exceeds i64 milliseconds")?,
         });
@@ -1139,7 +1140,12 @@ impl DataClient for DeriveDataClient {
                 let ts_init = clock.get_time_ns();
 
                 for trade in &result.trades {
-                    match parse_trade_tick(trade, price_precision, size_precision, ts_init) {
+                    match parse_trade_tick_from_rest(
+                        trade,
+                        price_precision,
+                        size_precision,
+                        ts_init,
+                    ) {
                         Ok(tick) if seen_trade_ids.insert(tick.trade_id) => trades.push(tick),
                         Ok(_) => {}
                         Err(e) => log::warn!(
@@ -1211,8 +1217,8 @@ impl DataClient for DeriveDataClient {
         let limit = request.limit.map(NonZeroUsize::get);
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
-        let start_ms = start.map(|dt| dt.timestamp_millis());
-        let end_ms = end.map(|dt| dt.timestamp_millis());
+        let start_ms = start.map(|dt| dt.as_millisecond());
+        let end_ms = end.map(|dt| dt.as_millisecond());
 
         self.spawn_task("request_funding_rates", async move {
             let result = match http_client
@@ -1308,9 +1314,9 @@ impl DataClient for DeriveDataClient {
         // and start to one window of `limit` buckets (or 1000) before end.
         let request_time = clock.get_time_ns();
         let now_secs = (request_time.as_u64() / NANOSECONDS_IN_SECOND) as i64;
-        let end_ts = end.map_or(now_secs, |dt| dt.timestamp());
+        let end_ts = end.map_or(now_secs, |dt| dt.as_second());
         let default_span = i64::from(period) * limit.unwrap_or(DERIVE_CANDLES_DEFAULT_LIMIT) as i64;
-        let start_ts = start.map_or(end_ts - default_span, |dt| dt.timestamp());
+        let start_ts = start.map_or(end_ts - default_span, |dt| dt.as_second());
 
         self.spawn_task("request_bars", async move {
             // Venue caps each call at 5000 candles; walk backwards by shrinking
@@ -1479,16 +1485,21 @@ impl DataClient for DeriveDataClient {
             // bootstrap when the REST ticker is unavailable or non-option.
             let forwards: Vec<ForwardPrice> = match http_client.get_ticker(&venue_symbol).await {
                 Ok(ticker) => match ticker.option_pricing.as_ref() {
-                    Some(pricing) => {
-                        let ts_event = clock.get_time_ns();
-                        vec![ForwardPrice::new(
+                    Some(pricing) => match ticker_ts_event(ticker.timestamp) {
+                        Ok(ts_event) => vec![ForwardPrice::new(
                             instrument_id,
                             pricing.forward_price,
                             Some(underlying.to_string()),
                             ts_event,
-                            ts_event,
-                        )]
-                    }
+                            clock.get_time_ns(),
+                        )],
+                        Err(e) => {
+                            log::warn!(
+                                "Derive ticker for {instrument_id} has an invalid timestamp: {e:?}; emitting empty forward prices",
+                            );
+                            Vec::new()
+                        }
+                    },
                     None => {
                         log::warn!(
                             "Derive ticker for {instrument_id} has no option_pricing; emitting empty forward prices",
@@ -2195,12 +2206,7 @@ fn retain_channel_for_reconnect(
 }
 
 impl DeriveDataClient {
-    async fn join_pending_tasks(&self) {
-        let tasks = {
-            let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-            tasks.drain(..).collect::<Vec<_>>()
-        };
-
+    async fn join_pending_tasks(&self, tasks: Vec<JoinHandle<()>>) {
         for handle in tasks {
             if let Err(e) = handle.await
                 && !e.is_cancelled()
@@ -2706,7 +2712,7 @@ mod tests {
             environment: DeriveEnvironment::Mainnet,
             ..Default::default()
         };
-        let client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
+        let mut client = DeriveDataClient::new(*DERIVE_CLIENT_ID, config).unwrap();
         let (ws_tx, ws_rx) = tokio::sync::mpsc::unbounded_channel();
         client.is_connected.store(true, Ordering::Release);
         client.spawn_stream_task(ws_rx);
@@ -3209,7 +3215,7 @@ mod tests {
         );
 
         match rx.try_recv().unwrap() {
-            DataEvent::Data(Data::MarkPriceUpdate(mark)) => {
+            DataEvent::Data(Data::MarkPrice(mark)) => {
                 assert_eq!(mark.instrument_id, instrument_id);
                 assert_eq!(mark.value, Price::from("3500.50"));
             }
@@ -3232,7 +3238,7 @@ mod tests {
         );
 
         match rx.try_recv().unwrap() {
-            DataEvent::Data(Data::IndexPriceUpdate(index)) => {
+            DataEvent::Data(Data::IndexPrice(index)) => {
                 assert_eq!(index.instrument_id, instrument_id);
                 assert_eq!(index.value, Price::from("3500.00"));
             }
@@ -3354,13 +3360,13 @@ mod tests {
                 DataEvent::Data(Data::Quote(q)) => {
                     assert!(quote.replace(q).is_none(), "duplicate Quote emission");
                 }
-                DataEvent::Data(Data::MarkPriceUpdate(m)) => {
+                DataEvent::Data(Data::MarkPrice(m)) => {
                     assert!(
                         mark.replace(m).is_none(),
                         "duplicate MarkPriceUpdate emission"
                     );
                 }
-                DataEvent::Data(Data::IndexPriceUpdate(i)) => {
+                DataEvent::Data(Data::IndexPrice(i)) => {
                     assert!(
                         index.replace(i).is_none(),
                         "duplicate IndexPriceUpdate emission"
@@ -3507,6 +3513,14 @@ mod tests {
         client.active_funding_subs.insert(instrument_id);
         client.active_greeks_subs.insert(instrument_id);
         client.is_connected.store(true, Ordering::Relaxed);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel::<()>();
+        client.pending_tasks.push(tokio::spawn(async move {
+            let _drop_tx = drop_tx;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
 
         client.disconnect().await.unwrap();
 
@@ -3541,6 +3555,10 @@ mod tests {
         assert!(!client.active_funding_subs.contains(&instrument_id));
         assert!(!client.active_greeks_subs.contains(&instrument_id));
         assert!(!client.is_connected());
+        assert_eq!(
+            drop_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+        );
     }
 
     #[tokio::test]
@@ -3566,12 +3584,7 @@ mod tests {
         }
 
         wait_until_async(
-            || async {
-                {
-                    let tasks = client.pending_tasks.lock().expect(MUTEX_POISONED);
-                    tasks.iter().all(JoinHandle::is_finished)
-                }
-            },
+            || async { client.pending_tasks.all_finished() },
             Duration::from_secs(2),
         )
         .await;
@@ -3579,7 +3592,7 @@ mod tests {
         // The next spawn should prune the finished handles before pushing the
         // new one, leaving exactly the new tracked task.
         client.spawn_task("test_prune", async { Ok(()) });
-        let len = client.pending_tasks.lock().expect(MUTEX_POISONED).len();
+        let len = client.pending_tasks.len();
         assert_eq!(len, 1, "pending_tasks should retain only the new task");
     }
 }

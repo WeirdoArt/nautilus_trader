@@ -85,6 +85,18 @@ impl OrderFactory {
         }
     }
 
+    /// Returns the trader ID.
+    #[must_use]
+    pub const fn trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    /// Returns the strategy ID.
+    #[must_use]
+    pub const fn strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
     /// Sets the client order ID generator count.
     pub const fn set_client_order_id_count(&mut self, count: usize) {
         self.order_id_generator.set_count(count);
@@ -1742,13 +1754,14 @@ fn required<T>(value: Option<T>, message: &'static str) -> anyhow::Result<T> {
 pub mod tests {
     use std::{cell::RefCell, rc::Rc};
 
+    use indexmap::IndexMap;
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::{
             ContingencyType, OrderSide, OrderType, TimeInForce, TrailingOffsetType, TriggerType,
         },
         identifiers::{
-            ClientOrderId, InstrumentId, OrderListId,
+            ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId,
             stubs::{strategy_id_ema_cross, trader_id},
         },
         orders::Order,
@@ -1774,6 +1787,12 @@ pub mod tests {
             false, // use_uuids_for_client_order_ids
             true,  // use_hyphens_in_client_order_ids
         )
+    }
+
+    #[rstest]
+    fn test_order_factory_identity(order_factory: OrderFactory) {
+        assert_eq!(order_factory.trader_id(), trader_id());
+        assert_eq!(order_factory.strategy_id(), strategy_id_ema_cross());
     }
 
     #[rstest]
@@ -1943,6 +1962,35 @@ pub mod tests {
             ClientOrderId::new("O-19700101-000000-001-001-1")
         );
         // assert_eq!(market_order.order_list_id(), None);
+    }
+
+    #[rstest]
+    fn test_market_order_preserves_primary_exec_algorithm_metadata(
+        mut order_factory: OrderFactory,
+    ) {
+        let client_order_id = ClientOrderId::from("O-PRIMARY");
+        let exec_algorithm_id = ExecAlgorithmId::from("TWAP");
+        let exec_algorithm_params =
+            IndexMap::from([(Ustr::from("interval_secs"), Ustr::from("10"))]);
+        let order = order_factory.market(
+            InstrumentId::from("BTCUSDT.BINANCE"),
+            OrderSide::Buy,
+            100.into(),
+            Some(TimeInForce::Gtc),
+            Some(false),
+            Some(false),
+            Some(exec_algorithm_id),
+            Some(exec_algorithm_params.clone()),
+            None,
+            Some(client_order_id),
+        );
+
+        assert_eq!(order.client_order_id(), client_order_id);
+        assert_eq!(order.exec_algorithm_id(), Some(exec_algorithm_id));
+        assert_eq!(order.exec_algorithm_params(), Some(&exec_algorithm_params));
+        assert_eq!(order.exec_spawn_id(), Some(client_order_id));
+        assert!(order.is_primary());
+        assert!(!order.is_spawned());
     }
 
     #[rstest]
@@ -2796,5 +2844,7 @@ pub mod tests {
         );
         assert_eq!(orders[0].order_list_id(), Some(order_list.id));
         assert_eq!(orders[1].order_list_id(), Some(order_list.id));
+        assert_eq!(orders[0].init_event().order_list_id, Some(order_list.id));
+        assert_eq!(orders[1].init_event().order_list_id, Some(order_list.id));
     }
 }

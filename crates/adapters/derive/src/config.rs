@@ -28,7 +28,7 @@ use crate::common::{enums::DeriveEnvironment, urls};
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.derive", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.derive", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -47,9 +47,9 @@ pub struct DeriveDataClientConfig {
     /// HTTP timeout in seconds.
     #[builder(default = 10)]
     pub http_timeout_secs: u64,
-    /// WebSocket timeout in seconds.
-    #[builder(default = 30)]
-    pub ws_timeout_secs: u64,
+    /// Optional per-operation WebSocket timeout in seconds (login, subscribe,
+    /// reads, writes). When unset, the low-level `WS_REQUEST_TIMEOUT` applies.
+    pub ws_timeout_secs: Option<u64>,
     /// Interval for refreshing instruments in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
@@ -68,6 +68,20 @@ pub struct DeriveDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeriveDataClientConfig {
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: DeriveEnvironment,
+    http_timeout_secs: u64,
+    ws_timeout_secs: Option<u64>,
+    update_instruments_interval_mins: u64,
+    currencies: Vec<String>,
+    include_expired: bool,
+    auto_load_missing_instruments: bool,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeriveDataClientConfig {
     fn default() -> Self {
@@ -107,7 +121,7 @@ impl DeriveDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.derive", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.derive", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -146,6 +160,9 @@ pub struct DeriveExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 5000)]
     pub retry_delay_max_ms: u64,
+    /// Optional per-operation WebSocket timeout in seconds (login, subscribe,
+    /// reads, writes). When unset, the low-level `WS_REQUEST_TIMEOUT` applies.
+    pub ws_timeout_secs: Option<u64>,
     /// Per-contract USDC fee cap signed into every order. Required for
     /// execution and must be greater than zero.
     pub max_fee_per_contract: Option<Decimal>,
@@ -177,7 +194,37 @@ pub struct DeriveExecClientConfig {
     /// of 1 when unset; raise it for Market Maker accounts with higher
     /// negotiated limits. See <https://docs.derive.xyz/reference/rate-limits>.
     pub max_matching_requests_per_second: Option<u32>,
+    /// Maximum per-instrument matching requests per second for instrument-
+    /// scoped order writes sent over the WebSocket. Defaults to the Trader-tier
+    /// limit of 1 when unset; raise it for Market Maker accounts with higher
+    /// negotiated per-instrument limits. This allowance is independent of
+    /// `max_matching_requests_per_second`, which never inflates it. See
+    /// <https://docs.derive.xyz/reference/rate-limits>.
+    pub max_per_instrument_matching_requests_per_second: Option<u32>,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DeriveExecClientConfig {
+    wallet_address: Option<String>,
+    subaccount_id: Option<u64>,
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: DeriveEnvironment,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    ws_timeout_secs: Option<u64>,
+    max_fee_per_contract: Option<Decimal>,
+    domain_separator: Option<String>,
+    action_typehash: Option<String>,
+    trade_module_address: Option<String>,
+    signature_expiry_secs: u64,
+    market_order_slippage_bps: u32,
+    max_matching_requests_per_second: Option<u32>,
+    max_per_instrument_matching_requests_per_second: Option<u32>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for DeriveExecClientConfig {
     fn default() -> Self {
@@ -212,6 +259,10 @@ impl Debug for DeriveExecClientConfig {
             .field(
                 "max_matching_requests_per_second",
                 &self.max_matching_requests_per_second,
+            )
+            .field(
+                "max_per_instrument_matching_requests_per_second",
+                &self.max_per_instrument_matching_requests_per_second,
             )
             .finish()
     }
@@ -285,7 +336,7 @@ mod tests {
         let config = DeriveDataClientConfig::default();
         assert_eq!(config.environment, DeriveEnvironment::Mainnet);
         assert_eq!(config.http_timeout_secs, 10);
-        assert_eq!(config.ws_timeout_secs, 30);
+        assert_eq!(config.ws_timeout_secs, None);
         assert_eq!(config.update_instruments_interval_mins, 60);
         assert!(config.currencies.is_empty());
         assert!(!config.include_expired);
@@ -316,6 +367,11 @@ mod tests {
         assert_eq!(config.http_timeout_secs, 10);
         assert_eq!(config.max_retries, 3);
         assert!(config.max_matching_requests_per_second.is_none());
+        assert!(
+            config
+                .max_per_instrument_matching_requests_per_second
+                .is_none()
+        );
         assert!(!config.has_credentials());
     }
 

@@ -604,13 +604,13 @@ pub fn order_replace_to_derive_payload(
     })
 }
 
-fn validate_order_support(order: &OrderAny) -> anyhow::Result<()> {
+pub(crate) fn validate_order_support(order: &OrderAny) -> anyhow::Result<()> {
     order_type_to_derive(order.order_type())?;
     time_in_force_to_derive(order.time_in_force(), order.is_post_only())?;
     Ok(())
 }
 
-fn validate_trigger_order_support(order: &OrderAny) -> anyhow::Result<()> {
+pub(crate) fn validate_trigger_order_support(order: &OrderAny) -> anyhow::Result<()> {
     trigger_order_type_to_derive(order.order_type())?;
     time_in_force_to_derive(order.time_in_force(), order.is_post_only())?;
     trigger_price_type_to_derive(order.trigger_type())?;
@@ -741,7 +741,8 @@ mod tests {
     use crate::common::{consts::DERIVE_VENUE, enums::DeriveInstrumentType};
 
     fn canonical_wire<T: Serialize>(params: &T) -> String {
-        let value = serde_json::to_value(params).unwrap();
+        let mut value = serde_json::to_value(params).unwrap();
+        value.sort_all_objects();
         serde_json::to_string(&value).unwrap()
     }
 

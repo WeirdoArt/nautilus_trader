@@ -17,7 +17,7 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use nautilus_model::identifiers::Venue;
+use nautilus_model::identifiers::{ClientId, Venue};
 use ustr::Ustr;
 
 /// Venue name string for Lighter.
@@ -25,6 +25,10 @@ pub const LIGHTER: &str = "LIGHTER";
 
 /// Lighter venue identifier.
 pub static LIGHTER_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(LIGHTER)));
+
+/// Static client ID instance.
+pub static LIGHTER_CLIENT_ID: LazyLock<ClientId> =
+    LazyLock::new(|| ClientId::new(Ustr::from(LIGHTER)));
 
 /// L2 chain id for Lighter mainnet.
 ///
@@ -49,6 +53,12 @@ pub const LIGHTER_ERROR_CODE_INVALID_NONCE: i64 = 21_104;
 
 /// Venue error code for an idempotent duplicate WebSocket subscription.
 pub const LIGHTER_ERROR_CODE_ALREADY_SUBSCRIBED: u64 = 30_003;
+
+/// Venue error code for WebSocket request rate limiting.
+pub const LIGHTER_ERROR_CODE_WS_RATE_LIMITED: u64 = 30_009;
+
+/// Venue error code for a failed WebSocket subscription open.
+pub const LIGHTER_ERROR_CODE_WS_SUBSCRIBE_FAILED: u64 = 30_012;
 
 /// Venue error-code range for L2 transaction failures.
 ///
@@ -80,6 +90,21 @@ pub const LIGHTER_AUTH_TOKEN_REFRESH_LEAD: Duration = Duration::from_secs(15 * 6
 /// Lighter requires a frame at least every 2 minutes; we send well below that.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Teardown window for a WebSocket carrying no inbound frame of any kind.
+///
+/// Liveness rests on the venue still sending frames rather than on market data
+/// arriving: a quiet market is legitimate, and the pong answering every
+/// [`HEARTBEAT_INTERVAL`] ping refreshes this window even when nothing trades.
+/// Three heartbeat cycles tolerate two lost replies before teardown.
+pub const HEARTBEAT_TIMEOUT: Duration =
+    Duration::from_secs(HEARTBEAT_INTERVAL.as_secs().saturating_mul(3));
+
+const _: () = assert!(
+    HEARTBEAT_TIMEOUT.as_secs() > HEARTBEAT_INTERVAL.as_secs(),
+    "heartbeat timeout must exceed the heartbeat interval, or every connection tears down \
+     before its first pong is due"
+);
+
 /// Base reconnect backoff for the WebSocket client.
 pub const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -98,6 +123,12 @@ pub const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Held below Lighter's 50-per-IP inflight cap; see the WebSocket rate-limit
 /// strategy in [`crate::common::rate_limit`].
 pub const SUBSCRIBE_INFLIGHT_MAX: usize = 35;
+
+/// Maximum venue-level retries for one WebSocket subscription request.
+pub const SUBSCRIBE_RETRY_MAX: u8 = 5;
+
+/// Initial backoff after a venue-level WebSocket subscription rejection.
+pub const SUBSCRIBE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Outbound command queue depth before backpressure kicks in.
 pub const QUEUE_MAX: usize = 1000;

@@ -21,7 +21,7 @@ from typing import Any
 from typing import ClassVar
 
 
-_EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples"
+_EXAMPLES_DIR = Path(__file__).resolve().parents[4] / "examples/live"
 
 
 def load_example_module(adapter: str, module: str) -> ModuleType:
@@ -68,6 +68,14 @@ class _CaptureBuilder:
         self._captured["risk_engine_config"] = config
         return self
 
+    def with_timeout_disconnection_secs(self, timeout_secs: int) -> "_CaptureBuilder":
+        self._captured["timeout_disconnection_secs"] = timeout_secs
+        return self
+
+    def with_delay_post_stop_secs(self, delay_secs: int) -> "_CaptureBuilder":
+        self._captured["delay_post_stop_secs"] = delay_secs
+        return self
+
     def add_data_client(self, *args: object) -> "_CaptureBuilder":
         self._captured["data_client_args"] = args
         return self
@@ -110,13 +118,11 @@ class _CaptureDataTesterConfig:
 def capture_exec_tester_main(
     monkeypatch: Any,
     module: ModuleType,
-    extra_args: list[str],
 ) -> dict[str, object]:
     captured: dict[str, object] = {}
     _CaptureExecTesterConfig.captured = captured
     _CaptureLiveNode.captured = captured
 
-    monkeypatch.setattr(sys, "argv", ["exec_tester.py", *extra_args])
     monkeypatch.setattr(module, "ExecTesterConfig", _CaptureExecTesterConfig)
     monkeypatch.setattr(module, "LiveNode", _CaptureLiveNode)
 
@@ -128,13 +134,11 @@ def capture_exec_tester_main(
 def capture_data_tester_main(
     monkeypatch: Any,
     module: ModuleType,
-    extra_args: list[str],
 ) -> dict[str, object]:
     captured: dict[str, object] = {}
     _CaptureDataTesterConfig.captured = captured
     _CaptureLiveNode.captured = captured
 
-    monkeypatch.setattr(sys, "argv", ["data_tester.py", *extra_args])
     monkeypatch.setattr(module, "DataTesterConfig", _CaptureDataTesterConfig)
     monkeypatch.setattr(module, "LiveNode", _CaptureLiveNode)
 

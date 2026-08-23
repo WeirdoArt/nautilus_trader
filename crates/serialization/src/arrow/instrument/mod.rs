@@ -949,7 +949,7 @@ mod tests {
             panic!("Decoded instrument type mismatch");
         };
 
-        // The quantity constraints are the fields dropped by the v1 Cython `from_dict` (#4461)
+        // The v1 `from_dict` dropped these quantity constraints (#4461), so check them here
         assert_eq!(decoded_equity.max_quantity, equity.max_quantity);
         assert_eq!(decoded_equity.min_quantity, equity.min_quantity);
 
@@ -1084,7 +1084,7 @@ mod tests {
         );
     }
 
-    // The `betting` stub populates every bound, margin and fee, so this covers the whole struct
+    // The `betting` stub populates every bound, margin, and fee, so this covers the whole struct
     #[rstest]
     fn test_encode_decode_round_trip_betting_all_fields() {
         let instrument = betting();

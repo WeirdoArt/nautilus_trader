@@ -39,11 +39,11 @@ use futures_util::StreamExt;
 use nautilus_common::live::get_runtime;
 use nautilus_core::python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
-    data::{BarType, Data, OrderBookDeltas_API},
+    data::{BarType, Data},
     enums::{OrderSide, OrderType, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     python::{
-        data::data_to_pycapsule,
+        data::data_to_pyobject,
         instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     },
     types::{Price, Quantity},
@@ -73,14 +73,6 @@ where
     });
 }
 
-fn ws_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
-    match data {
-        Data::Custom(custom) => Py::new(py, custom).map(|obj| obj.into_any()),
-        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|obj| obj.into_any()),
-        other => Ok(data_to_pycapsule(py, other)),
-    }
-}
-
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DeribitWebSocketClient {
@@ -93,6 +85,7 @@ impl DeribitWebSocketClient {
         heartbeat_interval=30,
         environment=DeribitEnvironment::Mainnet,
         proxy_url=None,
+        auth_timeout_secs=None,
     ))]
     fn py_new(
         url: Option<String>,
@@ -101,12 +94,14 @@ impl DeribitWebSocketClient {
         heartbeat_interval: u64,
         environment: DeribitEnvironment,
         proxy_url: Option<String>,
+        auth_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         Self::new(
             url,
             api_key,
             api_secret,
             heartbeat_interval,
+            auth_timeout_secs,
             environment,
             TransportBackend::default(),
             proxy_url,
@@ -139,16 +134,23 @@ impl DeribitWebSocketClient {
     /// Returns an error if neither the argument nor the environment variable
     /// provides a credential.
     #[staticmethod]
-    #[pyo3(name = "with_credentials", signature = (environment, api_key = None, api_secret = None, account_id = None, proxy_url = None))]
+    #[pyo3(name = "with_credentials", signature = (environment, api_key = None, api_secret = None, account_id = None, proxy_url = None, auth_timeout_secs = None))]
     fn py_with_credentials(
         environment: DeribitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
         account_id: Option<AccountId>,
         proxy_url: Option<String>,
+        auth_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
-        let mut client = Self::with_credentials(environment, api_key, api_secret, proxy_url)
-            .map_err(to_pyvalue_err)?;
+        let mut client = Self::with_credentials(
+            environment,
+            api_key,
+            api_secret,
+            auth_timeout_secs,
+            proxy_url,
+        )
+        .map_err(to_pyvalue_err)?;
 
         if let Some(id) = account_id {
             client.set_account_id(id);
@@ -288,7 +290,7 @@ impl DeribitWebSocketClient {
                         }
                         NautilusWsMessage::Data(msg) => Python::attach(|py| {
                             for data in msg {
-                                match ws_data_to_pyobject(py, data) {
+                                match data_to_pyobject(py, data) {
                                     Ok(py_obj) => {
                                         call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     }
@@ -300,11 +302,11 @@ impl DeribitWebSocketClient {
                                 }
                             }
                         }),
-                        NautilusWsMessage::Deltas(msg) => Python::attach(|py| {
-                            let py_obj =
-                                data_to_pycapsule(py, Data::Deltas(OrderBookDeltas_API::new(msg)));
-                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
-                        }),
+                        NautilusWsMessage::Deltas(msg) => {
+                            call_python_with_data(&call_soon, &callback, |py| {
+                                data_to_pyobject(py, Data::Deltas(Box::new(msg)))
+                            });
+                        }
                         NautilusWsMessage::Error(err) => {
                             log::warn!("WebSocket error: {err}");
                         }

@@ -72,8 +72,8 @@ use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
-        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TrailingOffsetType, TriggerType,
+        AccountType, ContingencyType, OmsType, OrderSide, OrderStatus, OrderType,
+        PositionSideSpecified, TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{AccountState, OrderAccepted, OrderEventAny, OrderUpdated},
     identifiers::{
@@ -82,8 +82,8 @@ use nautilus_model::{
     },
     instruments::{InstrumentAny, stubs::currency_pair_btcusdt},
     orders::{
-        LimitOrder, MarketIfTouchedOrder, Order, OrderAny, OrderList, StopMarketOrder,
-        TrailingStopMarketOrder,
+        LimitOrder, MarketIfTouchedOrder, Order, OrderAny, OrderList, StopLimitOrder,
+        StopMarketOrder, TrailingStopMarketOrder,
     },
     types::{AccountBalance, Money, Price, Quantity},
 };
@@ -123,39 +123,7 @@ fn load_fixture(name: &str) -> serde_json::Value {
 }
 
 fn exchange_info_response() -> serde_json::Value {
-    json!({
-        "timezone": "UTC",
-        "serverTime": 1700000000000_i64,
-        "rateLimits": [],
-        "exchangeFilters": [],
-        "symbols": [{
-            "symbol": "BTCUSDT",
-            "pair": "BTCUSDT",
-            "contractType": "PERPETUAL",
-            "deliveryDate": 4133404800000_i64,
-            "onboardDate": 1569398400000_i64,
-            "status": "TRADING",
-            "baseAsset": "BTC",
-            "quoteAsset": "USDT",
-            "marginAsset": "USDT",
-            "pricePrecision": 2,
-            "quantityPrecision": 3,
-            "baseAssetPrecision": 8,
-            "quotePrecision": 8,
-            "maintMarginPercent": "2.5000",
-            "requiredMarginPercent": "5.0000",
-            "underlyingType": "COIN",
-            "settlePlan": 0,
-            "triggerProtect": "0.0500",
-            "filters": [
-                {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
-                {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
-                {"filterType": "MIN_NOTIONAL", "notional": "5"}
-            ],
-            "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"],
-            "timeInForce": ["GTC", "IOC", "FOK", "GTD"]
-        }]
-    })
+    load_fixture("exchange_info_usdm.json")
 }
 
 #[derive(Clone, Copy)]
@@ -210,8 +178,11 @@ type CapturedWsTradingMessages = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
 #[derive(Clone, Copy, Debug)]
 enum ReportFixtureMode {
+    Delivery,
     Empty,
     FillsOnly,
+    Gtd,
+    HedgePositions,
     InvalidFill,
     PaginatedFills,
     Populated,
@@ -446,7 +417,17 @@ async fn handle_position_risk_query(
     }
     record_query(&state, "positionRisk", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly | ReportFixtureMode::Gtd => {
+            json_response(&json!([]))
+        }
+        ReportFixtureMode::Delivery => {
+            let mut positions = load_fixture("position_risk.json");
+            positions[0]["symbol"] = json!("BTCUSDT_260925");
+            json_response(&positions)
+        }
+        ReportFixtureMode::HedgePositions => {
+            json_response(&load_fixture("position_risk_hedge.json"))
+        }
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
@@ -466,9 +447,21 @@ async fn handle_open_orders_query(
     record_query(&state, "openOrders", query);
     match state.report_fixture_mode {
         ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Gtd => {
+            let mut order = load_fixture("order_response.json");
+            order["timeInForce"] = json!("GTD");
+            order["goodTillDate"] = json!(1_700_000_601_000_i64);
+            json_response(&json!([order]))
+        }
+        ReportFixtureMode::Delivery => {
+            let mut order = load_fixture("order_response.json");
+            order["symbol"] = json!("BTCUSDT_260925");
+            json_response(&json!([order]))
+        }
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
+        | ReportFixtureMode::HedgePositions
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
             json_response(&json!([load_fixture("order_response.json")]))
@@ -487,9 +480,21 @@ async fn handle_open_algo_orders_query(
     record_query(&state, "openAlgoOrders", query);
     match state.report_fixture_mode {
         ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Gtd => {
+            let mut orders = load_fixture("open_algo_orders.json");
+            orders[0]["timeInForce"] = json!("GTD");
+            orders[0]["goodTillDate"] = json!(1_700_000_601_000_i64);
+            json_response(&orders)
+        }
+        ReportFixtureMode::Delivery => {
+            let mut orders = load_fixture("open_algo_orders.json");
+            orders[0]["symbol"] = json!("BTCUSDT_260925");
+            json_response(&orders)
+        }
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
+        | ReportFixtureMode::HedgePositions
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => json_response(&load_fixture("open_algo_orders.json")),
     }
@@ -536,10 +541,14 @@ async fn handle_all_algo_orders_query(
         .unwrap_or_default();
     record_query(&state, "allAlgoOrders", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly => json_response(&json!([])),
+        ReportFixtureMode::Delivery
+        | ReportFixtureMode::Empty
+        | ReportFixtureMode::FillsOnly
+        | ReportFixtureMode::Gtd => json_response(&json!([])),
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::Populated
+        | ReportFixtureMode::HedgePositions
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
             let mut orders = load_fixture("open_algo_orders.json");
@@ -590,9 +599,12 @@ async fn handle_user_trades_query(
         - 30_000;
     record_query(&state, "userTrades", query);
     match state.report_fixture_mode {
-        ReportFixtureMode::Empty => json_response(&json!([])),
+        ReportFixtureMode::Delivery | ReportFixtureMode::Empty | ReportFixtureMode::Gtd => {
+            json_response(&json!([]))
+        }
         ReportFixtureMode::FillsOnly
         | ReportFixtureMode::Populated
+        | ReportFixtureMode::HedgePositions
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
             let mut trade = load_fixture("user_trade.json");
@@ -1053,6 +1065,76 @@ async fn start_exec_test_server_with_algo_capture_and_hedge_mode(
     (addr, captured_query)
 }
 
+async fn start_exec_test_server_with_gtd_algo_and_ws_capture() -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+    CapturedWsTradingMessages,
+) {
+    let captured_query = Arc::new(std::sync::Mutex::new(None));
+    let captured_ws_trading_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = create_exec_test_router_with_command_responses(CommandResponseState {
+        responses: CommandResponses::default(),
+        request_count: Arc::new(AtomicUsize::new(0)),
+        captured_queries: None,
+        captured_ws_trading_messages: Some(captured_ws_trading_messages.clone()),
+        report_fixture_mode: ReportFixtureMode::Empty,
+        hedge_mode: false,
+    })
+    .route(
+        "/fapi/v1/algoOrder",
+        post({
+            let captured_query = captured_query.clone();
+
+            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+
+                *captured_query.lock().unwrap() = Some(query.clone());
+                json_response(&json!({
+                    "algoId": 12345,
+                    "clientAlgoId": query.get("clientAlgoId").cloned().unwrap_or_default(),
+                    "algoType": "CONDITIONAL",
+                    "orderType": "STOP",
+                    "symbol": "BTCUSDT",
+                    "side": "SELL",
+                    "positionSide": "BOTH",
+                    "timeInForce": "GTD",
+                    "quantity": "0.001",
+                    "algoStatus": "NEW",
+                    "triggerPrice": "55000.00",
+                    "price": "56000.00",
+                    "workingType": "MARK_PRICE",
+                    "goodTillDate": query.get("goodTillDate").and_then(|value| value.parse::<i64>().ok()).unwrap_or_default()
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let health_url = format!("http://{addr}/fapi/v1/ping");
+    let http_client =
+        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    wait_until_async(
+        || {
+            let url = health_url.clone();
+            let client = http_client.clone();
+            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    (addr, captured_query, captured_ws_trading_messages)
+}
+
 fn create_exec_test_router_with_order_capture(
     captured_query: &Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
     hedge_mode: bool,
@@ -1064,41 +1146,7 @@ fn create_exec_test_router_with_order_capture(
         .route("/fapi/v1/ping", get(|| async { json_response(&json!({})) }))
         .route(
             "/fapi/v1/exchangeInfo",
-            get(|| async {
-                json_response(&json!({
-                    "timezone": "UTC",
-                    "serverTime": 1700000000000_i64,
-                    "rateLimits": [],
-                    "exchangeFilters": [],
-                    "symbols": [{
-                        "symbol": "BTCUSDT",
-                        "pair": "BTCUSDT",
-                        "contractType": "PERPETUAL",
-                        "deliveryDate": 4133404800000_i64,
-                        "onboardDate": 1569398400000_i64,
-                        "status": "TRADING",
-                        "baseAsset": "BTC",
-                        "quoteAsset": "USDT",
-                        "marginAsset": "USDT",
-                        "pricePrecision": 2,
-                        "quantityPrecision": 3,
-                        "baseAssetPrecision": 8,
-                        "quotePrecision": 8,
-                        "maintMarginPercent": "2.5000",
-                        "requiredMarginPercent": "5.0000",
-                        "underlyingType": "COIN",
-                        "settlePlan": 0,
-                        "triggerProtect": "0.0500",
-                        "filters": [
-                            {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
-                            {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
-                            {"filterType": "MIN_NOTIONAL", "notional": "5"}
-                        ],
-                        "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"],
-                        "timeInForce": ["GTC", "IOC", "FOK", "GTD"]
-                    }]
-                }))
-            }),
+            get(|| async { json_response(&exchange_info_response()) }),
         )
         .route(
             "/fapi/v1/positionSide/dual",
@@ -1160,8 +1208,12 @@ fn create_exec_test_router_with_order_capture(
                         if !has_auth_headers(&headers) {
                             return unauthorized_response();
                         }
+                        let mut response = load_fixture("order_response.json");
+                        if let Some(symbol) = query.get("symbol") {
+                            response["symbol"] = json!(symbol);
+                        }
                         *captured.lock().unwrap() = Some(query);
-                        json_response(&load_fixture("order_response.json"))
+                        json_response(&response)
                     }
                 }
             }),
@@ -1292,6 +1344,20 @@ fn add_test_instrument_to_cache(cache: &Rc<RefCell<Cache>>) {
     let exchange_info: BinanceFuturesUsdExchangeInfo =
         serde_json::from_value(exchange_info_response()).unwrap();
     let symbol = exchange_info.symbols.first().unwrap();
+    let instrument =
+        parse_usdm_instrument(symbol, UnixNanos::default(), UnixNanos::default()).unwrap();
+
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+}
+
+fn add_delivery_instrument_to_cache(cache: &Rc<RefCell<Cache>>) {
+    let exchange_info: BinanceFuturesUsdExchangeInfo =
+        serde_json::from_value(exchange_info_response()).unwrap();
+    let symbol = exchange_info
+        .symbols
+        .iter()
+        .find(|symbol| symbol.symbol == "BTCUSDT_260925")
+        .unwrap();
     let instrument =
         parse_usdm_instrument(symbol, UnixNanos::default(), UnixNanos::default()).unwrap();
 
@@ -1481,6 +1547,40 @@ async fn test_submit_order_generates_submitted_event() {
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_usdm_gtd_order_encodes_expiry_over_http() {
+    let (addr, captured_query) = start_exec_test_server_with_order_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let expire_time = valid_gtd_expire_time();
+    let order =
+        add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("gtd-http-test-001"), expire_time);
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    let expected_expiry = expire_time.as_millis().to_string();
+    assert_eq!(query.get("timeInForce").map(String::as_str), Some("GTD"));
+    assert_eq!(
+        query.get("goodTillDate").map(String::as_str),
+        Some(expected_expiry.as_str()),
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_submit_order_list_posts_batch_orders_for_independent_limits() {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture().await;
     let base_url_http = format!("http://{addr}");
@@ -1517,6 +1617,52 @@ async fn test_submit_order_list_posts_batch_orders_for_independent_limits() {
         batch[0]["newClientOrderId"]
             .as_str()
             .is_some_and(|value| value.contains("list-limit-001"))
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_usdm_gtd_order_list_encodes_each_expiry() {
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let expire_time = valid_gtd_expire_time();
+    let orders = vec![
+        add_gtd_limit_order_to_cache(
+            &cache,
+            ClientOrderId::new("gtd-batch-test-001"),
+            expire_time,
+        ),
+        add_gtd_limit_order_to_cache(
+            &cache,
+            ClientOrderId::new("gtd-batch-test-002"),
+            expire_time,
+        ),
+    ];
+    client
+        .submit_order_list(submit_order_list_command(&orders))
+        .unwrap();
+
+    let captured = wait_for_query(&captured_queries, "batchOrders").await;
+    let batch: Vec<serde_json::Value> = serde_json::from_str(
+        captured
+            .query
+            .get("batchOrders")
+            .expect("batchOrders query param"),
+    )
+    .unwrap();
+
+    assert_eq!(batch.len(), 2);
+    assert!(batch.iter().all(|item| item["timeInForce"] == "GTD"));
+    assert!(
+        batch
+            .iter()
+            .all(|item| item["goodTillDate"] == expire_time.as_millis())
     );
 }
 
@@ -1742,6 +1888,197 @@ async fn test_submit_algo_order_in_hedge_mode_omits_reduce_only() {
     let query = captured_query.lock().unwrap().clone().unwrap();
     assert_eq!(query.get("positionSide"), Some(&"LONG".to_string()));
     assert!(!query.contains_key("reduceOnly"));
+}
+
+/// Binance retires a whole hedge leg with `closePosition=true` submitted on the
+/// side that closes that leg: `SELL`+`positionSide=LONG` for the long leg and
+/// `BUY`+`positionSide=SHORT` for the short leg. `positionSide` must therefore
+/// follow close intent, which `close_position` expresses on its own - the wire
+/// `reduceOnly` field is forbidden alongside `positionSide`, and the internal
+/// `reduce_only` flag cannot be combined with `close_position` at all.
+#[rstest]
+#[case::close_long_leg(OrderSide::Sell, "LONG")]
+#[case::close_short_leg(OrderSide::Buy, "SHORT")]
+#[tokio::test]
+async fn test_submit_close_position_in_hedge_mode_emits_closing_position_side(
+    #[case] order_side: OrderSide,
+    #[case] expected_position_side: &'static str,
+) {
+    let (addr, captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(true).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-close-position-test-001");
+    let order_any = add_stop_market_order_to_cache(&cache, client_order_id, order_side, false);
+
+    client
+        .submit_order(submit_order_command_with_params(
+            &order_any,
+            Some(close_position_params()),
+        ))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(query.get("closePosition").map(String::as_str), Some("true"));
+    assert_eq!(
+        query.get("positionSide").map(String::as_str),
+        Some(expected_position_side),
+    );
+    assert!(!query.contains_key("reduceOnly"));
+    assert!(!query.contains_key("quantity"));
+}
+
+/// `close_position` already carries close intent, so pairing it with the internal
+/// `reduce_only` flag is refused locally before anything reaches the venue. This
+/// is the second half of the hedge-mode full-exit trap: the flag that would
+/// otherwise select the closing `positionSide` is exactly the flag that is
+/// rejected here.
+#[rstest]
+#[case::hedge(true)]
+#[case::one_way(false)]
+#[tokio::test]
+async fn test_submit_close_position_with_reduce_only_is_denied_locally(#[case] hedge_mode: bool) {
+    let (addr, _captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(hedge_mode).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-close-position-reduce-only-001");
+    let order_any = add_stop_market_order_to_cache(&cache, client_order_id, OrderSide::Sell, true);
+
+    let error = client
+        .submit_order(submit_order_command_with_params(
+            &order_any,
+            Some(close_position_params()),
+        ))
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "`close_position` cannot be combined with `reduce_only` on Binance",
+    );
+}
+
+/// An explicit-quantity hedge-mode exit is close-only purely by virtue of its
+/// `positionSide`, and that side is selected by the internal `reduce_only` flag.
+/// Leaving the flag unset to avoid the forbidden wire field therefore emits the
+/// *opening* leg and adds exposure instead of removing it.
+#[rstest]
+#[case::sell_opens_short_without_reduce_only(OrderSide::Sell, false, "SHORT")]
+#[case::sell_closes_long_with_reduce_only(OrderSide::Sell, true, "LONG")]
+#[case::buy_opens_long_without_reduce_only(OrderSide::Buy, false, "LONG")]
+#[case::buy_closes_short_with_reduce_only(OrderSide::Buy, true, "SHORT")]
+#[tokio::test]
+async fn test_submit_partial_exit_position_side_follows_reduce_only(
+    #[case] order_side: OrderSide,
+    #[case] reduce_only: bool,
+    #[case] expected_position_side: &'static str,
+) {
+    let (addr, captured_query) =
+        start_exec_test_server_with_algo_capture_and_hedge_mode(true).await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let client_order_id = ClientOrderId::new("hedge-partial-exit-test-001");
+    let order_any =
+        add_stop_market_order_to_cache(&cache, client_order_id, order_side, reduce_only);
+
+    client
+        .submit_order(submit_order_command(&order_any))
+        .unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        query.get("positionSide").map(String::as_str),
+        Some(expected_position_side),
+    );
+    assert_eq!(query.get("quantity").map(String::as_str), Some("0.001"));
+    assert!(!query.contains_key("reduceOnly"));
+    assert!(!query.contains_key("closePosition"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_usdm_gtd_algo_uses_http_when_ws_trading_is_active() {
+    let (addr, captured_query, captured_ws_trading_messages) =
+        start_exec_test_server_with_gtd_algo_and_ws_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let base_url_ws_trading = format!("ws://{addr}/ws-fapi/v1");
+    let (mut client, _rx, cache) = create_test_execution_client_with_ws_trading(
+        base_url_http,
+        base_url_ws,
+        base_url_ws_trading,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let expire_time = valid_gtd_expire_time();
+    let order = add_gtd_stop_limit_order_to_cache(
+        &cache,
+        ClientOrderId::new("gtd-algo-http-test-001"),
+        expire_time,
+    );
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    let expected_expiry = expire_time.as_millis().to_string();
+    assert_eq!(query.get("type").map(String::as_str), Some("STOP"));
+    assert_eq!(query.get("timeInForce").map(String::as_str), Some("GTD"));
+    assert_eq!(
+        query.get("goodTillDate").map(String::as_str),
+        Some(expected_expiry.as_str()),
+    );
+    assert!(captured_ws_trading_messages.lock().unwrap().is_empty());
 }
 
 #[rstest]
@@ -2353,6 +2690,154 @@ async fn test_query_order_uses_binance_symbol_for_futures_symbol() {
 
     let captured = wait_for_query(&captured_queries, "order").await;
     assert_query_symbol(&captured.query);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_delivery_order_routing_uses_raw_binance_symbol() {
+    let (addr, captured_query) = start_exec_test_server_with_order_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    let instrument_id = InstrumentId::from("BTCUSDT_260925.BINANCE");
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = add_limit_order_for_instrument_to_cache(
+        &cache,
+        instrument_id,
+        ClientOrderId::new("delivery-order-routing-test-001"),
+    );
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_query_symbol_eq(&query, "BTCUSDT_260925", "BTCUSDT_260925.BINANCE");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_delivery_reports_use_raw_binance_symbol() {
+    let instrument_id = InstrumentId::from("BTCUSDT_260925.BINANCE");
+    let (addr, captured_queries) = start_exec_test_server_with_query_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    client
+        .query_order(QueryOrder::new(
+            test_trader_id(),
+            Some(*BINANCE_CLIENT_ID),
+            test_strategy_id(),
+            instrument_id,
+            ClientOrderId::new("delivery-query-routing-test-001"),
+            Some(VenueOrderId::from("12345")),
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    let query = wait_for_query(&captured_queries, "order").await;
+
+    client
+        .generate_fill_reports(GenerateFillReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            Some(VenueOrderId::from("12345")),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let fills = wait_for_query(&captured_queries, "userTrades").await;
+
+    client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let positions = wait_for_query(&captured_queries, "positionRisk").await;
+
+    for captured in [&query, &fills, &positions] {
+        assert_query_symbol_eq(&captured.query, "BTCUSDT_260925", "BTCUSDT_260925.BINANCE");
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::Delivery,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_delivery_instrument_to_cache(&cache);
+    let instrument_id = InstrumentId::from("BTCUSDT_260925.BINANCE");
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let orders = client
+        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let positions = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        orders
+            .iter()
+            .any(|report| report.instrument_id == instrument_id)
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].instrument_id, instrument_id);
 }
 
 #[rstest]
@@ -3252,6 +3737,36 @@ async fn test_generate_mass_status_includes_stable_fill_identity(
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_mass_status_preserves_regular_and_algo_gtd_expiry() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::Gtd,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let reports = mass_status.order_reports();
+
+    assert_eq!(reports.len(), 2);
+    assert!(reports.values().all(|report| {
+        report.time_in_force == TimeInForce::Gtd
+            && report.expire_time == Some(UnixNanos::from_millis(1_700_000_601_000))
+    }));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_mass_status_fails_on_invalid_fill() {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -3270,6 +3785,25 @@ async fn test_generate_mass_status_fails_on_invalid_fill() {
     let error = client.generate_mass_status(Some(60)).await.unwrap_err();
 
     assert!(error.to_string().contains("commission"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_overflowing_lookback() {
+    let addr = start_exec_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (client, _rx, _cache) = create_test_execution_client(base_url_http, base_url_ws);
+
+    let error = client
+        .generate_mass_status(Some(307_445_735))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "lookback minutes exceed the nanosecond range"
+    );
 }
 
 #[rstest]
@@ -3476,6 +4010,69 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
 
 #[rstest]
 #[tokio::test]
+async fn test_position_report_generation_preserves_hedge_legs() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::HedgePositions,
+    )
+    .await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    let account_id = AccountId::from("BINANCE-001");
+    let instrument_id = test_instrument_id();
+    add_test_account_to_cache(&cache, account_id);
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            nautilus_core::UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].account_id, account_id);
+    assert_eq!(reports[0].instrument_id, instrument_id);
+    assert_eq!(reports[0].position_side, PositionSideSpecified::Long);
+    assert_eq!(reports[0].quantity, Quantity::from("0.005"));
+    assert_eq!(
+        reports[0].signed_decimal_qty,
+        rust_decimal_macros::dec!(0.005)
+    );
+    assert_eq!(reports[0].venue_position_id, None);
+    assert_eq!(
+        reports[0].avg_px_open,
+        Some(rust_decimal_macros::dec!(50000.0)),
+    );
+    assert_eq!(reports[0].ts_last, reports[0].ts_init);
+
+    assert_eq!(reports[1].account_id, account_id);
+    assert_eq!(reports[1].instrument_id, instrument_id);
+    assert_eq!(reports[1].position_side, PositionSideSpecified::Short);
+    assert_eq!(reports[1].quantity, Quantity::from("0.002"));
+    assert_eq!(
+        reports[1].signed_decimal_qty,
+        rust_decimal_macros::dec!(-0.002)
+    );
+    assert_eq!(reports[1].venue_position_id, None);
+    assert_eq!(
+        reports[1].avg_px_open,
+        Some(rust_decimal_macros::dec!(52000.0)),
+    );
+    assert_eq!(reports[1].ts_last, reports[1].ts_init);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_batch_cancel_uses_binance_symbol_for_futures_symbol() {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture().await;
     let base_url_http = format!("http://{addr}");
@@ -3662,6 +4259,93 @@ fn add_limit_order_for_instrument_to_cache(
     order_any
 }
 
+fn add_gtd_limit_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+    expire_time: UnixNanos,
+) -> OrderAny {
+    let order = LimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtd,
+        Some(expire_time),
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+    let order = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    order
+}
+
+fn add_gtd_stop_limit_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+    expire_time: UnixNanos,
+) -> OrderAny {
+    let order = StopLimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        OrderSide::Sell,
+        Quantity::from("0.001"),
+        Price::from("56000.00"),
+        Price::from("55000.00"),
+        TriggerType::MarkPrice,
+        TimeInForce::Gtd,
+        Some(expire_time),
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+    let order = OrderAny::StopLimit(order);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    order
+}
+
+fn valid_gtd_expire_time() -> UnixNanos {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    UnixNanos::from_seconds(now.as_secs() + 1_200)
+}
+
 fn add_triggered_stop_market_order_to_cache(
     cache: &Rc<RefCell<Cache>>,
     client_order_id: ClientOrderId,
@@ -3735,6 +4419,54 @@ fn add_triggered_stop_market_order_to_cache(
         .add_order(order_any.clone(), None, None, false)
         .unwrap();
     order_any
+}
+
+fn add_stop_market_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+    order_side: OrderSide,
+    reduce_only: bool,
+) -> OrderAny {
+    let order = StopMarketOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        order_side,
+        Quantity::from("0.001"),
+        Price::from("45000.00"),
+        TriggerType::MarkPrice,
+        TimeInForce::Gtc,
+        None,
+        reduce_only,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let order_any = OrderAny::StopMarket(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+    order_any
+}
+
+fn close_position_params() -> Params {
+    let mut params = Params::new();
+    params.insert("close_position".to_string(), json!(true));
+    params
 }
 
 fn algo_order_query_params() -> Params {
@@ -3858,16 +4590,20 @@ fn add_linked_conditional_orders_to_cache(cache: &Rc<RefCell<Cache>>) -> Vec<Ord
 }
 
 fn submit_order_command(order: &OrderAny) -> SubmitOrder {
+    submit_order_command_with_params(order, None)
+}
+
+fn submit_order_command_with_params(order: &OrderAny, params: Option<Params>) -> SubmitOrder {
     SubmitOrder::new(
         test_trader_id(),
         Some(*BINANCE_CLIENT_ID),
         test_strategy_id(),
-        test_instrument_id(),
+        order.instrument_id(),
         order.client_order_id(),
         order.init_event().clone(),
         None,
         None,
-        None,
+        params,
         nautilus_core::UUID4::new(),
         UnixNanos::default(),
         None,
@@ -4065,8 +4801,12 @@ async fn wait_for_ws_trading_method(
 }
 
 fn assert_query_symbol(query: &HashMap<String, String>) {
-    assert_eq!(query.get("symbol").map(String::as_str), Some("BTCUSDT"));
-    assert!(!query.values().any(|value| value.contains("BTCUSDT-PERP")));
+    assert_query_symbol_eq(query, "BTCUSDT", "BTCUSDT-PERP");
+}
+
+fn assert_query_symbol_eq(query: &HashMap<String, String>, expected: &str, nautilus_symbol: &str) {
+    assert_eq!(query.get("symbol").map(String::as_str), Some(expected));
+    assert!(!query.values().any(|value| value.contains(nautilus_symbol)));
 }
 
 async fn assert_no_order_event_matching<F>(
@@ -4102,6 +4842,41 @@ fn test_strategy_id() -> StrategyId {
 
 fn test_instrument_id() -> InstrumentId {
     InstrumentId::from("BTCUSDT-PERP.BINANCE")
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_usdm_gtd_order_encodes_expiry_over_ws() {
+    let (addr, captured_ws_trading_messages) =
+        start_exec_test_server_with_ws_trading_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let base_url_ws_trading = format!("ws://{addr}/ws-fapi/v1");
+    let (mut client, _rx, cache) = create_test_execution_client_with_ws_trading(
+        base_url_http,
+        base_url_ws,
+        base_url_ws_trading,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let expire_time = valid_gtd_expire_time();
+    let order =
+        add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("gtd-ws-test-001"), expire_time);
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    let message = wait_for_ws_trading_method(&captured_ws_trading_messages, "order.place").await;
+    let params = message.get("params").unwrap();
+
+    assert_eq!(
+        params.get("timeInForce").and_then(|value| value.as_str()),
+        Some("GTD"),
+    );
+    assert_eq!(
+        params.get("goodTillDate").and_then(|value| value.as_i64()),
+        Some(expire_time.as_millis() as i64),
+    );
 }
 
 #[rstest]

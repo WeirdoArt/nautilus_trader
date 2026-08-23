@@ -42,8 +42,8 @@ use nautilus_network::{
     http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
-        WebSocketConfig, channel_message_handler,
+        AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use serde_json::Value;
@@ -109,6 +109,7 @@ pub struct BybitWebSocketClient {
     requires_auth: bool,
     auth_tracker: AuthTracker,
     heartbeat: Option<u64>,
+    auth_wait_timeout: Duration,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<BybitWsMessage>>>,
@@ -151,6 +152,7 @@ impl Clone for BybitWebSocketClient {
             requires_auth: self.requires_auth,
             auth_tracker: self.auth_tracker.clone(),
             heartbeat: self.heartbeat,
+            auth_wait_timeout: self.auth_wait_timeout,
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: None, // Each clone gets its own receiver
@@ -186,6 +188,12 @@ impl BybitWebSocketClient {
         )
     }
 
+    /// Sets the timeout for waiting on (re)authentication before failing an
+    /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
+    pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
+        self.auth_wait_timeout = timeout;
+    }
+
     /// Creates a new Bybit public WebSocket client targeting the specified product/environment.
     #[must_use]
     pub fn new_public_with(
@@ -209,6 +217,7 @@ impl BybitWebSocketClient {
             requires_auth: false,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -261,6 +270,7 @@ impl BybitWebSocketClient {
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -313,6 +323,7 @@ impl BybitWebSocketClient {
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -347,11 +358,8 @@ impl BybitWebSocketClient {
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
-        // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
-        // in the message loop for minimal latency (see handler.rs pong response)
-        let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {
-            // Handler responds to pings internally via select! loop
-        });
+        // Inbound Ping frames are answered by the transport, so no ping handler is needed;
+        // the reader routes them away from the message channel and the handler never sees them.
 
         let ping_msg = serde_json::to_string(&BybitSubscription {
             op: BybitWsOperation::Ping,
@@ -362,14 +370,15 @@ impl BybitWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers: Self::default_headers(),
-            heartbeat: self.heartbeat,
-            heartbeat_msg: Some(ping_msg),
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: Some(ping_msg),
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -396,7 +405,6 @@ impl BybitWebSocketClient {
                 WebSocketClient::connect(
                     config.clone(),
                     Some(raw_handler.clone()),
-                    Some(ping_handler.clone()),
                     None,
                     vec![],
                     None,
@@ -562,7 +570,7 @@ impl BybitWebSocketClient {
                                 // Begin auth attempt so succeed() will update state
                                 let _rx = auth_tracker.begin();
 
-                                let expires = chrono::Utc::now().timestamp_millis()
+                                let expires = jiff::Timestamp::now().as_millisecond()
                                     + WEBSOCKET_AUTH_WINDOW_MS;
                                 let signature = cred.sign_websocket_auth(expires);
 
@@ -1268,7 +1276,7 @@ impl BybitWebSocketClient {
         }
 
         tokio::select! {
-            authenticated = self.auth_tracker.wait_for_authenticated(AUTH_WAIT_TIMEOUT) => {
+            authenticated = self.auth_tracker.wait_for_authenticated(self.auth_wait_timeout) => {
                 if authenticated {
                     Ok(())
                 } else {
@@ -1904,7 +1912,7 @@ impl BybitWebSocketClient {
             BybitWsError::Authentication("Credentials required for authentication".to_string())
         })?;
 
-        let expires = chrono::Utc::now().timestamp_millis() + WEBSOCKET_AUTH_WINDOW_MS;
+        let expires = jiff::Timestamp::now().as_millisecond() + WEBSOCKET_AUTH_WINDOW_MS;
         let signature = credential.sign_websocket_auth(expires);
 
         let auth_message = BybitAuthRequest {

@@ -1,4 +1,4 @@
-# Cfd
+# CFD
 
 `Cfd` represents a contract for difference that tracks an underlying asset without
 transferring ownership of the underlying. The venue defines the quote currency,
@@ -9,7 +9,7 @@ Examples include CFD contracts on FX, equities, indexes, and commodities.
 ## Fields
 
 | Field             | Rust type          | Python type        | Required/default | Notes                                    |
-|-------------------|--------------------|--------------------|------------------|------------------------------------------|
+| ----------------- | ------------------ | ------------------ | ---------------- | ---------------------------------------- |
 | `instrument_id`   | `InstrumentId`     | `InstrumentId`     | Required         | Stored as `id` in Rust.                  |
 | `raw_symbol`      | `Symbol`           | `Symbol`           | Required         | Native venue symbol.                     |
 | `asset_class`     | `AssetClass`       | `AssetClass`       | Required         | Asset class of the underlying.           |
@@ -112,7 +112,7 @@ audusd = Cfd(
 
 Representative adapters that create or consume `Cfd` instruments include:
 
-- [Interactive Brokers](../../integrations/ib.md) for CFD contracts.
+- [Interactive Brokers](../../integrations/interactive_brokers.md) for CFD contracts.
 
 ## Related guides
 

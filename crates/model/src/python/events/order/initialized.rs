@@ -16,7 +16,7 @@
 use indexmap::IndexMap;
 use nautilus_core::{
     UUID4, UnixNanos,
-    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
+    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err},
 };
 use pyo3::{
     basic::CompareOp,
@@ -36,8 +36,8 @@ use crate::{
     types::{Price, Quantity},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl OrderInitialized {
     /// Represents an event where an order has been initialized.
     ///
@@ -87,8 +87,8 @@ impl OrderInitialized {
         exec_algorithm_params: Option<IndexMap<String, String>>,
         exec_spawn_id: Option<ClientOrderId>,
         tags: Option<Vec<String>>,
-    ) -> Self {
-        Self::new(
+    ) -> PyResult<Self> {
+        Self::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -124,6 +124,7 @@ impl OrderInitialized {
             exec_spawn_id,
             tags.map(|vec| vec.iter().map(|s| Ustr::from(s)).collect()),
         )
+        .map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -143,9 +144,214 @@ impl OrderInitialized {
     }
 
     #[getter]
+    #[pyo3(name = "trader_id")]
+    fn py_trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    #[getter]
+    #[pyo3(name = "strategy_id")]
+    fn py_strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    fn py_instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    #[getter]
+    #[pyo3(name = "client_order_id")]
+    fn py_client_order_id(&self) -> ClientOrderId {
+        self.client_order_id
+    }
+
+    #[getter]
+    #[pyo3(name = "order_side")]
+    fn py_order_side(&self) -> OrderSide {
+        self.order_side
+    }
+
+    #[getter]
     #[pyo3(name = "order_type")]
     fn py_order_type(&self) -> OrderType {
         self.order_type
+    }
+
+    #[getter]
+    #[pyo3(name = "quantity")]
+    fn py_quantity(&self) -> Quantity {
+        self.quantity
+    }
+
+    #[getter]
+    #[pyo3(name = "time_in_force")]
+    fn py_time_in_force(&self) -> TimeInForce {
+        self.time_in_force
+    }
+
+    #[getter]
+    #[pyo3(name = "post_only")]
+    fn py_post_only(&self) -> bool {
+        self.post_only
+    }
+
+    #[getter]
+    #[pyo3(name = "reduce_only")]
+    fn py_reduce_only(&self) -> bool {
+        self.reduce_only
+    }
+
+    #[getter]
+    #[pyo3(name = "quote_quantity")]
+    fn py_quote_quantity(&self) -> bool {
+        self.quote_quantity
+    }
+
+    #[getter]
+    #[pyo3(name = "reconciliation")]
+    fn py_reconciliation(&self) -> bool {
+        self.reconciliation
+    }
+
+    #[getter]
+    #[pyo3(name = "event_id")]
+    fn py_event_id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "price")]
+    fn py_price(&self) -> Option<Price> {
+        self.price
+    }
+
+    #[getter]
+    #[pyo3(name = "activation_price")]
+    fn py_activation_price(&self) -> Option<Price> {
+        self.activation_price
+    }
+
+    #[getter]
+    #[pyo3(name = "trigger_price")]
+    fn py_trigger_price(&self) -> Option<Price> {
+        self.trigger_price
+    }
+
+    #[getter]
+    #[pyo3(name = "trigger_type")]
+    fn py_trigger_type(&self) -> Option<TriggerType> {
+        self.trigger_type
+    }
+
+    #[getter]
+    #[pyo3(name = "limit_offset")]
+    fn py_limit_offset(&self) -> Option<Decimal> {
+        self.limit_offset
+    }
+
+    #[getter]
+    #[pyo3(name = "trailing_offset")]
+    fn py_trailing_offset(&self) -> Option<Decimal> {
+        self.trailing_offset
+    }
+
+    #[getter]
+    #[pyo3(name = "trailing_offset_type")]
+    fn py_trailing_offset_type(&self) -> Option<TrailingOffsetType> {
+        self.trailing_offset_type
+    }
+
+    #[getter]
+    #[pyo3(name = "expire_time")]
+    fn py_expire_time(&self) -> Option<u64> {
+        self.expire_time.map(|ts| ts.as_u64())
+    }
+
+    #[getter]
+    #[pyo3(name = "display_qty")]
+    fn py_display_qty(&self) -> Option<Quantity> {
+        self.display_qty
+    }
+
+    #[getter]
+    #[pyo3(name = "emulation_trigger")]
+    fn py_emulation_trigger(&self) -> Option<TriggerType> {
+        self.emulation_trigger
+    }
+
+    #[getter]
+    #[pyo3(name = "trigger_instrument_id")]
+    fn py_trigger_instrument_id(&self) -> Option<InstrumentId> {
+        self.trigger_instrument_id
+    }
+
+    #[getter]
+    #[pyo3(name = "contingency_type")]
+    fn py_contingency_type(&self) -> Option<ContingencyType> {
+        self.contingency_type
+    }
+
+    #[getter]
+    #[pyo3(name = "order_list_id")]
+    fn py_order_list_id(&self) -> Option<OrderListId> {
+        self.order_list_id
+    }
+
+    #[getter]
+    #[pyo3(name = "linked_order_ids")]
+    fn py_linked_order_ids(&self) -> Option<Vec<ClientOrderId>> {
+        self.linked_order_ids.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "parent_order_id")]
+    fn py_parent_order_id(&self) -> Option<ClientOrderId> {
+        self.parent_order_id
+    }
+
+    #[getter]
+    #[pyo3(name = "exec_algorithm_id")]
+    fn py_exec_algorithm_id(&self) -> Option<ExecAlgorithmId> {
+        self.exec_algorithm_id
+    }
+
+    #[getter]
+    #[pyo3(name = "exec_algorithm_params")]
+    fn py_exec_algorithm_params(&self) -> Option<IndexMap<String, String>> {
+        self.exec_algorithm_params.as_ref().map(|params| {
+            params
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
+    }
+
+    #[getter]
+    #[pyo3(name = "exec_spawn_id")]
+    fn py_exec_spawn_id(&self) -> Option<ClientOrderId> {
+        self.exec_spawn_id
+    }
+
+    #[getter]
+    #[pyo3(name = "tags")]
+    fn py_tags(&self) -> Option<Vec<String>> {
+        self.tags
+            .as_ref()
+            .map(|tags| tags.iter().map(ToString::to_string).collect())
     }
 
     #[staticmethod]
@@ -170,15 +376,6 @@ impl OrderInitialized {
         dict.set_item("reduce_only", self.reduce_only)?;
         dict.set_item("quote_quantity", self.quote_quantity)?;
         dict.set_item("reconciliation", self.reconciliation)?;
-        // TODO remove options as in legacy cython only
-        let options = PyDict::new(py);
-
-        if self.order_type == OrderType::StopMarket {
-            options.set_item("trigger_type", self.trigger_type.map(|x| x.to_string()))?;
-            options.set_item("trigger_price", self.trigger_price.map(|x| x.to_string()))?;
-            options.set_item("expire_time_ns", self.expire_time.map(|x| x.to_string()))?;
-        }
-        dict.set_item("options", options)?;
         dict.set_item("event_id", self.event_id.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
@@ -303,7 +500,9 @@ impl OrderInitialized {
         match &self.tags {
             Some(tags) => dict.set_item(
                 "tags",
-                tags.iter().map(|x| x.to_string()).collect::<Vec<String>>(),
+                tags.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>(),
             )?,
             None => dict.set_item("tags", py.None())?,
         }

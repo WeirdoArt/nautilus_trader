@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use nautilus_core::python::to_pyvalue_err;
+use nautilus_model::position::Position;
 use pyo3::prelude::*;
 
 use super::transform_returns;
@@ -29,7 +30,7 @@ impl ExpectedShortfall {
     ///
     /// Expected Shortfall is the average of the losses that occur beyond the
     /// `ValueAtRisk` threshold at a
-    /// given confidence level — the mean of the worst
+    /// given confidence level - the mean of the worst
     /// `1 - confidence` tail of the return distribution. It is a coherent risk
     /// measure and captures tail severity that `VaR` alone does not.
     ///
@@ -73,7 +74,7 @@ impl ExpectedShortfall {
     }
 
     #[pyo3(name = "calculate_from_positions")]
-    fn py_calculate_from_positions(&mut self, _positions: Vec<Py<PyAny>>) -> Option<f64> {
+    fn py_calculate_from_positions(&mut self, _positions: Vec<Position>) -> Option<f64> {
         None
     }
 }

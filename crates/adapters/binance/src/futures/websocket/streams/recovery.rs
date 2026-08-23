@@ -39,8 +39,10 @@ use super::{
 };
 use crate::{
     common::{
+        consts::BINANCE_WS_HEARTBEAT_SECS,
         enums::{BinanceEnvironment, BinanceProductType},
         symbol::format_instrument_id,
+        urls::get_futures_user_stream_url,
     },
     futures::http::{client::BinanceFuturesHttpClient, query::BinanceOpenOrdersParamsBuilder},
 };
@@ -60,6 +62,7 @@ pub(crate) struct WsBuildParams {
     pub api_secret: String,
     pub private_base_url: String,
     pub transport_backend: TransportBackend,
+    pub proxy_url: Option<String>,
 }
 
 /// Context captured by the recovery driver task. All fields are cheaply
@@ -82,7 +85,8 @@ pub(crate) async fn build_and_connect_user_stream(
     params: &WsBuildParams,
     listen_key: &str,
 ) -> anyhow::Result<BinanceFuturesWebSocketClient> {
-    let private_url = format!("{}?listenKey={}", params.private_base_url, listen_key);
+    let private_url =
+        get_futures_user_stream_url(params.product_type, &params.private_base_url, listen_key);
 
     let mut ws_client = BinanceFuturesWebSocketClient::new(
         params.product_type,
@@ -90,15 +94,16 @@ pub(crate) async fn build_and_connect_user_stream(
         Some(params.api_key.clone()),
         Some(params.api_secret.clone()),
         Some(private_url),
-        Some(20),
+        Some(BINANCE_WS_HEARTBEAT_SECS),
         params.transport_backend,
     )
-    .context("failed to construct Binance Futures private WebSocket client")?;
+    .context("failed to construct Binance Futures private WebSocket client")?
+    .with_proxy(params.proxy_url.clone());
 
     log::debug!("Connecting to Binance Futures user data stream...");
-    ws_client.connect().await.map_err(|e| {
-        log::error!("Binance Futures private WebSocket connection failed: {e:?}");
-        anyhow::anyhow!("failed to connect Binance Futures private WebSocket: {e}")
+    ws_client.connect().await.map_err(|_| {
+        log::error!("Binance Futures private WebSocket connection failed");
+        anyhow::anyhow!("failed to connect Binance Futures private WebSocket")
     })?;
     log::debug!("Connected to Binance Futures user data stream");
 
@@ -273,7 +278,7 @@ async fn emit_open_order_reports(ctx: &RecoveryCtx) -> anyhow::Result<()> {
     let open_ok = match open_orders_result {
         Ok(orders) => {
             for order in orders {
-                let symbol_ustr = ustr::Ustr::from(order.symbol.as_str());
+                let symbol_ustr = order.symbol;
                 let (instrument_id, price_precision, size_precision) =
                     resolve_precision(&instruments, &symbol_ustr, product_type);
 
@@ -308,7 +313,7 @@ async fn emit_open_order_reports(ctx: &RecoveryCtx) -> anyhow::Result<()> {
     let algo_ok = match algo_orders_result {
         Ok(algo_orders) => {
             for algo_order in algo_orders {
-                let symbol_ustr = ustr::Ustr::from(algo_order.symbol.as_str());
+                let symbol_ustr = algo_order.symbol;
                 let (instrument_id, price_precision, size_precision) =
                     resolve_precision(&instruments, &symbol_ustr, product_type);
 

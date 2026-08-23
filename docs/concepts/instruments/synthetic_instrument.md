@@ -10,7 +10,7 @@ component instrument prices.
 ## Fields
 
 | Field             | Rust type           | Python type          | Required/default | Notes                                       |
-|-------------------|---------------------|----------------------|------------------|---------------------------------------------|
+| ----------------- | ------------------- | -------------------- | ---------------- | ------------------------------------------- |
 | `symbol`          | `Symbol`            | `Symbol`             | Required         | Synthetic symbol used with venue `SYNTH`.   |
 | `id`              | `InstrumentId`      | `InstrumentId`       | Derived          | Instrument ID formed from `symbol.SYNTH`.   |
 | `price_precision` | `u8`                | `int`                | Required         | Decimal places allowed for synthetic price. |
@@ -27,7 +27,6 @@ stores the same value as `id`.*
 
 - `SyntheticInstrument` is local to Nautilus and does not represent a venue orderable market.
 - It always uses the synthetic venue `SYNTH`.
-- Python requires at least two component instrument IDs.
 - The formula must compile against the supplied component identifiers before the object is valid.
 - It has no venue limits, margins, fees, order book, or adapter-specific metadata.
 

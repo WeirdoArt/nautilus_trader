@@ -50,12 +50,13 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Data, OrderBookDeltas, OrderBookDeltas_API, QuoteTick},
+    data::{Data, OrderBookDeltas, QuoteTick},
     enums::BookType,
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
 };
+use rust_decimal_macros::dec;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -117,6 +118,7 @@ impl KrakenFuturesDataClient {
         let ws = KrakenFuturesWebSocketClient::with_credentials(
             config.ws_public_url(),
             config.heartbeat_interval_secs,
+            None,
             None,
             config.transport_backend,
             config.proxy_url.clone(),
@@ -262,13 +264,13 @@ impl KrakenFuturesDataClient {
                 };
 
                 if let Some(mark) = parse_futures_ws_mark_price(&ticker, instrument, ts_init)
-                    && let Err(e) = sender.send(DataEvent::Data(Data::MarkPriceUpdate(mark)))
+                    && let Err(e) = sender.send(DataEvent::Data(Data::MarkPrice(mark)))
                 {
                     log::error!("Failed to send mark price: {e}");
                 }
 
                 if let Some(index) = parse_futures_ws_index_price(&ticker, instrument, ts_init)
-                    && let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(index)))
+                    && let Err(e) = sender.send(DataEvent::Data(Data::IndexPrice(index)))
                 {
                     log::error!("Failed to send index price: {e}");
                 }
@@ -340,11 +342,11 @@ impl KrakenFuturesDataClient {
 
                         let has_book_sub = book_instruments.contains(&instrument_id);
 
-                        if has_book_sub {
-                            let api_deltas = OrderBookDeltas_API::new(deltas);
-                            if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(api_deltas))) {
-                                log::error!("Failed to send book snapshot deltas: {e}");
-                            }
+                        if has_book_sub
+                            && let Err(e) =
+                                sender.send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
+                        {
+                            log::error!("Failed to send book snapshot deltas: {e}");
                         }
                     }
                     Err(e) => log::error!("Failed to parse book snapshot: {e}"),
@@ -382,11 +384,11 @@ impl KrakenFuturesDataClient {
 
                         let has_book_sub = book_instruments.contains(&instrument_id);
 
-                        if has_book_sub {
-                            let api_deltas = OrderBookDeltas_API::new(deltas);
-                            if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(api_deltas))) {
-                                log::error!("Failed to send book delta: {e}");
-                            }
+                        if has_book_sub
+                            && let Err(e) =
+                                sender.send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
+                        {
+                            log::error!("Failed to send book delta: {e}");
                         }
                     }
                     Err(e) => log::error!("Failed to parse book delta: {e}"),
@@ -417,9 +419,9 @@ impl KrakenFuturesDataClient {
             return;
         };
 
-        let bid = bid_price.as_f64();
-        let ask = ask_price.as_f64();
-        if bid > 0.0 && (ask - bid) / bid > 0.25 {
+        let bid = bid_price.as_decimal();
+        let ask = ask_price.as_decimal();
+        if bid > dec!(0) && (ask - bid) / bid > dec!(0.25) {
             log::debug!("Filtered quote with wide spread: bid={bid}, ask={ask}");
             return;
         }

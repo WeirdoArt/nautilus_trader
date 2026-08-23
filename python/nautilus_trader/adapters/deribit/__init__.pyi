@@ -8,22 +8,154 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
+    "DERIBIT",
+    "DERIBIT_CLIENT_ID",
+    "DERIBIT_VENUE",
+    "DeribitBookSummary",
     "DeribitCurrency",
     "DeribitDataClientConfig",
     "DeribitDataClientFactory",
     "DeribitEnvironment",
     "DeribitExecClientConfig",
     "DeribitExecutionClientFactory",
-    "DeribitHttpClient",
     "DeribitProductType",
     "DeribitUpdateInterval",
-    "DeribitWebSocketClient",
-    "get_deribit_http_base_url",
-    "get_deribit_ws_url",
+    "DeribitVolatilityIndex",
 ]
+
+DERIBIT: str
+DERIBIT_CLIENT_ID: model.ClientId
+DERIBIT_VENUE: model.Venue
+
+@typing.final
+class DeribitBookSummary:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def instrument_name(self) -> str: ...
+    @property
+    def underlying_price(self) -> typing.Any: ...
+    @property
+    def underlying_index(self) -> typing.Any: ...
+    @property
+    def mark_price(self) -> typing.Any: ...
+    @property
+    def mid_price(self) -> typing.Any: ...
+    @property
+    def bid_price(self) -> typing.Any: ...
+    @property
+    def ask_price(self) -> typing.Any: ...
+    @property
+    def last_price(self) -> typing.Any: ...
+    @property
+    def mark_iv(self) -> typing.Any: ...
+    @property
+    def bid_iv(self) -> typing.Any: ...
+    @property
+    def ask_iv(self) -> typing.Any: ...
+    @property
+    def interest_rate(self) -> typing.Any: ...
+    @property
+    def open_interest(self) -> typing.Any: ...
+    @property
+    def open_interest_value(self) -> typing.Any: ...
+    @property
+    def volume(self) -> typing.Any: ...
+    @property
+    def volume_usd(self) -> typing.Any: ...
+    @property
+    def volume_notional(self) -> typing.Any: ...
+    @property
+    def volume_btc(self) -> typing.Any: ...
+    @property
+    def high(self) -> typing.Any: ...
+    @property
+    def low(self) -> typing.Any: ...
+    @property
+    def price_change(self) -> typing.Any: ...
+    @property
+    def estimated_delivery_price(self) -> typing.Any: ...
+    @property
+    def delivery_price(self) -> typing.Any: ...
+    @property
+    def base_currency(self) -> typing.Any: ...
+    @property
+    def quote_currency(self) -> typing.Any: ...
+    @property
+    def creation_timestamp(self) -> int: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+    def __new__(
+        cls,
+        instrument_id: model.InstrumentId,
+        instrument_name: str,
+        underlying_price: typing.Any,
+        underlying_index: typing.Any,
+        mark_price: typing.Any,
+        mid_price: typing.Any,
+        bid_price: typing.Any,
+        ask_price: typing.Any,
+        last_price: typing.Any,
+        mark_iv: typing.Any,
+        bid_iv: typing.Any,
+        ask_iv: typing.Any,
+        interest_rate: typing.Any,
+        open_interest: typing.Any,
+        open_interest_value: typing.Any,
+        volume: typing.Any,
+        volume_usd: typing.Any,
+        volume_notional: typing.Any,
+        volume_btc: typing.Any,
+        high: typing.Any,
+        low: typing.Any,
+        price_change: typing.Any,
+        estimated_delivery_price: typing.Any,
+        delivery_price: typing.Any,
+        base_currency: typing.Any,
+        quote_currency: typing.Any,
+        creation_timestamp: int,
+        ts_event: int,
+        ts_init: int,
+    ) -> DeribitBookSummary: ...
+    def to_json(self) -> str: ...
+    @classmethod
+    def from_json(cls, data: typing.Any) -> typing.Any: ...
+    @classmethod
+    def decode_record_batch_py(
+        cls, metadata: typing.Mapping[str, str], py_batch: typing.Any
+    ) -> typing.Any: ...
+    def encode_record_batch_py(self, items: list) -> typing.Any: ...
 
 @typing.final
 class DeribitDataClientConfig:
+    @property
+    def product_types(self) -> list[DeribitProductType]: ...
+    @property
+    def environment(self) -> DeribitEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_ws(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def auth_timeout_secs(self) -> int | None: ...
+    @property
+    def update_instruments_interval_mins(self) -> int: ...
+    @property
+    def auto_load_missing_instruments(self) -> bool: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         product_types: typing.Sequence[DeribitProductType] | None = None,
@@ -38,10 +170,13 @@ class DeribitDataClientConfig:
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
         heartbeat_interval_secs: int | None = None,
+        auth_timeout_secs: int | None = None,
         update_instruments_interval_mins: int | None = None,
         auto_load_missing_instruments: bool | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class DeribitDataClientFactory:
@@ -50,6 +185,30 @@ class DeribitDataClientFactory:
 
 @typing.final
 class DeribitExecClientConfig:
+    @property
+    def trader_id(self) -> model.TraderId: ...
+    @property
+    def account_id(self) -> model.AccountId: ...
+    @property
+    def product_types(self) -> list[DeribitProductType]: ...
+    @property
+    def environment(self) -> DeribitEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_ws(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def auth_timeout_secs(self) -> int | None: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         trader_id: model.TraderId,
@@ -65,8 +224,11 @@ class DeribitExecClientConfig:
         max_retries: int | None = None,
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
+        auth_timeout_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class DeribitExecutionClientFactory:
@@ -133,9 +295,32 @@ class DeribitHttpClient:
     def request_position_status_reports(
         self, account_id: model.AccountId, instrument_id: model.InstrumentId | None = None
     ) -> typing.Any: ...
+    def request_book_summaries(self, currency: str, kind: str | None = None) -> typing.Any: ...
     def request_forward_prices(
         self, currency: str, instrument_id: model.InstrumentId | None = None
     ) -> typing.Any: ...
+
+@typing.final
+class DeribitVolatilityIndex:
+    @property
+    def index_name(self) -> str: ...
+    @property
+    def volatility(self) -> float: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+    def __new__(
+        cls, index_name: str, volatility: float, ts_event: int, ts_init: int
+    ) -> DeribitVolatilityIndex: ...
+    def to_json(self) -> str: ...
+    @classmethod
+    def from_json(cls, data: typing.Any) -> typing.Any: ...
+    @classmethod
+    def decode_record_batch_py(
+        cls, metadata: typing.Mapping[str, str], py_batch: typing.Any
+    ) -> typing.Any: ...
+    def encode_record_batch_py(self, items: list) -> typing.Any: ...
 
 @typing.final
 class DeribitWebSocketClient:
@@ -147,6 +332,7 @@ class DeribitWebSocketClient:
         heartbeat_interval: int = 30,
         environment: DeribitEnvironment = ...,
         proxy_url: str | None = None,
+        auth_timeout_secs: int | None = None,
     ) -> None: ...
     @staticmethod
     def new_public(
@@ -159,6 +345,7 @@ class DeribitWebSocketClient:
         api_secret: str | None = None,
         account_id: model.AccountId | None = None,
         proxy_url: str | None = None,
+        auth_timeout_secs: int | None = None,
     ) -> DeribitWebSocketClient: ...
     @property
     def url(self) -> str: ...

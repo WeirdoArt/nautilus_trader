@@ -95,8 +95,8 @@ CREATE TABLE IF NOT EXISTS "order" (
     expire_time TEXT,
     filled_qty TEXT DEFAULT '0',
     liquidity_side TEXT,
-    avg_px DOUBLE PRECISION,
-    slippage DOUBLE PRECISION,
+    avg_px NUMERIC,
+    slippage NUMERIC,
     commissions TEXT[],
     status TEXT NOT NULL,
     is_post_only BOOLEAN,
@@ -121,6 +121,32 @@ CREATE TABLE IF NOT EXISTS "order" (
 );
 -- Bring databases created before trailing-stop activation-price persistence forward
 ALTER TABLE "order" ADD COLUMN IF NOT EXISTS activation_price TEXT;
+-- Widen the order average-price columns from DOUBLE PRECISION to unconstrained NUMERIC.
+--
+-- Guarded because `ALTER COLUMN ... TYPE ... USING` takes ACCESS EXCLUSIVE and rewrites the whole
+-- table, and this file is re-issued on every `nautilus database init`.
+--
+-- Cast through `text` rather than directly: a direct `double precision::numeric` rounds to 15
+-- significant digits, so 1.2345678901234567 would land as 1.23456789012346. Going via `text`
+-- takes float8's shortest round-trip output and keeps the stored value.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'order' AND column_name = 'avg_px' AND data_type = 'double precision'
+    ) THEN
+        ALTER TABLE "order" ALTER COLUMN avg_px TYPE NUMERIC USING avg_px::text::NUMERIC;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'order' AND column_name = 'slippage' AND data_type = 'double precision'
+    ) THEN
+        ALTER TABLE "order" ALTER COLUMN slippage TYPE NUMERIC USING slippage::text::NUMERIC;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS "order_event" (
     id TEXT PRIMARY KEY NOT NULL,
@@ -398,6 +424,18 @@ CREATE TABLE IF NOT EXISTS "pool" (
     FOREIGN KEY (token1_chain, token1_address) REFERENCES token(chain_id, address),
     FOREIGN KEY (chain_id, dex_name) REFERENCES dex(chain_id, name)
 );
+ALTER TABLE "pool" ADD COLUMN IF NOT EXISTS event_sync_version INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS "pool_event_sync" (
+    chain_id INTEGER NOT NULL,
+    dex_name TEXT NOT NULL,
+    pool_identifier TEXT NOT NULL,
+    event_family TEXT NOT NULL,
+    last_full_sync_block_number BIGINT NOT NULL,
+    PRIMARY KEY (chain_id, dex_name, pool_identifier, event_family),
+    FOREIGN KEY (chain_id, dex_name, pool_identifier)
+        REFERENCES pool(chain_id, dex_name, pool_identifier) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS "pool_swap_event" (
     id BIGSERIAL PRIMARY KEY,
@@ -614,3 +652,135 @@ CREATE TABLE IF NOT EXISTS "pool_tick" (
     FOREIGN KEY (chain_id, pool_identifier, snapshot_block, snapshot_transaction_index, snapshot_log_index)
         REFERENCES pool_snapshot(chain_id, pool_identifier, block, transaction_index, log_index) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS "execution_transaction" (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
+    wallet_address TEXT,
+    nonce BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL,
+    client_order_id TEXT,
+    UNIQUE (chain_id, transaction_hash)
+);
+ALTER TABLE "execution_transaction" ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+ALTER TABLE "execution_transaction" ADD COLUMN IF NOT EXISTS wallet_address TEXT;
+ALTER TABLE "execution_transaction" ALTER COLUMN wallet_address DROP NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "execution_schema_version" (
+    component TEXT PRIMARY KEY,
+    version SMALLINT NOT NULL CHECK (version > 0)
+);
+
+CREATE TABLE IF NOT EXISTS "execution_intent" (
+    id BIGSERIAL PRIMARY KEY,
+    schema_version SMALLINT NOT NULL CHECK (schema_version = 2),
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE RESTRICT,
+    wallet_address TEXT NOT NULL,
+    nonce BIGINT CHECK (nonce IS NULL OR nonce >= 0),
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'prepared', 'signed', 'broadcast', 'included', 'finalized',
+        'reverted', 'replaced', 'dropped', 'reorged', 'recoverable'
+    )),
+    client_order_id TEXT,
+    trader_id TEXT,
+    strategy_id TEXT,
+    account_id TEXT,
+    instrument_id TEXT,
+    pool_address TEXT,
+    transaction_to TEXT NOT NULL,
+    transaction_input TEXT NOT NULL,
+    transaction_value TEXT NOT NULL,
+    amount_in TEXT,
+    created_block BIGINT NOT NULL CHECK (created_block >= 0),
+    acknowledgement_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    fill_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    terminal_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT execution_intent_active_check CHECK (
+        NOT active
+        OR status NOT IN ('finalized', 'reverted', 'recoverable')
+        OR (
+            status IN ('finalized', 'reverted')
+            AND NOT (fill_emitted OR terminal_emitted)
+        )
+    ),
+    CHECK (NOT (fill_emitted AND terminal_emitted)),
+    CHECK (
+        purpose <> 'swap'
+        OR (
+            client_order_id IS NOT NULL
+            AND trader_id IS NOT NULL
+            AND strategy_id IS NOT NULL
+            AND account_id IS NOT NULL
+            AND instrument_id IS NOT NULL
+            AND pool_address IS NOT NULL
+            AND amount_in IS NOT NULL
+        )
+    ),
+    UNIQUE (id, chain_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_active_signer_key
+    ON "execution_intent" (chain_id, wallet_address) WHERE active;
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_active_nonce_key
+    ON "execution_intent" (chain_id, wallet_address, nonce) WHERE active AND nonce IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_client_order_key
+    ON "execution_intent" (chain_id, wallet_address, client_order_id)
+    WHERE client_order_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "execution_transaction_hash" (
+    id BIGSERIAL PRIMARY KEY,
+    intent_id BIGINT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    raw_transaction BYTEA,
+    status TEXT NOT NULL CHECK (status IN (
+        'signed', 'broadcast', 'included', 'finalized', 'reverted',
+        'replaced', 'dropped', 'reorged'
+    )),
+    block_number BIGINT CHECK (block_number IS NULL OR block_number >= 0),
+    block_hash TEXT,
+    receipt_success BOOLEAN,
+    gas_used BIGINT CHECK (gas_used IS NULL OR gas_used >= 0),
+    effective_gas_price TEXT,
+    current BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (intent_id, chain_id)
+        REFERENCES execution_intent(id, chain_id) ON DELETE RESTRICT,
+    UNIQUE (chain_id, transaction_hash),
+    UNIQUE (intent_id, transaction_hash)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_transaction_hash_current_key
+    ON "execution_transaction_hash" (intent_id) WHERE current;
+
+CREATE TABLE IF NOT EXISTS "execution_transaction_transition" (
+    id BIGSERIAL PRIMARY KEY,
+    intent_id BIGINT NOT NULL REFERENCES execution_intent(id) ON DELETE RESTRICT,
+    transaction_hash_id BIGINT REFERENCES execution_transaction_hash(id) ON DELETE RESTRICT,
+    transition_key TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL CHECK (to_status IN (
+        'prepared', 'signed', 'broadcast', 'included', 'finalized',
+        'reverted', 'replaced', 'dropped', 'reorged', 'recoverable'
+    )),
+    block_number BIGINT CHECK (block_number IS NULL OR block_number >= 0),
+    block_hash TEXT,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (intent_id, transition_key)
+);
+
+CREATE OR REPLACE FUNCTION execution_transition_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Execution transitions are append-only';
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS execution_transition_append_only ON "execution_transaction_transition";
+CREATE TRIGGER execution_transition_append_only
+    BEFORE UPDATE OR DELETE ON "execution_transaction_transition"
+    FOR EACH STATEMENT EXECUTE FUNCTION execution_transition_append_only();

@@ -36,15 +36,18 @@ use nautilus_model::instruments::InstrumentAny;
 use nautilus_network::{
     http::{HttpClient, HttpClientError, HttpResponse, Method, USER_AGENT},
     retry::{RetryConfig, RetryManager},
+    websocket::proxy::ProxyUrl,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
     common::urls::gamma_api_url,
+    filters::set_market_closed,
     http::{
         error::{Error, Result},
         models::{GammaEvent, GammaMarket, GammaTag, SearchResponse},
+        pagination::{Completion, CursorProtocol, FetchOutcome, Paginator, WindowedCollect},
         parse::{create_instrument_from_def, parse_gamma_market},
         query::{GetGammaEventsParams, GetGammaMarketsParams, GetSearchParams},
         rate_limits::POLYMARKET_GAMMA_REST_QUOTA,
@@ -53,6 +56,11 @@ use crate::{
 
 const GAMMA_MARKETS_KEYSET_PAGE_LIMIT: u32 = 100;
 const GAMMA_EVENTS_KEYSET_PAGE_LIMIT: u32 = 500;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GammaStop {
+    CallerCapped,
+}
 
 /// Provides a raw HTTP client for the Polymarket Gamma API.
 ///
@@ -71,6 +79,19 @@ impl PolymarketGammaRawHttpClient {
     ///
     /// Returns an error if the HTTP client cannot be created.
     pub fn new(base_url: Option<String>, timeout_secs: u64) -> StdResult<Self, HttpClientError> {
+        Self::new_with_proxy(base_url, timeout_secs, None)
+    }
+
+    /// Creates a new raw client with an optional validated proxy URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new_with_proxy(
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<ProxyUrl>,
+    ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
             client: HttpClient::new(
                 Self::default_headers(),
@@ -78,7 +99,7 @@ impl PolymarketGammaRawHttpClient {
                 vec![],
                 Some(*POLYMARKET_GAMMA_REST_QUOTA),
                 Some(timeout_secs),
-                None,
+                proxy_url.map(|url| url.expose().to_string()),
             )?,
             base_url: base_url
                 .unwrap_or_else(|| gamma_api_url().to_string())
@@ -173,6 +194,12 @@ impl PolymarketGammaRawHttpClient {
     /// Fetches a single market by ID from the Gamma API.
     pub async fn get_gamma_market(&self, market_id: &str) -> Result<GammaMarket> {
         let path = format!("/markets/{market_id}");
+        self.send_get::<(), _>(&path, None::<&()>).await
+    }
+
+    /// Fetches a market from the Gamma API `GET /markets/slug/{slug}`.
+    pub async fn get_gamma_market_by_slug(&self, slug: &str) -> Result<GammaMarket> {
+        let path = format!("/markets/slug/{slug}");
         self.send_get::<(), _>(&path, None::<&()>).await
     }
 
@@ -348,6 +375,11 @@ fn parse_markets_to_instruments(markets: &[GammaMarket], ts_init: UnixNanos) -> 
 // Returns parsed instruments alongside condition IDs of markets still in the
 // CLOB hydration window (empty or empty-entry `clob_token_ids`), so callers
 // can retry rather than treating them as terminal.
+//
+// This is the single funnel through which live instruments reach the client caches, so Gamma's
+// `closed` state is recorded here rather than in `create_instrument_from_def`. Historical loader
+// instruments share that constructor and must not carry terminal state in `info`; they expose it
+// through `resolution_metadata` instead.
 fn parse_markets_with_transient(
     markets: &[GammaMarket],
     ts_init: UnixNanos,
@@ -365,7 +397,11 @@ fn parse_markets_with_transient(
             Ok(defs) => {
                 for def in defs {
                     match create_instrument_from_def(&def, ts_init) {
-                        Ok(instrument) => instruments.push(instrument),
+                        Ok(InstrumentAny::BinaryOption(mut binary)) => {
+                            set_market_closed(&mut binary, def.closed);
+                            instruments.push(InstrumentAny::BinaryOption(binary));
+                        }
+                        Ok(other) => instruments.push(other),
                         Err(e) => log::warn!("Failed to create instrument: {e}"),
                     }
                 }
@@ -404,7 +440,7 @@ fn flatten_event_markets(events: Vec<GammaEvent>) -> Vec<GammaMarket> {
             let event_game_id = event.game_id;
             event.markets.into_iter().map(move |mut market| {
                 if market.game_id.is_none() {
-                    market.game_id = event_game_id;
+                    market.game_id.clone_from(&event_game_id);
                 }
                 market
             })
@@ -435,10 +471,25 @@ impl PolymarketGammaHttpClient {
         timeout_secs: u64,
         retry_config: RetryConfig,
     ) -> StdResult<Self, HttpClientError> {
+        Self::new_with_proxy(gamma_base_url, timeout_secs, retry_config, None)
+    }
+
+    /// Creates a new domain client with an optional validated proxy URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    pub fn new_with_proxy(
+        gamma_base_url: Option<String>,
+        timeout_secs: u64,
+        retry_config: RetryConfig,
+        proxy_url: Option<ProxyUrl>,
+    ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
-            inner: Arc::new(PolymarketGammaRawHttpClient::new(
+            inner: Arc::new(PolymarketGammaRawHttpClient::new_with_proxy(
                 gamma_base_url,
                 timeout_secs,
+                proxy_url,
             )?),
             clock: get_atomic_clock_realtime(),
             retry_manager: Arc::new(RetryManager::new(retry_config)),
@@ -454,49 +505,42 @@ impl PolymarketGammaHttpClient {
             .limit
             .unwrap_or(GAMMA_MARKETS_KEYSET_PAGE_LIMIT)
             .min(GAMMA_MARKETS_KEYSET_PAGE_LIMIT);
-        let max_markets = base_params.max_markets;
-        let mut all_markets = Vec::new();
-        let mut remaining_offset = base_params.offset.unwrap_or(0);
-        let mut after_cursor = None;
-        let mut page_num = 0u32;
+        let protocol = CursorProtocol::<GammaStop>::gamma("Gamma market");
+        let reducer = WindowedCollect::new(
+            base_params.offset.unwrap_or(0) as usize,
+            base_params.max_markets.map(|value| value as usize),
+            GammaStop::CallerCapped,
+        );
+        let paginator = Paginator::new("Gamma market", protocol, reducer);
+        let completed = paginator
+            .run(
+                |position| {
+                    let after_cursor = position.map(|cursor| cursor.as_ref().to_string());
+                    let params = GetGammaMarketsParams {
+                        limit: Some(page_size),
+                        offset: None,
+                        ..base_params.clone()
+                    };
+                    async move {
+                        let response = self
+                            .inner
+                            .get_gamma_markets_keyset(params, after_cursor.as_deref())
+                            .await?;
+                        Ok::<_, anyhow::Error>(FetchOutcome::Page {
+                            rows: response.markets,
+                            wire: response.next_cursor,
+                        })
+                    }
+                },
+                anyhow::Error::new,
+            )
+            .await?;
 
-        loop {
-            let params = GetGammaMarketsParams {
-                limit: Some(page_size),
-                offset: None,
-                ..base_params.clone()
-            };
-
-            let response = self
-                .inner
-                .get_gamma_markets_keyset(params, after_cursor.as_deref())
-                .await?;
-            let page_len = response.markets.len() as u32;
-            let skipped = remaining_offset.min(page_len) as usize;
-            remaining_offset -= skipped as u32;
-            page_num += 1;
-            all_markets.extend(response.markets.into_iter().skip(skipped));
-
-            log::debug!(
-                "Fetched markets page {page_num}: {page_len} markets (total: {})",
-                all_markets.len(),
-            );
-
-            if let Some(cap) = max_markets
-                && all_markets.len() as u32 >= cap
-            {
-                all_markets.truncate(cap as usize);
-                break;
+        match completed.completion {
+            Completion::WireExhausted | Completion::Stopped(GammaStop::CallerCapped) => {
+                Ok(completed.output)
             }
-
-            let Some(next_cursor) = response.next_cursor else {
-                break;
-            };
-
-            after_cursor = Some(next_cursor);
         }
-
-        Ok(all_markets)
     }
 
     /// Fetches all active markets from the Gamma API, paginating automatically.
@@ -634,7 +678,7 @@ impl PolymarketGammaHttpClient {
                     }
                 },
                 |e| e.is_retryable(),
-                Error::transport,
+                |e| Error::transport(e.to_string()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -820,50 +864,42 @@ impl PolymarketGammaHttpClient {
             .limit
             .unwrap_or(GAMMA_EVENTS_KEYSET_PAGE_LIMIT)
             .min(GAMMA_EVENTS_KEYSET_PAGE_LIMIT);
-        let max_events = base_params.max_events;
-        let mut all_events = Vec::new();
-        let mut remaining_offset = base_params.offset.unwrap_or(0);
-        let mut after_cursor = None;
-        let mut page_num = 0u32;
+        let protocol = CursorProtocol::<GammaStop>::gamma("Gamma event");
+        let reducer = WindowedCollect::new(
+            base_params.offset.unwrap_or(0) as usize,
+            base_params.max_events.map(|value| value as usize),
+            GammaStop::CallerCapped,
+        );
+        let paginator = Paginator::new("Gamma event", protocol, reducer);
+        let completed = paginator
+            .run(
+                |position| {
+                    let after_cursor = position.map(|cursor| cursor.as_ref().to_string());
+                    let params = GetGammaEventsParams {
+                        limit: Some(page_size),
+                        offset: None,
+                        ..base_params.clone()
+                    };
+                    async move {
+                        let response = self
+                            .inner
+                            .get_gamma_events_keyset(params, after_cursor.as_deref())
+                            .await?;
+                        Ok::<_, anyhow::Error>(FetchOutcome::Page {
+                            rows: response.events,
+                            wire: response.next_cursor,
+                        })
+                    }
+                },
+                anyhow::Error::new,
+            )
+            .await?;
 
-        loop {
-            let params = GetGammaEventsParams {
-                limit: Some(page_size),
-                offset: None,
-                ..base_params.clone()
-            };
-
-            let response = self
-                .inner
-                .get_gamma_events_keyset(params, after_cursor.as_deref())
-                .await?;
-            let page_len = response.events.len() as u32;
-            let skipped = remaining_offset.min(page_len) as usize;
-            remaining_offset -= skipped as u32;
-            page_num += 1;
-            let market_count: usize = response.events.iter().map(|e| e.markets.len()).sum();
-            all_events.extend(response.events.into_iter().skip(skipped));
-
-            log::debug!(
-                "Fetched events page {page_num}: {page_len} events, {market_count} markets (total events: {})",
-                all_events.len(),
-            );
-
-            if let Some(cap) = max_events
-                && all_events.len() as u32 >= cap
-            {
-                all_events.truncate(cap as usize);
-                break;
+        match completed.completion {
+            Completion::WireExhausted | Completion::Stopped(GammaStop::CallerCapped) => {
+                Ok(completed.output)
             }
-
-            let Some(next_cursor) = response.next_cursor else {
-                break;
-            };
-
-            after_cursor = Some(next_cursor);
         }
-
-        Ok(all_events)
     }
 
     /// Fetches instruments from events matching full query params (paginated).
@@ -882,6 +918,14 @@ impl PolymarketGammaHttpClient {
             instruments.len(),
         );
         Ok(instruments)
+    }
+
+    /// Fetches raw Gamma events using arbitrary query params with auto-pagination.
+    pub async fn request_events_by_params(
+        &self,
+        params: GetGammaEventsParams,
+    ) -> anyhow::Result<Vec<GammaEvent>> {
+        self.fetch_gamma_events_paginated(params).await
     }
 
     /// Searches for instruments via the Gamma public search endpoint.

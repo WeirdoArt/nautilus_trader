@@ -30,7 +30,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport},
     types::{Money, Price, Quantity},
 };
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
@@ -311,7 +311,7 @@ pub fn parse_ws_user_event_to_order_status_report(
         && avg_decimal.is_sign_positive()
         && !avg_decimal.is_zero()
     {
-        report = report.with_avg_px(avg_decimal.to_f64().unwrap_or_default())?;
+        report = report.with_avg_px(avg_decimal);
     }
 
     Ok(report)
@@ -475,7 +475,7 @@ mod tests {
                 assert_eq!(tick.instrument_id, instrument.id());
                 assert_eq!(tick.price, Price::from("68900.50"));
                 assert_eq!(tick.size, Quantity::from("0.00150000"));
-                assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+                assert_eq!(tick.aggressor_side, AggressorSide::Buy);
                 assert_eq!(tick.trade_id.as_str(), "995098700");
                 assert!(tick.ts_event.as_u64() > 0);
             }
@@ -495,7 +495,7 @@ mod tests {
                 let trade_data = &events[0].trades[1];
                 let tick = parse_ws_trade(trade_data, &instrument, ts_init).unwrap();
 
-                assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+                assert_eq!(tick.aggressor_side, AggressorSide::Sell);
                 assert_eq!(tick.price, Price::from("68900.00"));
                 assert_eq!(tick.size, Quantity::from("0.05000000"));
             }

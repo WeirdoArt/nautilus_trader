@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.testkit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.testkit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -149,6 +149,10 @@ pub struct ExecTesterConfig {
     /// Cancel and replace stop orders to maintain offset.
     #[builder(default = false)]
     pub cancel_replace_stop_orders_to_maintain_offset: bool,
+    /// Trigger one modify or cancel-replace when each enabled limit side is first accepted.
+    /// Combine with exactly one limit-order maintenance mode (TC-E30 to TC-E33).
+    #[builder(default = false)]
+    pub trigger_limit_order_maintenance_once: bool,
     /// Use post-only for limit orders.
     #[builder(default = false)]
     pub use_post_only: bool,
@@ -169,6 +173,8 @@ pub struct ExecTesterConfig {
     /// Close all positions on stop.
     #[builder(default = true)]
     pub close_positions_on_stop: bool,
+    /// Truncate close-on-stop quantities to this decimal precision.
+    pub close_positions_qty_precision: Option<u8>,
     /// Time in force for closing positions (None defaults to GTC).
     pub close_positions_time_in_force: Option<TimeInForce>,
     /// Use `reduce_only` when closing positions.
@@ -244,6 +250,57 @@ impl ExecTesterConfig {
             );
         }
 
+        if self.trigger_limit_order_maintenance_once {
+            let modify = self.modify_orders_to_maintain_tob_offset;
+            let cancel_replace = self.cancel_replace_orders_to_maintain_tob_offset;
+
+            errors.check(
+                modify || cancel_replace,
+                ConfigError::required_one_of([
+                    "modify_orders_to_maintain_tob_offset",
+                    "cancel_replace_orders_to_maintain_tob_offset",
+                ]),
+            );
+            errors.check(
+                !(modify && cancel_replace),
+                ConfigError::mutually_exclusive_fields([
+                    "modify_orders_to_maintain_tob_offset",
+                    "cancel_replace_orders_to_maintain_tob_offset",
+                ]),
+            );
+            errors.check(
+                self.enable_limit_buys || self.enable_limit_sells,
+                ConfigError::dependency(
+                    "trigger_limit_order_maintenance_once",
+                    "enable_limit_buys or enable_limit_sells",
+                    "at least one limit side must be enabled",
+                ),
+            );
+            errors.check(
+                !(self.batch_submit_limit_pair
+                    && self.enable_limit_buys
+                    && self.enable_limit_sells),
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "batch_submit_limit_pair",
+                ]),
+            );
+            errors.check(
+                !self.enable_brackets,
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "enable_brackets",
+                ]),
+            );
+            errors.check(
+                !self.test_modify_rejected,
+                ConfigError::mutually_exclusive_fields([
+                    "trigger_limit_order_maintenance_once",
+                    "test_modify_rejected",
+                ]),
+            );
+        }
+
         errors.into_result()
     }
 
@@ -298,12 +355,14 @@ impl ExecTesterConfig {
             modify_stop_orders_to_maintain_offset: false,
             cancel_replace_orders_to_maintain_tob_offset: false,
             cancel_replace_stop_orders_to_maintain_offset: false,
+            trigger_limit_order_maintenance_once: false,
             use_post_only: false,
             limit_aggressive: false,
             use_quote_quantity: false,
             emulation_trigger: None,
             cancel_orders_on_stop: true,
             close_positions_on_stop: true,
+            close_positions_qty_precision: None,
             close_positions_time_in_force: None,
             reduce_only_on_stop: true,
             use_individual_cancels_on_stop: false,

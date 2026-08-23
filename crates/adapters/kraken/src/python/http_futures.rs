@@ -15,7 +15,7 @@
 
 //! Python bindings for the Kraken Futures HTTP client.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::BarType,
@@ -181,8 +181,8 @@ impl KrakenFuturesHttpClient {
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -268,8 +268,8 @@ impl KrakenFuturesHttpClient {
         &self,
         py: Python<'py>,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -325,8 +325,8 @@ impl KrakenFuturesHttpClient {
         py: Python<'py>,
         account_id: AccountId,
         instrument_id: Option<InstrumentId>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         open_only: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -355,8 +355,8 @@ impl KrakenFuturesHttpClient {
         py: Python<'py>,
         account_id: AccountId,
         instrument_id: Option<InstrumentId>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -578,7 +578,8 @@ impl KrakenFuturesHttpClient {
 }
 
 // Separate block to avoid pyo3_stub_gen trait bound issues with batch-order tuples.
-// Stub is maintained manually in nautilus_pyo3.pyi.
+// These methods are registered in DEFERRED_RUNTIME_METHODS until the generator
+// supports complex tuple parameter types.
 #[pymethods]
 impl KrakenFuturesHttpClient {
     /// Submits multiple orders in a single batch request.

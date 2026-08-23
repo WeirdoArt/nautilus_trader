@@ -33,7 +33,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use chrono::{TimeZone, Utc};
+use jiff::{Timestamp, civil::Date, tz::Offset};
 use nautilus_bitmex::{
     common::{
         consts::BITMEX_CLIENT_ID,
@@ -63,14 +63,25 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::BarType,
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId},
     instruments::Instrument,
     types::Quantity,
 };
 use nautilus_network::http::HttpClient;
+use nautilus_testkit::events::drain_data_events;
 use rstest::rstest;
 use serde_json::{Value, json};
+
+fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
+    Offset::UTC
+        .to_timestamp(
+            Date::new(year, month, day)
+                .unwrap()
+                .at(hour, minute, second, 0),
+        )
+        .unwrap()
+}
 
 #[derive(Debug, Clone, Copy)]
 enum RequiredInstrumentCachePath {
@@ -398,6 +409,24 @@ async fn handle_delete_order(headers: axum::http::HeaderMap, body: String) -> Re
         .into_response()
 }
 
+async fn handle_delete_all_orders(headers: axum::http::HeaderMap) -> Response {
+    if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "message": "Invalid API Key.", "name": "HTTPError" }
+            })),
+        )
+            .into_response();
+    }
+
+    Json(vec![
+        load_test_data("http_cancel_all_close_race.json"),
+        load_test_data("http_cancel_all_canceled.json"),
+    ])
+    .into_response()
+}
+
 async fn handle_cancel_all_after(headers: axum::http::HeaderMap, body: String) -> Response {
     if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
         return (
@@ -436,6 +465,10 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/order", axum::routing::post(handle_post_order))
         .route("/order", axum::routing::delete(handle_delete_order))
         .route(
+            "/order/all",
+            axum::routing::delete(handle_delete_all_orders),
+        )
+        .route(
             "/order/cancelAllAfter",
             axum::routing::post(handle_cancel_all_after),
         )
@@ -469,18 +502,6 @@ async fn start_test_server()
     .await;
 
     Ok((addr, state))
-}
-
-async fn drain_data_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    timeout: Duration,
-) -> Vec<DataEvent> {
-    let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-        events.push(event);
-    }
-    events
 }
 
 fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
@@ -672,8 +693,8 @@ async fn test_request_funding_rates() {
     .unwrap();
 
     let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
-    let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2025, 1, 1, 8, 0, 0).unwrap();
+    let start = utc_timestamp(2025, 1, 1, 0, 0, 0);
+    let end = utc_timestamp(2025, 1, 1, 8, 0, 0);
     let rates = client
         .request_funding_rates(instrument_id, Some(start), Some(end), Some(3))
         .await
@@ -927,6 +948,54 @@ async fn test_cancel_order() {
     assert_eq!(result_array[0]["ordStatus"], "Canceled");
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_orders_skips_invalid_order_rejection() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let reports = client.cancel_all_orders(instrument_id, None).await.unwrap();
+
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(
+        report.venue_order_id.as_str(),
+        "550e8400-e29b-41d4-a716-446655440003"
+    );
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from("cancel-control"))
+    );
+    assert_eq!(report.order_side, OrderSide::Buy);
+    assert_eq!(report.order_type, OrderType::Limit);
+    assert_eq!(report.time_in_force, TimeInForce::Gtc);
+    assert_eq!(report.order_status, OrderStatus::Canceled);
+    assert_eq!(report.quantity, Quantity::from("100"));
+    assert_eq!(report.filled_qty, Quantity::from("0"));
+}
+
 // Test that HTTP client correctly implements rate limiting per BitMEX API requirements.
 //
 // This test verifies that the client respects rate limits by making 6 HTTP requests and checking
@@ -1040,8 +1109,7 @@ async fn test_http_network_error() {
     let base_url = "http://127.0.0.1:1".to_string();
 
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 1, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 1, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 
@@ -1083,8 +1151,7 @@ async fn test_http_500_internal_server_error() {
 
     let base_url = format!("http://{addr}");
     let client =
-        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
-            .unwrap();
+        BitmexRawHttpClient::new(Some(base_url), 60, 0, 1, 1, 10_000, 10, 30, None).unwrap();
 
     let result = client.get_instruments(false).await;
 

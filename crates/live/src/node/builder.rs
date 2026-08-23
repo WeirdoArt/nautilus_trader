@@ -18,7 +18,7 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
 
 use nautilus_common::{
-    cache::CacheConfig,
+    cache::{CacheConfig, database::CacheDatabaseFactory},
     clients::ExecutionClient,
     clock::Clock,
     enums::Environment,
@@ -50,7 +50,7 @@ use super::{
     LiveNode,
     config::{
         LiveDataEngineConfig, LiveExecEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
-        RoutingConfig,
+        RoutingConfig, validate_live_environment,
     },
 };
 use crate::{
@@ -83,7 +83,7 @@ impl Debug for ExternalMessageBusIngress {
 /// audit and replay (see [`Self::with_event_store`]).
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", unsendable)
+    pyo3::pyclass(module = "nautilus_trader.live", unsendable)
 )]
 pub struct LiveNodeBuilder {
     name: String,
@@ -96,6 +96,7 @@ pub struct LiveNodeBuilder {
     exec_client_routing: HashMap<String, RoutingConfig>,
     event_store_factory: Option<EventStoreFactory>,
     clock_factory: Option<ClockFactory>,
+    cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
     external_msgbus_factory: Option<Box<dyn MessageBusBackingFactory>>,
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
     external_msgbus_ingress: Option<ExternalMessageBusIngress>,
@@ -112,6 +113,10 @@ impl Debug for LiveNodeBuilder {
             .field("exec_client_configs", &self.exec_client_configs.keys())
             .field("event_store_factory", &self.event_store_factory.is_some())
             .field("clock_factory", &self.clock_factory.is_some())
+            .field(
+                "cache_database_factory",
+                &self.cache_database_factory.is_some(),
+            )
             .field(
                 "external_msgbus_factory",
                 &self.external_msgbus_factory.is_some(),
@@ -135,12 +140,7 @@ impl LiveNodeBuilder {
     ///
     /// Returns an error if `environment` is invalid (BACKTEST).
     pub fn new(trader_id: TraderId, environment: Environment) -> anyhow::Result<Self> {
-        match environment {
-            Environment::Sandbox | Environment::Live => {}
-            Environment::Backtest => {
-                anyhow::bail!("LiveNode cannot be used with Backtest environment");
-            }
-        }
+        validate_live_environment(environment)?;
 
         let config = LiveNodeConfig {
             environment,
@@ -159,6 +159,7 @@ impl LiveNodeBuilder {
             exec_client_routing: HashMap::new(),
             event_store_factory: None,
             clock_factory: None,
+            cache_database_factory: None,
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
@@ -171,12 +172,7 @@ impl LiveNodeBuilder {
     ///
     /// Returns an error if the config's environment is invalid (BACKTEST).
     pub fn from_config(config: LiveNodeConfig) -> anyhow::Result<Self> {
-        match config.environment {
-            Environment::Sandbox | Environment::Live => {}
-            Environment::Backtest => {
-                anyhow::bail!("LiveNode cannot be used with Backtest environment");
-            }
-        }
+        validate_live_environment(config.environment)?;
 
         Ok(Self {
             name: "LiveNode".to_string(),
@@ -189,6 +185,7 @@ impl LiveNodeBuilder {
             exec_client_routing: HashMap::new(),
             event_store_factory: None,
             clock_factory: None,
+            cache_database_factory: None,
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
@@ -313,6 +310,16 @@ impl LiveNodeBuilder {
     #[must_use]
     pub fn with_cache_config(mut self, config: CacheConfig) -> Self {
         self.config.cache = Some(config);
+        self
+    }
+
+    /// Install the cache database backing from a factory.
+    ///
+    /// The node constructs and owns the adapter when it starts, so the `load_state` and
+    /// `save_state` settings on [`LiveNodeConfig`] take effect.
+    #[must_use]
+    pub fn with_cache_database_factory(mut self, factory: Box<dyn CacheDatabaseFactory>) -> Self {
+        self.cache_database_factory = Some(factory);
         self
     }
 
@@ -713,6 +720,7 @@ impl LiveNodeBuilder {
             self.config,
             exec_manager,
             exec_clients,
+            self.cache_database_factory,
             self.external_msgbus_ingress,
         );
         node.load_configured_plugins()?;

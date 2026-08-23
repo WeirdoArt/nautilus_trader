@@ -58,7 +58,9 @@ static RISK_PROCESS_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static ORDER_EMULATOR_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ORDER_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
-static SHUTDOWN_SYSTEM_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static SYSTEM_QUEUE_STATE_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static SYSTEM_SOCKET_STATE_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static SYSTEM_SHUTDOWN_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_ORDER_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_FILL_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_POSITION_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
@@ -230,6 +232,20 @@ macro_rules! define_switchboard {
                 *PORTFOLIO_ORDER_ENDPOINT.get_or_init(|| "Portfolio.update_order".into())
             }
 
+            /// Pub/sub topic carrying `QueueStateChanged` events.
+            #[inline]
+            #[must_use]
+            pub fn queue_state_changed_topic() -> MStr<Topic> {
+                *SYSTEM_QUEUE_STATE_TOPIC.get_or_init(|| "events.system.QueueStateChanged".into())
+            }
+
+            /// Pub/sub topic carrying `SocketStateChanged` events.
+            #[inline]
+            #[must_use]
+            pub fn socket_state_changed_topic() -> MStr<Topic> {
+                *SYSTEM_SOCKET_STATE_TOPIC.get_or_init(|| "events.system.SocketStateChanged".into())
+            }
+
             /// Pub/sub topic carrying `ShutdownSystem` commands published by
             /// actors, engines, and strategies.
             ///
@@ -239,7 +255,7 @@ macro_rules! define_switchboard {
             #[inline]
             #[must_use]
             pub fn shutdown_system_topic() -> MStr<Topic> {
-                *SHUTDOWN_SYSTEM_TOPIC.get_or_init(|| "commands.system.shutdown".into())
+                *SYSTEM_SHUTDOWN_TOPIC.get_or_init(|| "commands.system.shutdown".into())
             }
 
             /// Pub/sub topic carrying raw `OrderStatusReport`s that arrived from
@@ -444,6 +460,10 @@ define_switchboard! {
     order_filled_topics: InstrumentId,
     get_order_filled_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.order_filled.{}", instrument_id;
+
+    order_fill_voided_topics: InstrumentId,
+    get_order_fill_voided_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.order_fill_voided.{}", instrument_id;
 
     event_order_topics: StrategyId,
     get_event_order_topic(strategy_id: StrategyId) -> strategy_id,
@@ -659,6 +679,7 @@ define_wrappers! {
     get_order_cancel_rejected_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_canceled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_filled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_order_fill_voided_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_snapshot_order_topic(client_order_id: ClientOrderId) -> MStr<Topic>,
     get_snapshot_position_topic(position_id: PositionId) -> MStr<Topic>,
     get_event_order_topic(strategy_id: StrategyId) -> MStr<Topic>,
@@ -973,6 +994,10 @@ mod tests {
         MessagingSwitchboard::get_order_filled_topic as OrderEventTopicFn,
         "events.order_filled.ESZ24.XCME",
     )]
+    #[case::fill_voided(
+        MessagingSwitchboard::get_order_fill_voided_topic as OrderEventTopicFn,
+        "events.order_fill_voided.ESZ24.XCME",
+    )]
     fn test_get_order_event_topic(
         mut switchboard: MessagingSwitchboard,
         instrument_id: InstrumentId,
@@ -992,6 +1017,7 @@ mod tests {
     #[case::cancel_rejected(MessagingSwitchboard::get_order_cancel_rejected_topic as OrderEventTopicFn)]
     #[case::canceled(MessagingSwitchboard::get_order_canceled_topic as OrderEventTopicFn)]
     #[case::filled(MessagingSwitchboard::get_order_filled_topic as OrderEventTopicFn)]
+    #[case::fill_voided(MessagingSwitchboard::get_order_fill_voided_topic as OrderEventTopicFn)]
     fn test_order_event_topic_does_not_match_strategy_order_pattern(
         mut switchboard: MessagingSwitchboard,
         instrument_id: InstrumentId,
@@ -1024,6 +1050,22 @@ mod tests {
             switchboard
                 .snapshot_position_topics
                 .contains_key(&position_id)
+        );
+    }
+
+    #[rstest]
+    fn test_queue_state_changed_topic_identity() {
+        assert_eq!(
+            MessagingSwitchboard::queue_state_changed_topic().as_ref(),
+            "events.system.QueueStateChanged"
+        );
+    }
+
+    #[rstest]
+    fn test_socket_state_changed_topic_identity() {
+        assert_eq!(
+            MessagingSwitchboard::socket_state_changed_topic().as_ref(),
+            "events.system.SocketStateChanged"
         );
     }
 

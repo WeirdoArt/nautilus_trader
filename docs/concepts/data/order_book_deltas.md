@@ -1,23 +1,23 @@
 # OrderBookDeltas
 
-`OrderBookDeltas` groups a non-empty batch of `OrderBookDelta` records that belong
-to the same logical book event. It reduces per-message overhead when adapters receive
-or produce multiple book changes at once.
+`OrderBookDeltas` groups a non-empty batch of `OrderBookDelta` records from one logical book event.
+It reduces per-message overhead when an adapter receives or produces several changes at once.
 
 ## Fields
 
-| Field           | Rust type             | Python type            | Required/default | Notes                                     |
-|-----------------|-----------------------|------------------------|------------------|-------------------------------------------|
-| `instrument_id` | `InstrumentId`        | `InstrumentId`         | Required         | Instrument whose book is changing.        |
-| `deltas`        | `Vec<OrderBookDelta>` | `list[OrderBookDelta]` | Required         | Non‑empty batch of deltas.                |
-| `flags`         | `u8`                  | `int`                  | From last delta  | Last delta flags.                         |
-| `sequence`      | `u64`                 | `int`                  | From last delta  | Last delta sequence number.               |
-| `ts_event`      | `UnixNanos`           | `int`                  | From last delta  | Last delta event timestamp.               |
-| `ts_init`       | `UnixNanos`           | `int`                  | From last delta  | Last delta initialization timestamp.      |
+| Field           | Rust type             | Python type            | Required/default | Notes                                |
+| --------------- | --------------------- | ---------------------- | ---------------- | ------------------------------------ |
+| `instrument_id` | `InstrumentId`        | `InstrumentId`         | Required         | Instrument whose book is changing.   |
+| `deltas`        | `Vec<OrderBookDelta>` | `list[OrderBookDelta]` | Required         | Non-empty batch of deltas.           |
+| `flags`         | `u8`                  | `int`                  | From last delta  | Last delta flags.                    |
+| `sequence`      | `u64`                 | `int`                  | From last delta  | Last delta sequence number.          |
+| `ts_event`      | `UnixNanos`           | `int`                  | From last delta  | Last delta event timestamp.          |
+| `ts_init`       | `UnixNanos`           | `int`                  | From last delta  | Last delta initialization timestamp. |
 
 ## Behavior
 
 - The batch must contain at least one delta.
+- Every delta's `instrument_id` must match the batch `instrument_id`.
 - The batch metadata mirrors the final delta.
 - The final delta should carry `F_LAST` when it closes a logical event group.
 - Snapshot batches usually begin with a `CLEAR` delta and end with `F_SNAPSHOT | F_LAST`.
@@ -104,4 +104,4 @@ deltas = OrderBookDeltas(instrument_id, [bid, ask])
 
 - [OrderBookDelta](order_book_delta.md) covers the contained update type.
 - [Order books](../order_book.md) explains supported order book state.
-- [Python API Reference](/docs/python-api-latest/model/data.html) lists Python members.
+- [Python API reference](/docs/python-api-latest/model/data.html) lists Python members.

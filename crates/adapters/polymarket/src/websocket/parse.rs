@@ -17,10 +17,12 @@
 
 use std::str::FromStr;
 
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use nautilus_core::{
     UnixNanos,
     correctness::{CorrectnessError, CorrectnessResult},
     datetime::NANOSECONDS_IN_MILLISECOND,
+    hex,
 };
 use nautilus_model::{
     data::{BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick},
@@ -29,12 +31,14 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
+use serde::Serialize;
 
-use super::messages::{PolymarketBookSnapshot, PolymarketQuote, PolymarketQuotes, PolymarketTrade};
-use crate::common::{
-    consts::{MAX_PRICE, MIN_PRICE},
-    enums::PolymarketOrderSide,
-    parse::determine_trade_id,
+use super::messages::{
+    PolymarketBookLevel, PolymarketBookSnapshot, PolymarketQuote, PolymarketTrade,
+};
+use crate::{
+    common::{enums::PolymarketOrderSide, parse::determine_trade_id},
+    http::parse::tick_relative_price_bounds,
 };
 
 /// Parses a millisecond epoch timestamp string into [`UnixNanos`].
@@ -60,6 +64,85 @@ pub(crate) fn parse_quantity(s: &str, precision: u8) -> CorrectnessResult<Quanti
         message: format!("Invalid quantity '{s}': {e}"),
     })?;
     Quantity::from_decimal_dp(value, precision)
+}
+
+pub(crate) fn verify_book_snapshot_hash(
+    snap: &PolymarketBookSnapshot,
+    min_order_size: Option<&str>,
+    neg_risk: Option<bool>,
+) -> anyhow::Result<bool> {
+    let Some(expected) = snap.hash.as_deref() else {
+        return Ok(false);
+    };
+
+    let Some(computed) = book_snapshot_hash(snap, min_order_size, neg_risk)? else {
+        return Ok(false);
+    };
+
+    if computed != expected {
+        anyhow::bail!(
+            "Book snapshot hash mismatch for {}: expected {expected}, computed {computed}",
+            snap.asset_id
+        );
+    }
+
+    Ok(true)
+}
+
+fn book_snapshot_hash(
+    snap: &PolymarketBookSnapshot,
+    min_order_size: Option<&str>,
+    neg_risk: Option<bool>,
+) -> anyhow::Result<Option<String>> {
+    let Some(min_order_size) = snap.min_order_size.as_deref().or(min_order_size) else {
+        return Ok(None);
+    };
+
+    let Some(tick_size) = snap.tick_size.as_deref() else {
+        return Ok(None);
+    };
+
+    let Some(neg_risk) = snap.neg_risk.or(neg_risk) else {
+        return Ok(None);
+    };
+
+    let Some(last_trade_price) = snap.last_trade_price.as_deref() else {
+        return Ok(None);
+    };
+
+    // Keep field order aligned with the server-compatible payload in the official SDK:
+    // Polymarket/py-clob-client-v2@215fc63a8fd6ec3a10c7edb73997c9772d8686d3:utilities.py
+    let preimage = BookSnapshotHashPreimage {
+        market: snap.market.as_str(),
+        asset_id: snap.asset_id.as_str(),
+        timestamp: &snap.timestamp,
+        hash: "",
+        bids: &snap.bids,
+        asks: &snap.asks,
+        min_order_size,
+        tick_size,
+        neg_risk,
+        last_trade_price,
+    };
+
+    let serialized = serde_json::to_vec(&preimage)?;
+    let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &serialized);
+
+    Ok(Some(hex::encode(hash)))
+}
+
+#[derive(Serialize)]
+struct BookSnapshotHashPreimage<'a> {
+    market: &'a str,
+    asset_id: &'a str,
+    timestamp: &'a str,
+    hash: &'static str,
+    bids: &'a [PolymarketBookLevel],
+    asks: &'a [PolymarketBookLevel],
+    min_order_size: &'a str,
+    tick_size: &'a str,
+    neg_risk: bool,
+    last_trade_price: &'a str,
 }
 
 /// Parses a book snapshot into [`OrderBookDeltas`] (CLEAR + ADD).
@@ -137,52 +220,65 @@ pub fn parse_book_snapshot(
     Ok(OrderBookDeltas::new(instrument_id, deltas))
 }
 
-/// Parses price change quotes into incremental [`OrderBookDeltas`].
+/// Parses price change quotes into incremental book deltas.
+///
+/// Each result corresponds to one quote. The final successful delta carries
+/// [`RecordFlag::F_LAST`], including when later quotes fail to parse.
 pub fn parse_book_deltas(
-    quotes: &PolymarketQuotes,
+    quotes: &[&PolymarketQuote],
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
+    ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> anyhow::Result<OrderBookDeltas> {
-    let ts_event = parse_timestamp_ms(&quotes.timestamp)?;
+) -> Vec<anyhow::Result<OrderBookDelta>> {
+    let mut deltas = quotes
+        .iter()
+        .map(|change| {
+            parse_book_delta(
+                change,
+                instrument_id,
+                price_precision,
+                size_precision,
+                ts_event,
+                ts_init,
+            )
+        })
+        .collect::<Vec<_>>();
 
-    let total = quotes.price_changes.len();
-    let mut deltas = Vec::with_capacity(total);
-
-    for (idx, change) in quotes.price_changes.iter().enumerate() {
-        let price = parse_price(&change.price, price_precision)?;
-        let size = parse_quantity(&change.size, size_precision)?;
-        let side = match change.side {
-            PolymarketOrderSide::Buy => OrderSide::Buy,
-            PolymarketOrderSide::Sell => OrderSide::Sell,
-        };
-
-        let (action, order_size) = if size.is_zero() {
-            (BookAction::Delete, Quantity::zero(size_precision))
-        } else {
-            (BookAction::Update, size)
-        };
-
-        let order = BookOrder::new(side, price, order_size, 0);
-        let flags = if idx == total - 1 {
-            RecordFlag::F_LAST as u8
-        } else {
-            0
-        };
-
-        deltas.push(OrderBookDelta::new_checked(
-            instrument_id,
-            action,
-            order,
-            flags,
-            0,
-            ts_event,
-            ts_init,
-        )?);
+    if let Some(delta) = deltas
+        .iter_mut()
+        .rev()
+        .find_map(|result| result.as_mut().ok())
+    {
+        delta.flags |= RecordFlag::F_LAST as u8;
     }
 
-    Ok(OrderBookDeltas::new(instrument_id, deltas))
+    deltas
+}
+
+fn parse_book_delta(
+    change: &PolymarketQuote,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDelta> {
+    let price = parse_price(&change.price, price_precision)?;
+    let size = parse_quantity(&change.size, size_precision)?;
+    let side = match change.side {
+        PolymarketOrderSide::Buy => OrderSide::Buy,
+        PolymarketOrderSide::Sell => OrderSide::Sell,
+    };
+    let (action, order_size) = if size.is_zero() {
+        (BookAction::Delete, Quantity::zero(size_precision))
+    } else {
+        (BookAction::Update, size)
+    };
+    let order = BookOrder::new(side, price, order_size, 0);
+
+    OrderBookDelta::new_checked(instrument_id, action, order, 0, 0, ts_event, ts_init)
 }
 
 /// Parses a trade message into a [`TradeTick`].
@@ -196,8 +292,8 @@ pub fn parse_trade_tick(
     let price = parse_price(&trade.price, price_precision)?;
     let size = parse_quantity(&trade.size, size_precision)?;
     let aggressor_side = match trade.side {
-        PolymarketOrderSide::Buy => AggressorSide::Buyer,
-        PolymarketOrderSide::Sell => AggressorSide::Seller,
+        PolymarketOrderSide::Buy => AggressorSide::Buy,
+        PolymarketOrderSide::Sell => AggressorSide::Sell,
     };
     let ts_event = parse_timestamp_ms(&trade.timestamp)?;
 
@@ -228,6 +324,7 @@ pub fn parse_quote_from_snapshot(
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
+    price_increment: Price,
     drop_quotes_missing_side: bool,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<QuoteTick>> {
@@ -236,6 +333,7 @@ pub fn parse_quote_from_snapshot(
     }
 
     let ts_event = parse_timestamp_ms(&snap.timestamp)?;
+    let (min_price, max_price) = tick_relative_price_bounds(price_increment.as_decimal())?;
 
     // Polymarket sends bids ascending and asks descending, so best-of-book is last.
     let (bid_price, bid_size) = match snap.bids.last() {
@@ -243,20 +341,14 @@ pub fn parse_quote_from_snapshot(
             parse_price(&best_bid.price, price_precision)?,
             parse_quantity(&best_bid.size, size_precision)?,
         ),
-        None => (
-            parse_price(MIN_PRICE, price_precision)?,
-            Quantity::zero(size_precision),
-        ),
+        None => (min_price, Quantity::zero(size_precision)),
     };
     let (ask_price, ask_size) = match snap.asks.last() {
         Some(best_ask) => (
             parse_price(&best_ask.price, price_precision)?,
             parse_quantity(&best_ask.size, size_precision)?,
         ),
-        None => (
-            parse_price(MAX_PRICE, price_precision)?,
-            Quantity::zero(size_precision),
-        ),
+        None => (max_price, Quantity::zero(size_precision)),
     };
 
     Ok(Some(QuoteTick::new_checked(
@@ -283,6 +375,7 @@ pub fn parse_quote_from_price_change(
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
+    price_increment: Price,
     drop_quotes_missing_side: bool,
     last_quote: Option<&QuoteTick>,
     ts_event: UnixNanos,
@@ -294,15 +387,16 @@ pub fn parse_quote_from_price_change(
         return Ok(None);
     }
 
+    let (min_price, max_price) = tick_relative_price_bounds(price_increment.as_decimal())?;
     let bid_missing = bid_top.is_none();
     let ask_missing = ask_top.is_none();
     let bid_price = match bid_top {
         Some(price) => price,
-        None => parse_price(MIN_PRICE, price_precision)?,
+        None => min_price,
     };
     let ask_price = match ask_top {
         Some(price) => price,
-        None => parse_price(MAX_PRICE, price_precision)?,
+        None => max_price,
     };
 
     if !bid_missing && !ask_missing && bid_price >= ask_price {
@@ -394,7 +488,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::http::parse::{create_instrument_from_def, parse_gamma_market};
+    use crate::{
+        http::parse::{
+            create_instrument_from_def, parse_gamma_market, rebuild_instrument_with_tick_size,
+        },
+        websocket::messages::PolymarketQuotes,
+    };
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let content =
@@ -408,6 +507,12 @@ mod tests {
         create_instrument_from_def(&defs[0], UnixNanos::from(1_000_000_000u64)).unwrap()
     }
 
+    fn test_instrument_with_tick(tick_size: &str) -> InstrumentAny {
+        let instrument = test_instrument();
+        let ts = UnixNanos::from(1_000_000_000u64);
+        rebuild_instrument_with_tick_size(&instrument, tick_size, ts, ts).unwrap()
+    }
+
     #[rstest]
     fn test_parse_timestamp_ms() {
         let ns = parse_timestamp_ms("1703875200000").unwrap();
@@ -417,6 +522,55 @@ mod tests {
     #[rstest]
     fn test_parse_timestamp_ms_invalid() {
         assert!(parse_timestamp_ms("not_a_number").is_err());
+    }
+
+    #[rstest]
+    fn test_book_snapshot_hash_matches_captured_snapshot() {
+        let snap: PolymarketBookSnapshot = load("ws_book_snapshot_captured.json");
+
+        assert_eq!(snap.min_order_size, None);
+        assert_eq!(snap.neg_risk, None);
+        assert_eq!(snap.tick_size.as_deref(), Some("0.01"));
+        assert_eq!(snap.last_trade_price.as_deref(), Some("0.920"));
+        assert_eq!(
+            book_snapshot_hash(&snap, Some("5"), Some(false)).unwrap(),
+            Some("ed47eb91f3c7985fac1cb18cb7c19535eddd3c0a".to_string())
+        );
+        assert!(verify_book_snapshot_hash(&snap, Some("5"), Some(false)).unwrap());
+    }
+
+    #[rstest]
+    fn test_book_snapshot_hash_rejects_mismatch() {
+        let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot_captured.json");
+        snap.bids[0].size = "3149725.71".to_string();
+
+        let error = verify_book_snapshot_hash(&snap, Some("5"), Some(false)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            concat!(
+                "Book snapshot hash mismatch for ",
+                "350977769852917329387037893294763093471844346281449484439085576212613048126: ",
+                "expected ed47eb91f3c7985fac1cb18cb7c19535eddd3c0a, ",
+                "computed 6402b534c270a1ce46a75c62f1d7e3651182cc75"
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_book_snapshot_hash_allows_missing_hash() {
+        let snap: PolymarketBookSnapshot = load("ws_book_snapshot_missing_hash.json");
+
+        assert!(!verify_book_snapshot_hash(&snap, None, None).unwrap());
+    }
+
+    #[rstest]
+    fn test_book_snapshot_hash_allows_incomplete_preimage() {
+        let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot_captured.json");
+        snap.tick_size = None;
+        snap.last_trade_price = None;
+
+        assert!(!verify_book_snapshot_hash(&snap, Some("5"), Some(false)).unwrap());
     }
 
     #[rstest]
@@ -464,30 +618,31 @@ mod tests {
     fn test_parse_book_deltas() {
         let quotes: PolymarketQuotes = load("ws_quotes.json");
         let instrument = test_instrument();
+        let ts_event = parse_timestamp_ms(&quotes.timestamp).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
+        let changes = quotes.price_changes.iter().collect::<Vec<_>>();
 
         let deltas = parse_book_deltas(
-            &quotes,
+            &changes,
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            ts_event,
             ts_init,
         )
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()
         .unwrap();
 
-        assert_eq!(deltas.deltas.len(), 2);
+        assert_eq!(deltas.len(), 2);
 
         // Exactly one delta carries F_LAST, and it must be the last one
         let f_last_count = deltas
-            .deltas
             .iter()
             .filter(|d| d.flags & RecordFlag::F_LAST as u8 != 0)
             .count();
         assert_eq!(f_last_count, 1);
-        assert_ne!(
-            deltas.deltas.last().unwrap().flags & RecordFlag::F_LAST as u8,
-            0
-        );
+        assert_ne!(deltas.last().unwrap().flags & RecordFlag::F_LAST as u8, 0);
     }
 
     #[rstest]
@@ -495,18 +650,23 @@ mod tests {
         let mut quotes: PolymarketQuotes = load("ws_quotes.json");
         quotes.price_changes[0].size = "0".to_string();
         let instrument = test_instrument();
+        let ts_event = parse_timestamp_ms(&quotes.timestamp).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
+        let changes = quotes.price_changes.iter().collect::<Vec<_>>();
 
         let deltas = parse_book_deltas(
-            &quotes,
+            &changes,
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            ts_event,
             ts_init,
         )
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()
         .unwrap();
 
-        assert_eq!(deltas.deltas[0].action, BookAction::Delete);
+        assert_eq!(deltas[0].action, BookAction::Delete);
     }
 
     #[rstest]
@@ -525,7 +685,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(tick.instrument_id, instrument.id());
-        assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+        assert_eq!(tick.aggressor_side, AggressorSide::Buy);
         assert_eq!(tick.ts_event, UnixNanos::from(1_703_875_202_000_000_000u64));
     }
 
@@ -566,6 +726,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             true,
             ts_init,
         )
@@ -593,6 +754,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             true,
             ts_init,
         )
@@ -605,7 +767,7 @@ mod tests {
     fn test_parse_quote_from_snapshot_empty_side_uses_boundary_when_drop_disabled() {
         let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot.json");
         snap.asks.clear();
-        let instrument = test_instrument();
+        let instrument = test_instrument_with_tick("0.005");
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let quote = parse_quote_from_snapshot(
@@ -613,6 +775,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             false,
             ts_init,
         )
@@ -621,10 +784,7 @@ mod tests {
 
         assert_eq!(quote.bid_price, Price::from("0.50"));
         assert_eq!(quote.bid_size, Quantity::from("200.00"));
-        assert_eq!(
-            quote.ask_price,
-            parse_price(MAX_PRICE, instrument.price_precision()).unwrap()
-        );
+        assert_eq!(quote.ask_price, Price::from("0.995"));
         assert_eq!(quote.ask_size, Quantity::from("0.00"));
     }
 
@@ -632,7 +792,7 @@ mod tests {
     fn test_parse_quote_from_snapshot_empty_bid_uses_boundary_when_drop_disabled() {
         let mut snap: PolymarketBookSnapshot = load("ws_book_snapshot.json");
         snap.bids.clear();
-        let instrument = test_instrument();
+        let instrument = test_instrument_with_tick("0.0025");
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let quote = parse_quote_from_snapshot(
@@ -640,16 +800,14 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             false,
             ts_init,
         )
         .unwrap()
         .expect("quote should use boundary bid when drop is disabled");
 
-        assert_eq!(
-            quote.bid_price,
-            parse_price(MIN_PRICE, instrument.price_precision()).unwrap()
-        );
+        assert_eq!(quote.bid_price, Price::from("0.0025"));
         assert_eq!(quote.bid_size, Quantity::from("0.00"));
         assert_eq!(quote.ask_price, Price::from("0.51"));
         assert_eq!(quote.ask_size, Quantity::from("150.00"));
@@ -667,6 +825,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             true,
             None,
             ts_event,
@@ -695,6 +854,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             true,
             None,
             ts_event,
@@ -713,7 +873,7 @@ mod tests {
     ) {
         let mut quotes: PolymarketQuotes = load("ws_quotes.json");
         quotes.price_changes[0].best_ask = best_ask.map(str::to_string);
-        let instrument = test_instrument();
+        let instrument = test_instrument_with_tick("0.005");
         let ts_event = parse_timestamp_ms(&quotes.timestamp).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
@@ -722,6 +882,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             false,
             None,
             ts_event,
@@ -732,10 +893,7 @@ mod tests {
 
         assert_eq!(quote.bid_price, Price::from("0.51"));
         assert_eq!(quote.bid_size, Quantity::from("150.00"));
-        assert_eq!(
-            quote.ask_price,
-            parse_price(MAX_PRICE, instrument.price_precision()).unwrap()
-        );
+        assert_eq!(quote.ask_price, Price::from("0.995"));
         assert_eq!(quote.ask_size, Quantity::from("0.00"));
     }
 
@@ -747,7 +905,7 @@ mod tests {
         quotes.price_changes[0].size = "75".to_string();
         quotes.price_changes[0].best_bid = Some("0".to_string());
         quotes.price_changes[0].best_ask = Some("0.52".to_string());
-        let instrument = test_instrument();
+        let instrument = test_instrument_with_tick("0.0025");
         let ts_event = parse_timestamp_ms(&quotes.timestamp).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
@@ -756,6 +914,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             false,
             None,
             ts_event,
@@ -764,10 +923,7 @@ mod tests {
         .unwrap()
         .expect("quote should use boundary bid when drop is disabled");
 
-        assert_eq!(
-            quote.bid_price,
-            parse_price(MIN_PRICE, instrument.price_precision()).unwrap()
-        );
+        assert_eq!(quote.bid_price, Price::from("0.0025"));
         assert_eq!(quote.bid_size, Quantity::from("0.00"));
         assert_eq!(quote.ask_price, Price::from("0.52"));
         assert_eq!(quote.ask_size, Quantity::from("75.00"));
@@ -787,6 +943,7 @@ mod tests {
             instrument.id(),
             instrument.price_precision(),
             instrument.size_precision(),
+            instrument.price_increment(),
             false,
             None,
             ts_event,

@@ -43,7 +43,7 @@ use crate::{
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.binance", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -85,6 +85,8 @@ impl DataClientFactory for BinanceDataClientFactory {
 
         let client_id = ClientId::from(name);
 
+        binance_config.validate()?;
+
         let product_type = binance_config.product_type;
 
         match product_type {
@@ -116,7 +118,7 @@ impl DataClientFactory for BinanceDataClientFactory {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.binance", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -156,6 +158,8 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
             .clone();
 
         let product_type = binance_config.product_type;
+
+        binance_config.validate()?;
 
         match product_type {
             BinanceProductType::Spot => {

@@ -35,7 +35,7 @@ use nautilus_model::{
         position::snapshot::PositionSnapshot,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
+        AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
         TraderId, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
@@ -60,14 +60,18 @@ const CACHE_PROCESS: &str = "cache-process";
 /// Configuration for a Postgres-backed cache database.
 ///
 /// Missing fields are resolved from Postgres environment variables and then built-in defaults.
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "config deserializes plain fields; unsafe methods come from generated PyO3 integration"
+    )
+)]
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.infrastructure",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.infrastructure", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -171,7 +175,7 @@ impl CacheDatabaseFactory for PostgresCacheConfig {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.infrastructure")
+    pyo3::pyclass(module = "nautilus_trader.infrastructure")
 )]
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
@@ -202,6 +206,7 @@ pub enum DatabaseQuery {
     UpdateOrder(OrderEventAny),
     UpdatePosition(OrderFilled),
     IndexOrderPosition(ClientOrderId, PositionId),
+    IndexOrderClients(Vec<(ClientOrderId, ClientId)>),
 }
 
 impl PostgresCacheDatabase {
@@ -224,6 +229,7 @@ impl PostgresCacheDatabase {
         let pg_connect_options =
             get_postgres_connect_options(host, port, username, password, database);
         let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
+        check_schema_migrated(&pool).await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseQuery>();
 
         let handle = get_runtime().spawn(async move {
@@ -284,6 +290,36 @@ impl PostgresCacheDatabase {
 
         log_task_stopped(CACHE_PROCESS);
     }
+}
+
+// Fails fast when the connected database predates the exact-average columns.
+//
+// Both directions of the mismatch are otherwise silent: `numeric -> double precision` is an
+// implicit cast so writes truncate, and the row readers use `.ok().flatten()` so reads degrade
+// to `None`. A column absent altogether is left to the query that first touches it.
+async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name || ' (' || data_type || ')'
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND (table_name, column_name) IN (('order', 'avg_px'), ('order', 'slippage'))
+          AND data_type <> 'numeric'
+        ORDER BY table_name, column_name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    Err(sqlx::Error::Configuration(
+        format!(
+            "Postgres schema is out of date, {} should be `numeric`: run `nautilus database init` to migrate",
+            stale.join(", ")
+        )
+        .into(),
+    ))
 }
 
 async fn handle_query(
@@ -759,11 +795,11 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         rx.recv()?
     }
 
-    fn load_actor(&self, component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {component_id}")
+    fn load_actor(&self, actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
+        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
-    fn delete_actor(&self, _component_id: &ComponentId) -> anyhow::Result<()> {
+    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -1111,20 +1147,33 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         })
     }
 
+    fn index_order_clients(&self, claims: &[(ClientOrderId, ClientId)]) -> anyhow::Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        let query = DatabaseQuery::IndexOrderClients(claims.to_vec());
+        self.tx.send(query).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to send query index_order_clients to database message handler: {e}"
+            )
+        })
+    }
+
     fn update_actor(
         &self,
-        _component_id: &ComponentId,
+        actor_id: &ActorId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        todo!()
+        anyhow::bail!("update_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
     fn update_strategy(
         &self,
-        _strategy_id: &StrategyId,
+        strategy_id: &StrategyId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        todo!()
+        anyhow::bail!("update_strategy not implemented for PostgreSQL cache adapter: {strategy_id}")
     }
 
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
@@ -1308,6 +1357,9 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             }
             DatabaseQuery::IndexOrderPosition(client_order_id, position_id) => {
                 DatabaseQueries::index_order_position(pool, client_order_id, position_id).await
+            }
+            DatabaseQuery::IndexOrderClients(claims) => {
+                DatabaseQueries::index_order_clients(pool, &claims).await
             }
         };
 

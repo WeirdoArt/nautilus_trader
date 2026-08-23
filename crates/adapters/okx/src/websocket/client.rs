@@ -55,8 +55,8 @@ use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
     websocket::{
-        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, PingHandler, SubscriptionState, TEXT_PING,
-        TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
+        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TEXT_PING, TransportBackend,
+        WebSocketClient, WebSocketConfig, channel_message_handler,
     },
 };
 use serde_json::Value;
@@ -78,13 +78,13 @@ use super::{
 use crate::common::{
     consts::{
         OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER,
+        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, select_book_channel,
     },
     credential::Credential,
     enums::{
-        OKXGreeksType, OKXInstrumentType, OKXOrderType, OKXPositionSide, OKXTargetCurrency,
-        OKXTradeMode, OKXTriggerType, OKXVipLevel, conditional_order_to_algo_type,
-        is_conditional_order,
+        OKXBookChannel, OKXGreeksType, OKXInstrumentType, OKXOrderType, OKXPositionSide,
+        OKXTargetCurrency, OKXTradeMode, OKXTriggerType, OKXVipLevel,
+        conditional_order_to_algo_type, is_conditional_order,
     },
     parse::{
         bar_spec_as_okx_channel, okx_instrument_type, okx_instrument_type_from_symbol,
@@ -205,7 +205,7 @@ pub(crate) struct PendingOrderInfo {
 #[derive(Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.okx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.okx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -561,23 +561,23 @@ impl OKXWebSocketClient {
 
         // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
         // in the message loop for minimal latency (see handler.rs TEXT_PONG response)
-        let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {
-            // Handler responds to pings internally via select! loop
-        });
+        // Inbound Ping frames are answered by the transport, so no ping handler is needed;
+        // the reader routes them away from the message channel and the handler never sees them.
 
         let headers = vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())];
 
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: Some(TEXT_PING.to_string()),
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: Some(TEXT_PING.to_string()),
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: None,
             reconnect_delay_max_ms: None,
             reconnect_backoff_factor: None,
             reconnect_jitter_ms: None,
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
@@ -629,8 +629,7 @@ impl OKXWebSocketClient {
         let client = WebSocketClient::connect(
             config,
             Some(message_handler),
-            Some(ping_handler),
-            None, // post_reconnection
+            None,
             keyed_quotas,
             Some(*OKX_WS_CONNECTION_QUOTA), // Default quota for connection operations
         )
@@ -1304,6 +1303,38 @@ impl OKXWebSocketClient {
             .await
     }
 
+    /// Subscribes to the Retail Price Improvement order book channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    pub async fn subscribe_book_rpi(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        self.subscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Requests a fresh snapshot by replacing the current incremental book subscription.
+    pub(crate) async fn resubscribe_book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXBookChannel,
+    ) -> Result<(), OKXWsError> {
+        let channel = ws_channel_for_book(channel);
+        self.resubscribe_ws_channel(instrument_id, channel).await
+    }
+
+    /// Replaces an instrument subscription on the specified WebSocket channel.
+    pub(crate) async fn resubscribe_ws_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXWsChannel,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(channel.clone(), instrument_id.symbol.inner())
+            .await?;
+        self.subscribe_inst_id(channel, instrument_id.symbol.inner())
+            .await
+    }
+
     /// Subscribes to 5-level order book snapshot data for an instrument.
     ///
     /// Updates every 100ms when there are changes.
@@ -1381,30 +1412,18 @@ impl OKXWebSocketClient {
     ) -> anyhow::Result<()> {
         let vip = self.vip_level();
 
-        match depth {
-            50 => {
-                if vip < OKXVipLevel::Vip4 {
-                    anyhow::bail!(
-                        "VIP level {vip} insufficient for 50 depth subscription (requires VIP4)"
-                    );
-                }
-                self.subscribe_book50_l2_tbt(instrument_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-            }
-            0 | 400 => {
-                if vip >= OKXVipLevel::Vip5 {
-                    self.subscribe_book_l2_tbt(instrument_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))
-                } else {
-                    self.subscribe_books_channel(instrument_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))
-                }
-            }
-            _ => anyhow::bail!("Invalid depth {depth}, must be 0, 50, or 400"),
+        if !matches!(depth, 0 | 50 | 400) {
+            anyhow::bail!("Invalid depth {depth}, must be 0, 50, or 400");
         }
+
+        if depth == 50 && vip < OKXVipLevel::Vip4 {
+            anyhow::bail!("VIP level {vip} insufficient for 50 depth subscription (requires VIP4)");
+        }
+
+        let channel = select_book_channel(depth as usize, vip);
+        self.subscribe_inst_id(ws_channel_for_book(channel), instrument_id.symbol.inner())
+            .await?;
+        Ok(())
     }
 
     /// Subscribes to best bid/ask quote data for an instrument.
@@ -1708,6 +1727,19 @@ impl OKXWebSocketClient {
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
         self.unsubscribe_inst_id(OKXWsChannel::Books, instrument_id.symbol.inner())
+            .await
+    }
+
+    /// Unsubscribe from Retail Price Improvement order book data for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_book_rpi(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<(), OKXWsError> {
+        self.unsubscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
             .await
     }
 
@@ -2123,42 +2155,6 @@ impl OKXWebSocketClient {
         self.unsubscribe(vec![arg]).await
     }
 
-    /// Subscribes to fill updates for the given instrument type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the subscription request fails.
-    pub async fn subscribe_fills(
-        &self,
-        instrument_type: OKXInstrumentType,
-    ) -> Result<(), OKXWsError> {
-        let arg = OKXSubscriptionArg {
-            channel: OKXWsChannel::Fills,
-            inst_type: Some(instrument_type),
-            inst_family: None,
-            inst_id: None,
-        };
-        self.subscribe(vec![arg]).await
-    }
-
-    /// Unsubscribes from fill updates for the given instrument type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the subscription request fails.
-    pub async fn unsubscribe_fills(
-        &self,
-        instrument_type: OKXInstrumentType,
-    ) -> Result<(), OKXWsError> {
-        let arg = OKXSubscriptionArg {
-            channel: OKXWsChannel::Fills,
-            inst_type: Some(instrument_type),
-            inst_family: None,
-            inst_id: None,
-        };
-        self.unsubscribe(vec![arg]).await
-    }
-
     /// Subscribes to account balance updates.
     ///
     /// # Errors
@@ -2229,12 +2225,56 @@ impl OKXWebSocketClient {
         self.unsubscribe(vec![arg]).await
     }
 
+    /// Subscribes to liquidation risk warnings for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#trading-account-websocket-liquidation-warning-channel>
+    pub async fn subscribe_liquidation_warning(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::LiquidationWarning,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.subscribe(vec![arg]).await
+    }
+
+    /// Unsubscribes from liquidation risk warnings for the given instrument type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the unsubscription request fails.
+    pub async fn unsubscribe_liquidation_warning(
+        &self,
+        instrument_type: OKXInstrumentType,
+    ) -> Result<(), OKXWsError> {
+        let arg = OKXSubscriptionArg {
+            channel: OKXWsChannel::LiquidationWarning,
+            inst_type: Some(instrument_type),
+            inst_family: None,
+            inst_id: None,
+        };
+        self.unsubscribe(vec![arg]).await
+    }
+
     /// Place multiple orders in a single batch via WebSocket.
     ///
     /// # References
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-orders>
-    async fn ws_batch_place_orders(&self, args: Vec<Value>) -> Result<(), OKXWsError> {
+    async fn ws_batch_place_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
             id: Some(request_id.clone()),
@@ -2250,7 +2290,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_ORDER.to_vec()),
             request_id: Some(request_id),
-            client_order_id: None,
+            client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchOrders),
         };
 
@@ -2262,7 +2302,11 @@ impl OKXWebSocketClient {
     /// # References
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-cancel-orders>
-    async fn ws_batch_cancel_orders(&self, args: Vec<Value>) -> Result<(), OKXWsError> {
+    async fn ws_batch_cancel_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
             id: Some(request_id.clone()),
@@ -2278,7 +2322,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
             request_id: Some(request_id),
-            client_order_id: None,
+            client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
         };
 
@@ -2290,7 +2334,11 @@ impl OKXWebSocketClient {
     /// # References
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-batch-amend-orders>
-    async fn ws_batch_amend_orders(&self, args: Vec<Value>) -> Result<(), OKXWsError> {
+    async fn ws_batch_amend_orders(
+        &self,
+        args: Vec<Value>,
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
             id: Some(request_id.clone()),
@@ -2306,7 +2354,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_AMEND.to_vec()),
             request_id: Some(request_id),
-            client_order_id: None,
+            client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchAmendOrders),
         };
 
@@ -2348,7 +2396,12 @@ impl OKXWebSocketClient {
         speed_bump: Option<String>,
         outcome: Option<String>,
         slippage_pct: Option<String>,
+        rpi: Option<bool>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
+        let rpi = rpi.unwrap_or(false);
+
         if !OKX_SUPPORTED_ORDER_TYPES.contains(&order_type) {
             return Err(OKXWsError::ClientError(format!(
                 "Unsupported order type: {order_type:?}",
@@ -2399,18 +2452,9 @@ impl OKXWebSocketClient {
         }
 
         match instrument_type {
-            OKXInstrumentType::Spot => {
+            OKXInstrumentType::Spot | OKXInstrumentType::Margin => {
                 // SPOT: ccy parameter is required by OKX for spot trading
                 builder.ccy(quote_currency.to_string());
-            }
-            OKXInstrumentType::Margin => {
-                builder.ccy(quote_currency.to_string());
-
-                if let Some(ro) = reduce_only
-                    && ro
-                {
-                    builder.reduce_only(ro);
-                }
             }
             OKXInstrumentType::Swap | OKXInstrumentType::Futures => {
                 // SWAP/FUTURES: use quote currency for margin (required by OKX)
@@ -2437,13 +2481,11 @@ impl OKXWebSocketClient {
                 if position_side.is_none() {
                     builder.pos_side(OKXPositionSide::Net);
                 }
-
-                if let Some(ro) = reduce_only
-                    && ro
-                {
-                    builder.reduce_only(ro);
-                }
             }
+        }
+
+        if should_send_reduce_only(instrument_type, td_mode, position_side, reduce_only) {
+            builder.reduce_only(true);
         }
 
         if let Some(attach_algo_ords) = attach_algo_ords {
@@ -2482,7 +2524,15 @@ impl OKXWebSocketClient {
         // OKX implements FOK/IOC as order types rather than separate time-in-force
         // Market + FOK is unsupported (FOK requires a limit price)
         // optimal_limit_ioc is only supported for SWAP/FUTURES, not SPOT or OPTION
-        let (okx_ord_type, price) = if post_only.unwrap_or(false) {
+        if rpi && order_type != OrderType::Limit {
+            return Err(OKXWsError::ClientError(
+                "OKX RPI orders require a limit order".to_string(),
+            ));
+        }
+
+        let (okx_ord_type, price) = if rpi {
+            (OKXOrderType::Rpi, price)
+        } else if post_only.unwrap_or(false) {
             (OKXOrderType::PostOnly, price)
         } else if let Some(tif) = time_in_force {
             match (order_type, tif) {
@@ -2549,6 +2599,14 @@ impl OKXWebSocketClient {
             builder.slippage_pct(slippage);
         }
 
+        if let Some(rpi_taker_access) = rpi_taker_access {
+            builder.rpi_taker_access(rpi_taker_access);
+        }
+
+        if let Some(rpi_px_round) = rpi_px_round {
+            builder.rpi_px_round(rpi_px_round);
+        }
+
         builder.ord_type(okx_ord_type);
         builder.sz(quantity.to_string());
 
@@ -2594,7 +2652,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ORDER.to_vec()),
             request_id: Some(request_id),
-            client_order_id: Some(client_order_id),
+            client_order_ids: vec![client_order_id],
             op: Some(super::enums::OKXWsOperation::Order),
         };
 
@@ -2635,6 +2693,8 @@ impl OKXWebSocketClient {
         new_px_usd: Option<String>,
         new_px_vol: Option<String>,
         speed_bump: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
         let mut builder = WsAmendOrderParamsBuilder::default();
 
@@ -2682,6 +2742,14 @@ impl OKXWebSocketClient {
             builder.speed_bump(speed_bump);
         }
 
+        if let Some(rpi_taker_access) = rpi_taker_access {
+            builder.rpi_taker_access(rpi_taker_access);
+        }
+
+        if let Some(rpi_px_round) = rpi_px_round {
+            builder.rpi_px_round(rpi_px_round);
+        }
+
         let params = builder
             .build()
             .map_err(|e| OKXWsError::ClientError(format!("Build amend params error: {e}")))?;
@@ -2701,7 +2769,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_AMEND.to_vec()),
             request_id: Some(request_id),
-            client_order_id,
+            client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::AmendOrder),
         };
 
@@ -2780,7 +2848,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
             request_id: Some(request_id),
-            client_order_id,
+            client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelOrder),
         };
 
@@ -2862,7 +2930,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_MASS_CANCEL.to_vec()),
             request_id: Some(request_id),
-            client_order_id: None,
+            client_order_ids: Vec::new(),
             op: Some(super::enums::OKXWsOperation::MassCancel),
         };
 
@@ -2893,8 +2961,12 @@ impl OKXWebSocketClient {
             Option<bool>,
             Option<String>,
             Option<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
         )>,
     ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.3).collect();
         let args: Vec<Value> = {
             let mut args = Vec::with_capacity(orders.len());
             let inst_id_codes = self.inst_id_code_cache.load();
@@ -2915,8 +2987,12 @@ impl OKXWebSocketClient {
                 reduce_only,
                 speed_bump,
                 outcome,
+                rpi,
+                rpi_taker_access,
+                rpi_px_round,
             ) in orders
             {
+                let rpi = rpi.unwrap_or(false);
                 let mut builder = WsPostOrderParamsBuilder::default();
 
                 let (inst_id_symbol, inst_id_code) = Self::inst_id_symbol_and_code_from_snapshot(
@@ -2947,7 +3023,15 @@ impl OKXWebSocketClient {
                     builder.pos_side(OKXPositionSide::Net);
                 }
 
-                let okx_ord_type = if post_only.unwrap_or(false) {
+                if rpi && ord_type != OrderType::Limit {
+                    return Err(OKXWsError::ClientError(
+                        "OKX RPI batch orders require limit orders".to_string(),
+                    ));
+                }
+
+                let okx_ord_type = if rpi {
+                    OKXOrderType::Rpi
+                } else if post_only.unwrap_or(false) {
                     OKXOrderType::PostOnly
                 } else {
                     match ord_type {
@@ -2971,8 +3055,8 @@ impl OKXWebSocketClient {
                     builder.px(p.to_string());
                 }
 
-                if let Some(ro) = reduce_only {
-                    builder.reduce_only(ro);
+                if should_send_reduce_only(inst_type, td_mode, pos_side, reduce_only) {
+                    builder.reduce_only(true);
                 }
 
                 let speed_bump = if inst_type == OKXInstrumentType::Events {
@@ -2999,6 +3083,14 @@ impl OKXWebSocketClient {
                     builder.outcome(outcome);
                 }
 
+                if let Some(rpi_taker_access) = rpi_taker_access {
+                    builder.rpi_taker_access(rpi_taker_access);
+                }
+
+                if let Some(rpi_px_round) = rpi_px_round {
+                    builder.rpi_px_round(rpi_px_round);
+                }
+
                 builder.tag(OKX_NAUTILUS_BROKER_ID);
 
                 let params = builder.build().map_err(|e| {
@@ -3011,7 +3103,7 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_place_orders(args).await
+        self.ws_batch_place_orders(args, client_order_ids).await
     }
 
     /// Modifies multiple orders.
@@ -3027,17 +3119,31 @@ impl OKXWebSocketClient {
             OKXInstrumentType,
             InstrumentId,
             ClientOrderId,
-            ClientOrderId,
+            Option<String>,
             Option<Price>,
             Option<Quantity>,
             Option<String>,
+            Option<bool>,
+            Option<bool>,
         )>,
     ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.2).collect();
         let args: Vec<Value> = {
             let mut args = Vec::with_capacity(orders.len());
             let inst_id_codes = self.inst_id_code_cache.load();
 
-            for (_inst_type, inst_id, cl_ord_id, new_cl_ord_id, pr, sz, speed_bump) in orders {
+            for (
+                _inst_type,
+                inst_id,
+                cl_ord_id,
+                request_id,
+                pr,
+                sz,
+                speed_bump,
+                rpi_taker_access,
+                rpi_px_round,
+            ) in orders
+            {
                 let mut builder = WsAmendOrderParamsBuilder::default();
 
                 let (_, inst_id_code) =
@@ -3045,7 +3151,10 @@ impl OKXWebSocketClient {
                 builder.inst_id_code(inst_id_code);
 
                 builder.cl_ord_id(cl_ord_id.as_str());
-                builder.new_cl_ord_id(new_cl_ord_id.as_str());
+
+                if let Some(request_id) = request_id {
+                    builder.req_id(request_id);
+                }
 
                 if let Some(p) = pr {
                     builder.new_px(p.to_string());
@@ -3059,6 +3168,14 @@ impl OKXWebSocketClient {
                     builder.speed_bump(speed_bump);
                 }
 
+                if let Some(rpi_taker_access) = rpi_taker_access {
+                    builder.rpi_taker_access(rpi_taker_access);
+                }
+
+                if let Some(rpi_px_round) = rpi_px_round {
+                    builder.rpi_px_round(rpi_px_round);
+                }
+
                 let params = builder.build().map_err(|e| {
                     OKXWsError::ClientError(format!("Build amend batch params error: {e}"))
                 })?;
@@ -3069,7 +3186,7 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_amend_orders(args).await
+        self.ws_batch_amend_orders(args, client_order_ids).await
     }
 
     /// Cancels multiple orders.
@@ -3088,6 +3205,10 @@ impl OKXWebSocketClient {
         &self,
         orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
     ) -> Result<(), OKXWsError> {
+        let client_order_ids: Vec<ClientOrderId> = orders
+            .iter()
+            .filter_map(|(_, cl_ord_id, _)| *cl_ord_id)
+            .collect();
         let args: Vec<Value> = {
             let mut args = Vec::with_capacity(orders.len());
             let inst_id_codes = self.inst_id_code_cache.load();
@@ -3120,7 +3241,7 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_cancel_orders(args).await
+        self.ws_batch_cancel_orders(args, client_order_ids).await
     }
 
     /// Submits an algo order (conditional/stop order).
@@ -3236,7 +3357,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ALGO_ORDER.to_vec()),
             request_id: Some(request_id),
-            client_order_id: Some(client_order_id),
+            client_order_ids: vec![client_order_id],
             op: Some(super::enums::OKXWsOperation::OrderAlgo),
         };
 
@@ -3299,7 +3420,7 @@ impl OKXWebSocketClient {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ALGO_CANCEL.to_vec()),
             request_id: Some(request_id),
-            client_order_id,
+            client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelAlgos),
         };
 
@@ -3312,7 +3433,35 @@ impl OKXWebSocketClient {
             .read()
             .await
             .send(cmd)
-            .map_err(|e| OKXWsError::ClientError(format!("Handler not available: {e}")))
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))
+    }
+}
+
+fn should_send_reduce_only(
+    instrument_type: OKXInstrumentType,
+    td_mode: OKXTradeMode,
+    position_side: Option<PositionSide>,
+    reduce_only: Option<bool>,
+) -> bool {
+    if reduce_only != Some(true) {
+        return false;
+    }
+
+    match instrument_type {
+        OKXInstrumentType::Spot | OKXInstrumentType::Margin => td_mode != OKXTradeMode::Cash,
+        OKXInstrumentType::Swap | OKXInstrumentType::Futures => position_side.is_none(),
+        OKXInstrumentType::Any => true,
+        OKXInstrumentType::Option | OKXInstrumentType::Events => false,
+    }
+}
+
+fn ws_channel_for_book(channel: OKXBookChannel) -> OKXWsChannel {
+    match channel {
+        OKXBookChannel::Book => OKXWsChannel::Books,
+        OKXBookChannel::BookL2Tbt => OKXWsChannel::BooksTbt,
+        OKXBookChannel::Books50L2Tbt => OKXWsChannel::Books50Tbt,
+        OKXBookChannel::BooksRpi => OKXWsChannel::BooksRpi,
+        OKXBookChannel::SprdBooks5 => OKXWsChannel::SprdBooks5,
     }
 }
 
@@ -3346,6 +3495,16 @@ mod tests {
             messages::{OKXOrderMsg, OKXWebSocketError, OKXWsFrame},
         },
     };
+
+    #[rstest]
+    #[case(OKXBookChannel::Book, OKXWsChannel::Books)]
+    #[case(OKXBookChannel::BookL2Tbt, OKXWsChannel::BooksTbt)]
+    #[case(OKXBookChannel::Books50L2Tbt, OKXWsChannel::Books50Tbt)]
+    #[case(OKXBookChannel::BooksRpi, OKXWsChannel::BooksRpi)]
+    #[case(OKXBookChannel::SprdBooks5, OKXWsChannel::SprdBooks5)]
+    fn test_ws_channel_for_book(#[case] channel: OKXBookChannel, #[case] expected: OKXWsChannel) {
+        assert_eq!(ws_channel_for_book(channel), expected);
+    }
 
     #[rstest]
     fn test_timestamp_format_for_websocket_auth() {
@@ -3978,6 +4137,9 @@ mod tests {
                 OrderSide::Buy,
                 OrderType::Limit,
                 Quantity::from("0.01"),
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,

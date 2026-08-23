@@ -32,7 +32,9 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4,
-    datetime::{NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
+    datetime::{
+        NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND, checked_mins_to_nanos, secs_to_nanos,
+    },
 };
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
@@ -52,6 +54,7 @@ use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+pub use super::queue::QueueMonitorConfig;
 use crate::execution::manager::ExecutionManagerConfig;
 
 /// The default rate limit string used for order submission and modification.
@@ -59,10 +62,19 @@ const DEFAULT_ORDER_RATE_LIMIT: &str = "100/00:00:01";
 const RUST_RUNTIME_UNSUPPORTED: &str = "not supported by the Rust live runtime yet";
 const RATE_LIMIT_FORMAT: &str = "expected 'limit/HH:MM:SS'";
 
+pub(crate) fn validate_live_environment(environment: Environment) -> anyhow::Result<()> {
+    match environment {
+        Environment::Sandbox | Environment::Live => Ok(()),
+        Environment::Backtest => {
+            anyhow::bail!("LiveNode cannot be used with Backtest environment")
+        }
+    }
+}
+
 /// Configuration for live data engines.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -162,7 +174,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
 /// Configuration for live risk engines.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -337,6 +349,20 @@ pub(crate) fn validate_non_negative_finite_f64(field: &str, value: f64) -> Confi
     )
 }
 
+pub(crate) fn validate_positive_interval_secs(field: &str, value: f64) -> ConfigResult<()> {
+    check_range(
+        field,
+        value.is_finite() && value > 0.0,
+        format!("{value} (must be a positive finite number)"),
+    )?;
+    let nanos = secs_to_nanos(value).map_err(|e| ConfigError::range(field, e.to_string()))?;
+    check_range(
+        field,
+        nanos > 0,
+        format!("{value} (must be at least one nanosecond)"),
+    )
+}
+
 #[cfg(feature = "python")]
 pub(crate) fn duration_from_secs_f64(field: &str, value: f64) -> ConfigResult<Duration> {
     check_range(
@@ -351,7 +377,7 @@ pub(crate) fn duration_from_secs_f64(field: &str, value: f64) -> ConfigResult<Du
 /// Configuration for live execution engines.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -499,6 +525,8 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
             snapshot_orders: config.snapshot_orders,
             snapshot_positions: config.snapshot_positions,
             snapshot_positions_interval_secs: config.snapshot_positions_interval_secs,
+            // Live must carry replay state so prior-cycle void corrections still resolve
+            carry_replay_events_on_reopen: true,
             allow_overfills: config.allow_overfills,
             filter_unclaimed_external_orders: config.filter_unclaimed_external_orders,
             external_clients: config.external_clients,
@@ -575,7 +603,7 @@ impl From<&LiveExecEngineConfig> for ExecutionManagerConfig {
 /// Configuration for live client message routing.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -594,7 +622,7 @@ pub struct RoutingConfig {
 /// Configuration for instrument providers.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -627,7 +655,7 @@ impl Default for InstrumentProviderConfig {
 /// Configuration for live data clients.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -650,7 +678,7 @@ pub struct LiveDataClientConfig {
 /// Configuration for live execution clients.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -670,7 +698,7 @@ pub struct LiveExecClientConfig {
 /// Configuration for one Rust-native plug-in instance loaded by a live node.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -702,7 +730,7 @@ impl Default for PluginConfig {
 /// Configuration for live Nautilus system nodes.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.live", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -721,10 +749,10 @@ pub struct LiveNodeConfig {
     /// The trader ID for the node.
     #[builder(default = TraderId::from("TRADER-001"))]
     pub trader_id: TraderId,
-    /// If trading strategy state should be loaded from the database on start.
+    /// If actor and strategy state should be loaded from the database on start.
     #[builder(default)]
     pub load_state: bool,
-    /// If trading strategy state should be saved to the database on stop.
+    /// If actor and strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
     /// If the system should request shutdown when an error log is emitted.
@@ -740,7 +768,7 @@ pub struct LiveNodeConfig {
     /// The timeout for all clients to connect and initialize.
     #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
-    /// The timeout for execution state to reconcile.
+    /// The timeout for startup reconciliation and each continuous report-collection task.
     #[builder(default = Duration::from_secs(30))]
     pub timeout_reconciliation: Duration,
     /// The timeout for portfolio to initialize margins and unrealized pnls.
@@ -765,6 +793,8 @@ pub struct LiveNodeConfig {
     pub emulator: Option<OrderEmulatorConfig>,
     /// The configuration for streaming to feather files.
     pub streaming: Option<StreamingConfig>,
+    /// The optional runner queue pressure monitor configuration.
+    pub queue_monitor: Option<QueueMonitorConfig>,
     /// The event-store configuration.
     ///
     /// When set, the live node boots a kernel-managed event-store run for audit and replay.
@@ -831,6 +861,10 @@ impl LiveNodeConfig {
         collector.collect(self.data_engine.validate_runtime_support());
         collector.collect(self.risk_engine.validate_runtime_support());
         collector.collect(self.exec_engine.validate_runtime_support());
+
+        if let Some(queue_monitor) = &self.queue_monitor {
+            collector.collect(queue_monitor.validate());
+        }
         collector.collect(self.validate_plugin_configs());
 
         collector.into_result()
@@ -933,7 +967,7 @@ impl LiveRiskEngineConfig {
 }
 
 impl LiveExecEngineConfig {
-    fn validate_runtime_support(&self) -> ConfigResult<()> {
+    pub(crate) fn validate_runtime_support(&self) -> ConfigResult<()> {
         let mut collector = ConfigErrorCollector::new();
 
         // `Duration::from_secs_f64` panics on negative, NaN, or infinite input, and the
@@ -943,6 +977,68 @@ impl LiveExecEngineConfig {
             "LiveExecEngineConfig.reconciliation_startup_delay_secs",
             self.reconciliation_startup_delay_secs,
         ));
+
+        for (field, value) in [
+            (
+                "LiveExecEngineConfig.snapshot_positions_interval_secs",
+                self.snapshot_positions_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.open_check_interval_secs",
+                self.open_check_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.position_check_interval_secs",
+                self.position_check_interval_secs,
+            ),
+            (
+                "LiveExecEngineConfig.own_books_audit_interval_secs",
+                self.own_books_audit_interval_secs,
+            ),
+        ] {
+            if let Some(value) = value {
+                collector.collect(validate_positive_interval_secs(field, value));
+            }
+        }
+
+        for (field, value) in [
+            (
+                "LiveExecEngineConfig.open_check_lookback_mins",
+                self.open_check_lookback_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_orders_interval_mins",
+                self.purge_closed_orders_interval_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_positions_interval_mins",
+                self.purge_closed_positions_interval_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_account_events_interval_mins",
+                self.purge_account_events_interval_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_orders_buffer_mins",
+                self.purge_closed_orders_buffer_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_closed_positions_buffer_mins",
+                self.purge_closed_positions_buffer_mins,
+            ),
+            (
+                "LiveExecEngineConfig.purge_account_events_lookback_mins",
+                self.purge_account_events_lookback_mins,
+            ),
+        ] {
+            if let Some(mins) = value {
+                collector.collect(check_range(
+                    field,
+                    checked_mins_to_nanos(u64::from(mins)).is_some(),
+                    format!("{mins} minutes (must fit in `u64` nanoseconds)"),
+                ));
+            }
+        }
 
         if let Some(instrument_ids) = &self.reconciliation_instrument_ids {
             collector.collect(validate_instrument_id_strings(
@@ -1088,6 +1184,69 @@ mod tests {
         assert!(config.data_clients.is_empty());
         assert!(config.exec_clients.is_empty());
         assert!(config.plugins.is_empty());
+        assert!(config.queue_monitor.is_none());
+    }
+
+    #[rstest]
+    fn test_live_node_queue_monitor_config_serde_roundtrip() {
+        let config: LiveNodeConfig = toml::from_str(
+            "
+[queue_monitor]
+queue_depth_trigger = 100
+queue_depth_clear = 60
+mean_dispatch_ns_trigger = 1000
+mean_dispatch_ns_clear = 700
+",
+        )
+        .unwrap();
+
+        let expected = Some(
+            QueueMonitorConfig::builder()
+                .queue_depth_trigger(100)
+                .queue_depth_clear(60)
+                .mean_dispatch_ns_trigger(1_000)
+                .mean_dispatch_ns_clear(700)
+                .build(),
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: LiveNodeConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.queue_monitor, expected);
+        assert_eq!(restored.queue_monitor, expected);
+    }
+
+    #[rstest]
+    #[case(
+        QueueMonitorConfig {
+            queue_depth_trigger: 10,
+            queue_depth_clear: 10,
+            mean_dispatch_ns_trigger: 100,
+            mean_dispatch_ns_clear: 50,
+        },
+        "invalid LiveNodeConfig.queue_monitor.queue_depth: clear threshold 10 must be lower than trigger threshold 10"
+    )]
+    #[case(
+        QueueMonitorConfig {
+            queue_depth_trigger: 10,
+            queue_depth_clear: 5,
+            mean_dispatch_ns_trigger: 50,
+            mean_dispatch_ns_clear: 50,
+        },
+        "invalid LiveNodeConfig.queue_monitor.mean_dispatch_ns: clear threshold 50 must be lower than trigger threshold 50"
+    )]
+    fn test_live_node_queue_monitor_config_validates_hysteresis(
+        #[case] queue_monitor: QueueMonitorConfig,
+        #[case] expected: &str,
+    ) {
+        let config = LiveNodeConfig {
+            queue_monitor: Some(queue_monitor),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.validate_runtime_support().unwrap_err().to_string(),
+            expected
+        );
     }
 
     #[rstest]
@@ -1312,6 +1471,8 @@ mod tests {
         assert_eq!(converted.purge_closed_positions_buffer_mins, Some(2));
         assert_eq!(converted.purge_account_events_interval_mins, Some(15));
         assert_eq!(converted.purge_account_events_lookback_mins, Some(3));
+        // Pinned on for live regardless of the `ExecutionEngineConfig` default
+        assert!(converted.carry_replay_events_on_reopen);
     }
 
     #[rstest]
@@ -1450,6 +1611,91 @@ mod tests {
     }
 
     #[rstest]
+    fn test_validate_runtime_support_rejects_overflowing_minute_fields() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                open_check_lookback_mins: Some(u32::MAX),
+                purge_closed_orders_interval_mins: Some(u32::MAX),
+                purge_closed_positions_interval_mins: Some(u32::MAX),
+                purge_account_events_interval_mins: Some(u32::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::Multiple {
+                errors: vec![
+                    ConfigError::range(
+                        "LiveExecEngineConfig.open_check_lookback_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_closed_orders_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_closed_positions_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                    ConfigError::range(
+                        "LiveExecEngineConfig.purge_account_events_interval_mins",
+                        "4294967295 minutes (must fit in `u64` nanoseconds)",
+                    ),
+                ],
+            }
+        );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(307_445_734)]
+    fn test_validate_runtime_support_accepts_purge_retention_boundaries(#[case] mins: u32) {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                purge_closed_orders_buffer_mins: Some(mins),
+                purge_closed_positions_buffer_mins: Some(mins),
+                purge_account_events_lookback_mins: Some(mins),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate_runtime_support().is_ok());
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_rejects_overflowing_purge_retention_minutes() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                purge_closed_orders_buffer_mins: Some(307_445_735),
+                purge_closed_positions_buffer_mins: Some(307_445_735),
+                purge_account_events_lookback_mins: Some(307_445_735),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config.validate_runtime_support().unwrap_err();
+        let ConfigError::Multiple { errors } = error else {
+            panic!("Expected multiple config errors, received {error:?}");
+        };
+        assert_eq!(errors.len(), 3);
+
+        for field in [
+            "LiveExecEngineConfig.purge_closed_orders_buffer_mins",
+            "LiveExecEngineConfig.purge_closed_positions_buffer_mins",
+            "LiveExecEngineConfig.purge_account_events_lookback_mins",
+        ] {
+            assert!(errors.iter().any(
+                |e| matches!(e, ConfigError::Range { field: error_field, .. } if error_field == field)
+            ));
+        }
+    }
+
+    #[rstest]
     fn test_validate_runtime_support_rejects_invalid_rate_limit() {
         let config = LiveNodeConfig {
             risk_engine: LiveRiskEngineConfig {
@@ -1524,6 +1770,69 @@ mod tests {
 
         let error = config.validate_runtime_support().unwrap_err().to_string();
         assert!(error.contains("reconciliation_startup_delay_secs"));
+    }
+
+    #[rstest]
+    #[case(0.0)]
+    #[case(0.5e-9)]
+    #[case(-1.0)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    #[case(f64::NEG_INFINITY)]
+    #[case(f64::MAX)]
+    fn test_validate_runtime_support_rejects_invalid_exec_intervals(#[case] value: f64) {
+        let configs = [
+            (
+                "LiveExecEngineConfig.snapshot_positions_interval_secs",
+                LiveExecEngineConfig {
+                    snapshot_positions_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.open_check_interval_secs",
+                LiveExecEngineConfig {
+                    open_check_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.position_check_interval_secs",
+                LiveExecEngineConfig {
+                    position_check_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+            (
+                "LiveExecEngineConfig.own_books_audit_interval_secs",
+                LiveExecEngineConfig {
+                    own_books_audit_interval_secs: Some(value),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (expected_field, config) in configs {
+            let error = config.validate_runtime_support().unwrap_err();
+
+            assert!(matches!(
+                error,
+                ConfigError::Range { field, .. } if field == expected_field
+            ));
+        }
+    }
+
+    #[rstest]
+    fn test_validate_runtime_support_accepts_valid_exec_intervals() {
+        let config = LiveExecEngineConfig {
+            snapshot_positions_interval_secs: Some(1.25),
+            open_check_interval_secs: Some(2.5),
+            position_check_interval_secs: Some(3.75),
+            own_books_audit_interval_secs: Some(4.5),
+            ..Default::default()
+        };
+
+        assert!(config.validate_runtime_support().is_ok());
     }
 
     #[cfg(feature = "python")]
@@ -1724,7 +2033,8 @@ mod tests {
     }
 
     #[rstest]
-    #[expect(
+    // `allow` not `expect`: nightly clippy does not fire `float_cmp` inside `assert_eq!`
+    #[allow(
         clippy::float_cmp,
         reason = "asserts the exact configured default with no arithmetic involved"
     )]

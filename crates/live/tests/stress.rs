@@ -107,8 +107,8 @@ use nautilus_common::{
         DataEvent,
         execution::{CancelOrder, TradingCommand},
     },
-    msgbus,
-    runner::get_trading_cmd_sender,
+    msgbus::{self, MessagingSwitchboard},
+    runner::{SystemChannel, TradingCommandMessage, get_trading_cmd_sender},
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::{
@@ -167,7 +167,7 @@ fn sample_trade() -> TradeTick {
         instrument_id: InstrumentId::from("EUR/USD.SIM"),
         price: Price::from("1.10000"),
         size: Quantity::from(100_000),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::from("123456"),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::default(),
@@ -357,6 +357,11 @@ async fn stress_trade_burst() {
 
         assert_eq!(runner_delta.data_events, total as u64);
         assert_eq!(runner_delta.total_dispatched(), total as u64);
+        // Only the data events channel dispatches here, so it carries the whole total
+        assert_eq!(
+            runner_delta.data_events_busy_ns,
+            runner_delta.dispatch_busy_ns
+        );
         assert_runner_timing_advanced(&runner_delta);
 
         println!(
@@ -447,9 +452,10 @@ async fn stress_cancel_starvation() {
             // pure handler time. See the module doc for the full caveat.
             let pre_cmd = driver_exec_engine.borrow().command_count();
             let ts_init = driver_clock.borrow().timestamp_ns();
-            get_trading_cmd_sender().execute(TradingCommand::CancelOrder(sample_cancel(
-                seq as u64, ts_init,
-            )));
+            get_trading_cmd_sender().execute(TradingCommandMessage::new(
+                MessagingSwitchboard::exec_engine_execute(),
+                TradingCommand::CancelOrder(sample_cancel(seq as u64, ts_init)),
+            ));
 
             let mut yield_iters = 0u32;
 
@@ -492,6 +498,13 @@ async fn stress_cancel_starvation() {
             runner_delta.total_dispatched(),
             (trades_sent + cancels) as u64
         );
+        // Only data events and exec commands dispatch here, so they carry the whole total
+        assert_eq!(
+            runner_delta
+                .data_events_busy_ns
+                .saturating_add(runner_delta.exec_commands_busy_ns),
+            runner_delta.dispatch_busy_ns
+        );
         assert_runner_timing_advanced(&runner_delta);
 
         println!(
@@ -505,7 +518,8 @@ async fn stress_cancel_starvation() {
              runner.dispatch_busy_ns={} runner.elapsed_ns={} runner.maintenance_busy_ns={} \
              runner.external_msgbus_busy_ns={} runner.total_busy_ns={} \
              runner.dispatch_utilization={:.6} runner.loop_utilization={:.6} \
-             runner.mean_dispatch_ns={}",
+             runner.mean_dispatch_ns={} runner.mean_dispatch_ns.data_events={} \
+             runner.mean_dispatch_ns.exec_commands={}",
             cancels,
             trades_sent,
             total_elapsed.as_millis(),
@@ -530,6 +544,8 @@ async fn stress_cancel_starvation() {
             runner_delta.dispatch_utilization(),
             runner_delta.loop_utilization(),
             runner_delta.mean_dispatch_ns(),
+            runner_delta.channel_mean_dispatch_ns(SystemChannel::DataEvents),
+            runner_delta.channel_mean_dispatch_ns(SystemChannel::ExecCommands),
         );
 
         driver_handle.stop();

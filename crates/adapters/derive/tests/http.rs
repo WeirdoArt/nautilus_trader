@@ -36,7 +36,6 @@ use axum::{
     routing::post,
 };
 use nautilus_common::testing::wait_until_async;
-use nautilus_core::UnixNanos;
 use nautilus_derive::{
     common::{
         consts::{HEADER_LYRA_SIGNATURE, HEADER_LYRA_TIMESTAMP, HEADER_LYRA_WALLET},
@@ -45,11 +44,9 @@ use nautilus_derive::{
     },
     http::{
         DeriveCredentials, DeriveHttpClient,
-        query::{DeriveOrderParams, DeriveSignedEnvelope},
+        query::{DeriveCancelByLabelParams, DeriveOrderParams, DeriveSignedEnvelope},
     },
-    websocket::parse_candle_record,
 };
-use nautilus_model::data::BarType;
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
 use rust_decimal_macros::dec;
@@ -158,6 +155,14 @@ async fn handle_order(
     handle("/private/order", state, headers, body).await
 }
 
+async fn handle_cancel_by_label(
+    State(state): State<TestServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    handle("/private/cancel_by_label", state, headers, body).await
+}
+
 async fn handle_trade_history(
     State(state): State<TestServerState>,
     headers: HeaderMap,
@@ -212,6 +217,7 @@ async fn start_mock_server(state: TestServerState) -> SocketAddr {
         )
         .route("/public/get_tickers", post(handle_tickers))
         .route("/private/order", post(handle_order))
+        .route("/private/cancel_by_label", post(handle_cancel_by_label))
         .route("/health", axum::routing::get(handle_health))
         .with_state(state);
 
@@ -397,6 +403,30 @@ async fn test_send_private_attaches_all_lyra_auth_headers() {
 
 #[rstest]
 #[tokio::test]
+async fn test_cancel_order_by_label_http_preserves_count() {
+    let state = TestServerState::with_success_response();
+    *state.response_body.lock().await = load_json("common/ws_cancel_by_label_nonzero.json");
+    let addr = start_mock_server(state.clone()).await;
+
+    let client =
+        DeriveHttpClient::with_credentials(base_url(addr), test_credentials(), Some(5), None, None)
+            .unwrap();
+    let result = client
+        .cancel_by_label(&DeriveCancelByLabelParams::new(42, "CLIENT-ORDER-42"))
+        .await
+        .unwrap();
+
+    let captured = state.captured().await;
+    assert_eq!(captured.path, "/private/cancel_by_label");
+    assert_eq!(
+        captured.body,
+        json!({"subaccount_id": 42, "label": "CLIENT-ORDER-42"})
+    );
+    assert_eq!(result.cancelled_orders, 2);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_paced_http_writes_build_auth_headers_after_waiting() {
     let state = TestServerState::with_success_response();
     *state.response_body.lock().await = json!({
@@ -404,6 +434,9 @@ async fn test_paced_http_writes_build_auth_headers_after_waiting() {
         "result": {"order": load_json("perps/http_order_eth_partially_filled.json")},
     });
     let addr = start_mock_server(state.clone()).await;
+    // The fixed window is aligned to client construction, so measure from
+    // before the build to bound the reset wait.
+    let started = Instant::now();
     let client =
         DeriveHttpClient::with_credentials(base_url(addr), test_credentials(), Some(5), None, None)
             .unwrap();
@@ -431,7 +464,6 @@ async fn test_paced_http_writes_build_auth_headers_after_waiting() {
         trigger_type: None,
     };
 
-    let started = Instant::now();
     let requests = (0..7).map(|sequence| {
         let client = client.clone();
         let mut payload = payload.clone();
@@ -445,8 +477,9 @@ async fn test_paced_http_writes_build_auth_headers_after_waiting() {
     assert!(outcomes.iter().all(Result::is_ok));
     assert_eq!(captured.len(), 7);
     assert!(
-        elapsed >= Duration::from_millis(1_500),
-        "seven writes must exhaust the five-request burst, elapsed {elapsed:?}",
+        elapsed >= Duration::from_secs(4),
+        "writes past the five-request burst must wait for the discrete window \
+         reset (~5s), elapsed {elapsed:?}",
     );
 
     for request in captured {
@@ -681,48 +714,6 @@ async fn test_get_ticker_uses_get_tickers_and_selects_instrument(
     } else {
         assert!(ticker.option_pricing.is_none());
     }
-}
-
-#[rstest]
-#[tokio::test]
-#[ignore = "live network call against api.lyra.finance; run with --include-ignored"]
-async fn test_live_get_ticker_smoke() {
-    let client = DeriveHttpClient::new("https://api.lyra.finance", Some(10), None, None).unwrap();
-    let ticker = client
-        .get_ticker("ETH-PERP")
-        .await
-        .expect("live get_ticker must succeed");
-    assert_eq!(ticker.instrument_name.as_str(), "ETH-PERP");
-    // Perp tickers don't carry option_pricing; the option-chain path always
-    // probes a specific option instrument, so any non-zero mark price proves
-    // the wire shape is intact.
-    assert!(!ticker.mark_price.is_zero());
-}
-
-#[rstest]
-#[tokio::test]
-#[ignore = "live network call against api.lyra.finance; run with --include-ignored"]
-async fn test_live_get_candles_smoke() {
-    let client = DeriveHttpClient::new("https://api.lyra.finance", Some(10), None, None).unwrap();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let start_ts = now - 2 * 3600;
-
-    let candles = client
-        .get_candles("ETH-PERP", start_ts, now, 900)
-        .await
-        .expect("live get_candles must succeed");
-    assert!(!candles.is_empty(), "expected non-empty candle window");
-    let first = &candles[0];
-    assert!(first.high_price >= first.low_price);
-    assert!(first.timestamp_bucket >= start_ts);
-    assert!(first.timestamp_bucket <= now);
-
-    let bar_type = BarType::from("ETH-PERP.DERIVE-15-MINUTE-LAST-EXTERNAL");
-    let bar = parse_candle_record(first, bar_type, 2, 3, UnixNanos::default()).expect("bar parses");
-    assert_eq!(bar.bar_type, bar_type);
 }
 
 #[rstest]

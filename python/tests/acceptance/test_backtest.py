@@ -15,9 +15,10 @@
 """
 Acceptance tests for the v2 BacktestEngine.
 
-This suite mirrors the v1 acceptance suite under `tests/acceptance_tests/test_backtest.py`
-so we can validate v2 feature parity. Tests that depend on v2 features that have not yet
-been ported are marked with `pytest.skip` and a `v2 missing: ...` reason.
+This suite mirrors the v1 acceptance suite under
+`tests/acceptance_tests/test_backtest.py` so we can validate v2 feature parity. Tests
+that depend on v2 features that have not yet been ported are marked with `pytest.skip`
+and a `v2 missing: ...` reason.
 
 Most magic-number assertions from the v1 suite (msgbus counts, exact balances) are not
 replicated since v2's runtime has different internal counters; instead we assert on the
@@ -54,6 +55,7 @@ from nautilus_trader.model import OrderBookDelta
 from nautilus_trader.model import OrderBookDeltas
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
+from nautilus_trader.model import PositionSide
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
@@ -223,7 +225,7 @@ class TestBacktestAcceptanceTestsUSDJPY:
             self.usdjpy,
             bid_csv="fxcm/usdjpy-m1-bid-2013.csv",
             ask_csv="fxcm/usdjpy-m1-ask-2013.csv",
-            max_rows=2_000,  # ~8k ticks (4 ticks/bar) — keeps suite under a minute
+            max_rows=2_000,  # ~8k ticks (4 ticks/bar) - keeps suite under a minute
         )
         self.engine.add_data(ticks)
 
@@ -384,7 +386,7 @@ class TestBacktestAcceptanceTestsGBPUSDBarsInternal:
                     "atr_period": 20,
                     "trailing_atr_multiple": 0.01,
                     "trailing_offset_type": "PRICE",
-                    "trigger_type": "LAST_PRICE",
+                    "trigger_type": "BID_ASK",
                 },
             ),
         )
@@ -581,8 +583,8 @@ class TestBacktestAcceptanceTestsBTCUSDTEmaCrossTWAP:
 
         result = self.engine.get_result()
         orders = self.engine.cache.orders()
-        primary_orders = [o for o in orders if o.exec_spawn_id is None]
-        spawned_orders = [o for o in orders if o.exec_spawn_id is not None]
+        primary_orders = [o for o in orders if o.is_primary]
+        spawned_orders = [o for o in orders if o.is_spawned]
         assert result.iterations == len(bars)
         assert result.total_positions > 0
         assert primary_orders
@@ -727,7 +729,7 @@ class TestBacktestAcceptanceTestsETHUSDT:
 
 class TestBacktestAcceptanceTestsOrderBookImbalance:
     def setup_method(self):
-        self.engine = _engine()
+        self.engine = _engine(risk_bypass=True)
         self.venue = Venue("BETFAIR")
         self.gbp = Currency.from_str("GBP")
         self.instrument = _betfair_betting_instrument(selection_id=19248890)
@@ -1092,28 +1094,28 @@ def test_backtest_cash_margin_account_order_fill_position_parity_golden():
         aud_orders[OrderSide.BUY],
         OrderSide.BUY,
         Quantity.from_int(100_000),
-        0.7,
+        Decimal("0.70000"),
         ["1.40 USD"],
     )
     _assert_filled_market_order(
         aud_orders[OrderSide.SELL],
         OrderSide.SELL,
         Quantity.from_int(100_000),
-        0.7002,
+        Decimal("0.70020"),
         ["1.40 USD"],
     )
     _assert_filled_market_order(
         eth_orders[OrderSide.BUY],
         OrderSide.BUY,
         Quantity.from_str("0.50000"),
-        2000.0,
+        Decimal("2000.00"),
         ["0.10000000 USDT"],
     )
     _assert_filled_market_order(
         eth_orders[OrderSide.SELL],
         OrderSide.SELL,
         Quantity.from_str("0.50000"),
-        2001.0,
+        Decimal("2001.00"),
         ["0.10005000 USDT"],
     )
     _assert_closed_position(
@@ -1176,7 +1178,7 @@ def _assert_filled_market_order(
     order,
     side: OrderSide,
     quantity: Quantity,
-    avg_px: float,
+    avg_px: Decimal,
     commissions: list[str],
 ) -> None:
     assert order.side == side
@@ -1189,7 +1191,7 @@ def _assert_filled_market_order(
         assert filled_qty == quantity
     order_avg_px = getattr(order, "avg_px", None)
     if order_avg_px is None:
-        assert float(order.to_dict()["avg_px"]) == avg_px
+        assert Decimal(order.to_dict()["avg_px"]) == avg_px
     else:
         assert order_avg_px == avg_px
     raw_commissions = order.commissions()
@@ -1256,9 +1258,8 @@ class TestBacktestPnLAlignmentAcceptance:
     Validates that PnL is consistently calculated across the system.
 
     The v1 suite asserts equality between trader.generate_positions_report,
-    portfolio.realized_pnl, and account balance changes. v2's BacktestEngine does not
-    yet expose the trader/portfolio/account APIs externally, so we assert that the
-    relevant strategy ran and produced position cycles via BacktestResult.
+    portfolio.realized_pnl, and account balance changes. The v2 tests cover the
+    corresponding result summaries and post-run portfolio, cache, and account state.
 
     """
 
@@ -1341,11 +1342,7 @@ class TestBacktestPnLAlignmentAcceptance:
 
     def test_backtest_postrun_pnl_alignment(self):
         """
-        Mirrors GitHub issue #2856: positions report PnL == backtest post-run total PnL.
-
-        v2 backtest result does not expose the analyzer or positions report externally,
-        so we verify the engine ran the configured cycles and produced position events.
-
+        Checks the shorter open-close-reopen scenario through BacktestResult.
         """
         engine, audusd = self._build_engine(oms_type=OmsType.NETTING)
         engine.add_data(_build_pnl_quotes(audusd, periods=35, scenario="rising"))
@@ -1369,6 +1366,97 @@ class TestBacktestPnLAlignmentAcceptance:
         assert result.iterations == 35
         assert result.total_orders == len(actions)
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "oms_type",
+    [
+        pytest.param(OmsType.NETTING, id="netting"),
+        pytest.param(OmsType.HEDGING, id="hedging"),
+    ],
+)
+def test_backtest_postrun_realized_pnl_by_oms_type(oms_type):
+    engine = _engine()
+    audusd = TestInstrumentProvider.audusd_sim()
+    engine.add_venue(
+        venue=Venue("SIM"),
+        oms_type=oms_type,
+        account_type=AccountType.MARGIN,
+        base_currency=Currency.from_str("USD"),
+        starting_balances=[Money.from_str("1000000.00 USD")],
+    )
+    engine.add_instrument(audusd)
+    engine.add_data(_build_pnl_quotes(audusd, periods=70, scenario="multi_cycle"))
+
+    actions = [
+        [10, "BUY", "100000"],
+        [20, "SELL", "100000"],
+        [30, "BUY", "100000"],
+        [40, "SELL", "100000"],
+        [50, "SELL", "100000"],
+        [60, "BUY", "100000"],
+    ]
+    engine.add_strategy_from_config(
+        ImportableStrategyConfig(
+            strategy_path=TICK_SCHEDULED_STRATEGY,
+            config_path=TICK_SCHEDULED_CONFIG,
+            config={"instrument_id": str(audusd.id), "actions": actions},
+        ),
+    )
+
+    engine.run()
+    result = engine.get_result()
+    positions = engine.cache.positions()
+    positions.sort(key=lambda position: str(position.id))
+    snapshots = engine.cache.position_snapshots()
+
+    assert result.iterations == 70
+    assert result.total_orders == len(actions)
+
+    if oms_type == OmsType.NETTING:
+        assert engine.portfolio.realized_pnl(audusd.id) == Money.from_str("15.60 USD")
+        assert result.total_positions == 3
+        assert len(positions) == 1
+        assert len(snapshots) == 2
+
+        position = positions[0]
+        assert position.side == PositionSide.FLAT
+        assert position.quantity == Quantity.from_int(0)
+        assert not position.is_open
+        assert position.is_closed
+        assert position.event_count == 2
+        assert [snapshot.side for snapshot in snapshots] == [PositionSide.FLAT] * 2
+        assert [snapshot.quantity for snapshot in snapshots] == [Quantity.from_int(0)] * 2
+        assert [snapshot.is_open for snapshot in snapshots] == [False] * 2
+        assert [snapshot.is_closed for snapshot in snapshots] == [True] * 2
+        assert [snapshot.event_count for snapshot in snapshots] == [2] * 2
+        assert [snapshot.realized_pnl for snapshot in snapshots] + [position.realized_pnl] == [
+            Money.from_str("15.20 USD"),
+            Money.from_str("-14.80 USD"),
+            Money.from_str("15.20 USD"),
+        ]
+    else:
+        assert engine.portfolio.realized_pnl(audusd.id) == Money.from_str("-8.40 USD")
+        assert result.total_positions == 6
+        assert len(positions) == 6
+        assert snapshots == []
+        assert [position.side for position in positions] == [
+            PositionSide.LONG,
+            PositionSide.SHORT,
+            PositionSide.LONG,
+            PositionSide.SHORT,
+            PositionSide.SHORT,
+            PositionSide.LONG,
+        ]
+        assert [position.quantity for position in positions] == [Quantity.from_int(100_000)] * 6
+        assert [position.is_open for position in positions] == [True] * 6
+        assert [position.is_closed for position in positions] == [False] * 6
+        assert [position.event_count for position in positions] == [1] * 6
+        assert [position.realized_pnl for position in positions] == [
+            Money.from_str("-1.40 USD"),
+        ] * 6
+
+    engine.dispose()
 
 
 def _build_audusd_engine_with_quotes(periods: int = 3, oms_type=OmsType.HEDGING):
@@ -1552,7 +1640,7 @@ def test_synthetic_run_with_synthetic_trades():
                 instrument_id=ethusdt.id,
                 price=Price(price, precision=2),
                 size=Quantity(1.0, precision=5),
-                aggressor_side=AggressorSide.BUYER if i % 2 == 0 else AggressorSide.SELLER,
+                aggressor_side=AggressorSide.BUY if i % 2 == 0 else AggressorSide.SELL,
                 trade_id=TradeId(str(i)),
                 ts_event=ts,
                 ts_init=ts,
@@ -1626,9 +1714,8 @@ def test_engine_cache_shares_kernel_state():
     The ``BacktestEngine.cache`` getter must return a wrapper backed by the kernel's own
     cache (not a fresh detached one).
 
-    A regression that constructs
-    a new ``Cache`` per call would silently break parity assertions in the
-    rerun acceptance test.
+    A regression that constructs a new ``Cache`` per call would silently break parity
+    assertions in the rerun acceptance test.
 
     """
     engine = _engine()

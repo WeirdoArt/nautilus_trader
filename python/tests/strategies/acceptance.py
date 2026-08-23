@@ -16,7 +16,7 @@
 Strategies used by acceptance tests.
 
 Each strategy is importable via ImportableStrategyConfig. They aim to exercise specific
-engine behaviours — multi-cycle PnL accounting, cascading order submission, timer
+engine behaviours - multi-cycle PnL accounting, cascading order submission, timer
 firing, etc.
 
 """
@@ -521,7 +521,7 @@ class _EMACrossTrailingWorkflow(Strategy):
         self._update_indicators(bar)
         if not self._indicators_ready():
             return
-        if not self.portfolio.is_flat(self._instrument_id):
+        if not self.portfolio.is_net_flat(self._instrument_id):
             return
         if self.entry is not None and not self.entry.is_closed():
             return

@@ -49,7 +49,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Bar, Data, OrderBookDeltas_API},
+    data::{Bar, Data, OrderBookDeltas},
     enums::{AggregationSource, BookType},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -84,8 +84,11 @@ struct DataEventSink<'a> {
 }
 
 impl L3Sink for DataEventSink<'_> {
-    fn emit_deltas(&mut self, deltas: OrderBookDeltas_API) {
-        if let Err(e) = self.sender.send(DataEvent::Data(Data::Deltas(deltas))) {
+    fn emit_deltas(&mut self, deltas: OrderBookDeltas) {
+        if let Err(e) = self
+            .sender
+            .send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
+        {
             log::error!("Failed to send L3 deltas: {e}");
         }
     }
@@ -523,11 +526,10 @@ impl KrakenSpotDataClient {
                             context
                                 .book_sequence
                                 .store(next_sequence, Ordering::Relaxed);
-                            let api_deltas = OrderBookDeltas_API::new(deltas);
 
                             if let Err(e) = context
                                 .sender
-                                .send(DataEvent::Data(Data::Deltas(api_deltas)))
+                                .send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
                             {
                                 log::error!("Failed to send deltas: {e}");
                             }
@@ -557,7 +559,7 @@ impl KrakenSpotDataClient {
                         Ok(new_bar) => {
                             let key: (Ustr, u32) = (ohlc.symbol, ohlc.interval);
                             let new_interval_begin = UnixNanos::from(
-                                ohlc.interval_begin.timestamp_nanos_opt().unwrap_or(0) as u64,
+                                u64::try_from(ohlc.interval_begin.as_nanosecond()).unwrap_or(0),
                             );
 
                             if let Some((buffered_bar, buffered_begin)) = buffer.get(&key)
@@ -1152,6 +1154,8 @@ mod tests {
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -1303,12 +1307,12 @@ mod tests {
             symbol: Ustr::from("BTC/USD"),
             bids: Some(
                 (0..10)
-                    .map(|i| book_level(100.0 - f64::from(i), 1.0))
+                    .map(|i| book_level(Decimal::from(100 - i), Decimal::ONE))
                     .collect(),
             ),
             asks: Some(
                 (0..10)
-                    .map(|i| book_level(101.0 + f64::from(i), 1.0))
+                    .map(|i| book_level(Decimal::from(101 + i), Decimal::ONE))
                     .collect(),
             ),
             checksum: Some(0),
@@ -1334,7 +1338,7 @@ mod tests {
 
         let bid_update = KrakenWsBookData {
             symbol: Ustr::from("BTC/USD"),
-            bids: Some(vec![book_level(100.5, 1.0)]),
+            bids: Some(vec![book_level(dec!(100.5), Decimal::ONE)]),
             asks: Some(vec![]),
             checksum: Some(0),
             timestamp: "2024-01-01T00:00:01Z".parse().unwrap(),
@@ -1362,7 +1366,7 @@ mod tests {
         let ask_update = KrakenWsBookData {
             symbol: Ustr::from("BTC/USD"),
             bids: Some(vec![]),
-            asks: Some(vec![book_level(100.6, 1.0)]),
+            asks: Some(vec![book_level(dec!(100.6), Decimal::ONE)]),
             checksum: Some(0),
             timestamp: "2024-01-01T00:00:02Z".parse().unwrap(),
         };
@@ -1411,7 +1415,7 @@ mod tests {
         assert!(client.is_disconnected());
     }
 
-    fn book_level(price: f64, qty: f64) -> KrakenWsBookLevel {
+    fn book_level(price: Decimal, qty: Decimal) -> KrakenWsBookLevel {
         KrakenWsBookLevel { price, qty }
     }
 }

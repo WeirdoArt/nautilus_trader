@@ -38,7 +38,7 @@ use nautilus_binance::{
     futures::websocket::streams::client::BinanceFuturesWebSocketClient,
 };
 use nautilus_common::testing::wait_until_async;
-use nautilus_network::websocket::TransportBackend;
+use nautilus_network::{SocketState, SocketStateSink, websocket::TransportBackend};
 use rstest::rstest;
 use serde_json::json;
 
@@ -292,6 +292,25 @@ fn test_client_accepts_demo_environment() {
     );
 
     assert!(result.is_ok());
+}
+
+#[rstest]
+fn test_client_debug_redacts_url() {
+    let client = BinanceFuturesWebSocketClient::new(
+        BinanceProductType::CoinM,
+        BinanceEnvironment::Testnet,
+        None,
+        None,
+        Some("wss://dstream.binancefuture.com/ws/redacted".to_string()),
+        None,
+        TransportBackend::default(),
+    )
+    .unwrap();
+
+    let output = format!("{client:?}");
+
+    assert!(output.contains("url: \"<redacted>\""));
+    assert!(!output.contains("dstream.binancefuture.com"));
 }
 
 #[rstest]
@@ -881,7 +900,13 @@ async fn test_subscribe_futures_specific_streams() {
 #[tokio::test]
 async fn test_reconnection_after_server_drop() {
     let (addr, state) = start_test_server().await.unwrap();
-    let mut client = create_test_client(&addr);
+    let socket_states = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let socket_states_callback = Arc::clone(&socket_states);
+    let sink = SocketStateSink::new(move |socket_state| {
+        socket_states_callback.lock().unwrap().push(socket_state);
+    });
+
+    let mut client = create_test_client(&addr).with_state_sink(sink);
 
     client.connect().await.unwrap();
 
@@ -919,8 +944,22 @@ async fn test_reconnection_after_server_drop() {
         state.total_connections() > initial_total,
         "Expected at least one reconnection"
     );
+    wait_until_async(
+        || async { socket_states.lock().unwrap().len() == 3 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        *socket_states.lock().unwrap(),
+        vec![
+            SocketState::Connected,
+            SocketState::Disconnected,
+            SocketState::Connected,
+        ]
+    );
 
     client.close().await.unwrap();
+    assert_eq!(socket_states.lock().unwrap().len(), 3);
 }
 
 #[rstest]

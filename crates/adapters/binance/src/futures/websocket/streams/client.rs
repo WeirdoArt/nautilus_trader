@@ -37,6 +37,7 @@ use nautilus_common::live::get_runtime;
 use nautilus_core::{AtomicMap, string::secret::REDACTED};
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
+    SocketStateSink,
     mode::ConnectionMode,
     websocket::{
         PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
@@ -100,12 +101,14 @@ pub struct BinanceFuturesWebSocketClient {
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     transport_backend: TransportBackend,
+    proxy_url: Option<String>,
+    state_sink: Option<SocketStateSink>,
 }
 
 impl Debug for BinanceFuturesWebSocketClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(BinanceFuturesWebSocketClient))
-            .field("url", &self.url)
+            .field("url", &REDACTED)
             .field("product_type", &self.product_type)
             .field("credential", &self.credential.as_ref().map(|_| REDACTED))
             .field("heartbeat", &self.heartbeat)
@@ -160,7 +163,23 @@ impl BinanceFuturesWebSocketClient {
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
             transport_backend,
+            proxy_url: None,
+            state_sink: None,
         })
+    }
+
+    /// Configures the proxy used by every connection in the stream pool.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Configures socket state reporting for every connection in the stream pool.
+    #[must_use]
+    pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
+        self.state_sink = Some(state_sink);
+        self
     }
 
     /// Returns the product type (UsdM or CoinM).
@@ -215,8 +234,7 @@ impl BinanceFuturesWebSocketClient {
         self.slots.lock().expect("slots lock poisoned").push(slot);
 
         log::debug!(
-            "Connected to Binance Futures stream pool: url={}, product_type={:?}",
-            self.url,
+            "Connected to Binance Futures stream pool: product_type={:?}",
             self.product_type
         );
         Ok(())
@@ -301,9 +319,8 @@ impl BinanceFuturesWebSocketClient {
                 slots.len()
             };
             log::debug!(
-                "Pool slot {} connected: url={}, product_type={:?}",
+                "Pool slot {} connected: product_type={:?}",
                 slot_count - 1,
-                self.url,
                 self.product_type
             );
         }
@@ -422,6 +439,15 @@ impl BinanceFuturesWebSocketClient {
         });
     }
 
+    /// Replaces the complete instrument cache.
+    pub fn replace_instruments(&self, instruments: &[InstrumentAny]) {
+        let cache = instruments
+            .iter()
+            .map(|instrument| (instrument.raw_symbol().inner(), instrument.clone()))
+            .collect();
+        self.instruments_cache.store(cache);
+    }
+
     /// Update a single instrument in the cache.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
         self.instruments_cache
@@ -465,17 +491,18 @@ impl BinanceFuturesWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers,
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
-            proxy_url: None,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let keyed_quotas = vec![(
@@ -483,13 +510,13 @@ impl BinanceFuturesWebSocketClient {
             *BINANCE_WS_SUBSCRIPTION_QUOTA,
         )];
 
-        let client = WebSocketClient::connect(
+        let client = WebSocketClient::connect_with_state_sink(
             config,
             Some(raw_handler),
             Some(ping_handler),
-            None,
             keyed_quotas,
             Some(*BINANCE_WS_CONNECTION_QUOTA),
+            self.state_sink.clone(),
         )
         .await
         .map_err(|e| BinanceWsError::NetworkError(e.to_string()))?;
@@ -593,5 +620,32 @@ impl BinanceFuturesWebSocketClient {
             cancellation_token,
             connection_mode,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_with_proxy_preserves_proxy_url() {
+        let client = BinanceFuturesWebSocketClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Testnet,
+            None,
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+        )
+        .unwrap()
+        .with_proxy(Some("socks5://proxy.example:1080".to_string()));
+
+        assert_eq!(
+            client.proxy_url.as_deref(),
+            Some("socks5://proxy.example:1080")
+        );
     }
 }

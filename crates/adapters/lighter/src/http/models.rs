@@ -28,7 +28,7 @@ use ustr::Ustr;
 use crate::common::enums::{
     LighterCandleResolution, LighterFundingResolution, LighterMarketStatus, LighterOrderKind,
     LighterOrderSide, LighterOrderStatus, LighterOrderTimeInForce, LighterPositionMarginMode,
-    LighterProductType, LighterTradeType, LighterTriggerStatus,
+    LighterProductType, LighterTradeType, LighterTriggerStatus, LighterTxStatus,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -48,6 +48,22 @@ pub struct LighterNextNonce {
     pub code: i32,
     pub message: Option<String>,
     pub nonce: i64,
+}
+
+/// Response payload of `GET /api/v1/tx`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LighterTx {
+    pub code: i32,
+    pub message: Option<String>,
+    pub hash: String,
+    #[serde(rename = "type")]
+    pub tx_type: u8,
+    pub info: String,
+    pub event_info: String,
+    pub status: LighterTxStatus,
+    pub account_index: i64,
+    pub nonce: i64,
+    pub api_key_index: u8,
 }
 
 /// One account row from `GET /api/v1/account`.
@@ -75,7 +91,7 @@ pub struct LighterAccountsResponse {
 ///
 /// Lighter restricts maker-only keys to the 0ms speed-bump lane (PostOnly
 /// creates, modifies on ALO orders, cancel / cancel-all). Any tx kind outside
-/// that allowlist — for example `ApproveIntegrator` (tx_type 45) — is rejected
+/// that allowlist - for example `ApproveIntegrator` (tx_type 45) - is rejected
 /// with venue code `62007`. The adapter pre-flights this endpoint before
 /// submitting the integrator auto-approval so it can skip the doomed tx with
 /// a clear log line instead of swallowing the misleading 62007.

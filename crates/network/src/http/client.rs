@@ -44,29 +44,14 @@ const DEFAULT_HTTP2_KEEP_ALIVE_SECS: u64 = 30;
 /// caps already enforced on the WebSocket and raw-socket paths.
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 
-/// An HTTP client that supports rate limiting and timeouts.
+/// An asynchronous HTTP client with rate limiting, timeouts, and custom headers.
 ///
-/// Built on `reqwest` for async I/O. Allows per-endpoint and default quotas
-/// through a rate limiter.
-///
-/// This struct is designed to handle HTTP requests efficiently, providing
-/// support for rate limiting, timeouts, and custom headers. The client is
-/// built on top of `reqwest` and can be used for both synchronous and
-/// asynchronous HTTP requests.
+/// The client uses `reqwest` for I/O and supports default and per-key quotas. Multiple clients
+/// can share the same rate limiter when their requests consume one quota budget.
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.network", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.network")
-)]
 pub struct HttpClient {
-    /// The underlying HTTP client used to make requests.
     pub(crate) client: InnerHttpClient,
-    /// The rate limiter to control the request rate.
-    pub(crate) rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    pub(crate) rate_limiters: Arc<[Arc<RateLimiter<Ustr, MonotonicClock>>]>,
 }
 
 impl HttpClient {
@@ -113,6 +98,32 @@ impl HttpClient {
         proxy_url: Option<String>,
         rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
     ) -> Result<Self, HttpClientError> {
+        Self::new_with_rate_limiters(
+            headers,
+            header_keys,
+            timeout_secs,
+            proxy_url,
+            vec![rate_limiter],
+        )
+    }
+
+    /// Creates a new [`HttpClient`] instance sharing multiple externally-owned rate limiters.
+    ///
+    /// Each request awaits every limiter with the same keys. A limiter with no default quota
+    /// ignores keys it does not own, allowing independent quota scopes such as per-IP and
+    /// per-account limits to apply to one request.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    pub fn new_with_rate_limiters(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        rate_limiters: Vec<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+    ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
         // Build default headers
@@ -122,7 +133,7 @@ impl HttpClient {
             let header_name = HeaderName::from_str(&key)
                 .map_err(|e| HttpClientError::Error(format!("Invalid header name '{key}': {e}")))?;
             let header_value = HeaderValue::from_str(&value).map_err(|e| {
-                HttpClientError::Error(format!("Invalid header value '{value}': {e}"))
+                HttpClientError::Error(format!("Invalid header value for '{key}': {e}"))
             })?;
             header_map.insert(header_name, header_value);
         }
@@ -143,7 +154,7 @@ impl HttpClient {
         // Configure proxy if provided
         if let Some(proxy_url) = proxy_url {
             let proxy = reqwest::Proxy::all(&proxy_url)
-                .map_err(|e| HttpClientError::InvalidProxy(format!("{proxy_url}: {e}")))?;
+                .map_err(|_| HttpClientError::InvalidProxy("proxy URL is malformed".to_string()))?;
             client_builder = client_builder.proxy(proxy);
         }
 
@@ -151,29 +162,27 @@ impl HttpClient {
             .build()
             .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?;
 
-        // Pre-intern header keys as HeaderName, keeping both vectors aligned,
-        // an invalid key is an error: a silent drop would make response extraction read nothing.
-        let (valid_keys, header_names): (Vec<String>, Vec<HeaderName>) = header_keys
+        // Pre-intern header keys as HeaderName. An invalid key is an error: a silent drop would
+        // make response extraction read nothing.
+        let response_headers = header_keys
             .into_iter()
-            .map(|k| {
-                HeaderName::from_str(&k)
-                    .map(|name| (k.clone(), name))
-                    .map_err(|e| HttpClientError::Error(format!("Invalid header key '{k}': {e}")))
+            .map(|key| match HeaderName::from_str(&key) {
+                Ok(name) => Ok((key, name)),
+                Err(e) => Err(HttpClientError::Error(format!(
+                    "Invalid header key '{key}': {e}"
+                ))),
             })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .unzip();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let client = InnerHttpClient {
             client,
-            header_keys: Arc::from(valid_keys),
-            header_names: Arc::from(header_names),
+            response_headers: Arc::from(response_headers),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
 
         Ok(Self {
             client,
-            rate_limiter,
+            rate_limiters: rate_limiters.into(),
         })
     }
 
@@ -203,6 +212,32 @@ impl HttpClient {
             .await
     }
 
+    /// Sends an HTTP request while redacting the URL from logs and transport errors.
+    ///
+    /// Use this for endpoints whose path or other URL components can carry credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unable to send request or times out.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn request_with_url_redacted(
+        &self,
+        method: Method,
+        url: String,
+        params: Option<&HashMap<String, Vec<String>>>,
+        headers: Option<HashMap<String, String>>,
+        body: Option<Vec<u8>>,
+        timeout_secs: Option<u64>,
+        keys: Option<Vec<String>>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let keys = keys.map(into_ustr_vec);
+        self.await_rate_limits(keys.as_deref()).await;
+
+        self.client
+            .send_request_with_url_redacted(method, url, params, headers, body, timeout_secs)
+            .await
+    }
+
     /// Sends an HTTP request with serializable query parameters.
     ///
     /// This method accepts any type implementing `Serialize` for query parameters,
@@ -224,8 +259,7 @@ impl HttpClient {
         keys: Option<Vec<String>>,
     ) -> Result<HttpResponse, HttpClientError> {
         let keys = keys.map(into_ustr_vec);
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request_with_query(method, url, params, headers, body, timeout_secs)
@@ -248,12 +282,17 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         keys: Option<Vec<Ustr>>,
     ) -> Result<HttpResponse, HttpClientError> {
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request(method, url, params, headers, body, timeout_secs)
             .await
+    }
+
+    pub(crate) async fn await_rate_limits(&self, keys: Option<&[Ustr]>) {
+        for rate_limiter in self.rate_limiters.iter() {
+            rate_limiter.await_keys_ready(keys).await;
+        }
     }
 
     /// Sends an HTTP GET request.
@@ -345,18 +384,12 @@ impl HttpClient {
 
 /// Internal implementation backing [`HttpClient`].
 ///
-/// The client is backed by a [`reqwest::Client`] which keeps connections alive and
-/// can be cloned cheaply. The client also has a list of header fields to
-/// extract from the response.
-///
-/// The client returns an [`HttpResponse`]. The client filters only the key value
-/// for the give `header_keys`.
+/// The underlying [`reqwest::Client`] reuses pooled connections and is cheap to clone. Responses
+/// retain only configured header fields, and bodies larger than `max_response_bytes` are rejected.
 #[derive(Clone, Debug)]
 pub struct InnerHttpClient {
     pub(crate) client: reqwest::Client,
-    pub(crate) header_keys: Arc<[String]>,
-    pub(crate) header_names: Arc<[HeaderName]>,
-    /// Maximum response body size in bytes; bodies exceeding this are rejected.
+    pub(crate) response_headers: Arc<[(String, HeaderName)]>,
     pub(crate) max_response_bytes: usize,
 }
 
@@ -375,6 +408,34 @@ impl InnerHttpClient {
         body: Option<Vec<u8>>,
         timeout_secs: Option<u64>,
     ) -> Result<HttpResponse, HttpClientError> {
+        self.send_request_with_redaction(method, url, params, headers, body, timeout_secs, false)
+            .await
+    }
+
+    async fn send_request_with_url_redacted(
+        &self,
+        method: Method,
+        url: String,
+        params: Option<&HashMap<String, Vec<String>>>,
+        headers: Option<HashMap<String, String>>,
+        body: Option<Vec<u8>>,
+        timeout_secs: Option<u64>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        self.send_request_with_redaction(method, url, params, headers, body, timeout_secs, true)
+            .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn send_request_with_redaction(
+        &self,
+        method: Method,
+        url: String,
+        params: Option<&HashMap<String, Vec<String>>>,
+        headers: Option<HashMap<String, String>>,
+        body: Option<Vec<u8>>,
+        timeout_secs: Option<u64>,
+        redact_url: bool,
+    ) -> Result<HttpResponse, HttpClientError> {
         let full_url = encode_url_params(&url, params)?;
         self.send_request_internal(
             method,
@@ -383,6 +444,7 @@ impl InnerHttpClient {
             headers,
             body,
             timeout_secs,
+            redact_url,
         )
         .await
     }
@@ -404,7 +466,7 @@ impl InnerHttpClient {
         body: Option<Vec<u8>>,
         timeout_secs: Option<u64>,
     ) -> Result<HttpResponse, HttpClientError> {
-        self.send_request_internal(method, &url, query, headers, body, timeout_secs)
+        self.send_request_internal(method, &url, query, headers, body, timeout_secs, false)
             .await
     }
 
@@ -413,6 +475,7 @@ impl InnerHttpClient {
     /// # Errors
     ///
     /// Returns an error if unable to send request or times out.
+    #[expect(clippy::too_many_arguments)]
     async fn send_request_internal<Q: serde::Serialize>(
         &self,
         method: Method,
@@ -421,11 +484,14 @@ impl InnerHttpClient {
         headers: Option<HashMap<String, String>>,
         body: Option<Vec<u8>>,
         timeout_secs: Option<u64>,
+        redact_url: bool,
     ) -> Result<HttpResponse, HttpClientError> {
         let reqwest_url =
             Url::parse(url).map_err(|e| HttpClientError::from(format!("URL parse error: {e}")))?;
 
         let mut request_builder = self.client.request(method, reqwest_url);
+        let extra_header_count = headers.as_ref().map_or(0, HashMap::len);
+        let body_len = body.as_ref().map_or(0, Vec::len);
 
         if let Some(headers) = headers {
             let mut header_map = HeaderMap::with_capacity(headers.len());
@@ -433,13 +499,16 @@ impl InnerHttpClient {
                 let key = HeaderName::from_bytes(header_key.as_bytes())
                     .map_err(|e| HttpClientError::from(format!("Invalid header name: {e}")))?;
 
-                if let Some(old_value) = header_map.insert(
-                    key.clone(),
-                    header_value
-                        .parse()
-                        .map_err(|e| HttpClientError::from(format!("Invalid header value: {e}")))?,
-                ) {
-                    log::trace!("Replaced header '{key}': old={old_value:?}, new={header_value}");
+                if header_map
+                    .insert(
+                        key.clone(),
+                        header_value.parse().map_err(|e| {
+                            HttpClientError::from(format!("Invalid header value: {e}"))
+                        })?,
+                    )
+                    .is_some()
+                {
+                    log::trace!("Replaced duplicate request header '{key}'");
                 }
             }
             request_builder = request_builder.headers(header_map);
@@ -457,19 +526,26 @@ impl InnerHttpClient {
             Some(b) => request_builder
                 .body(b)
                 .build()
-                .map_err(HttpClientError::from)?,
-            None => request_builder.build().map_err(HttpClientError::from)?,
+                .map_err(|e| http_client_error(e, redact_url))?,
+            None => request_builder
+                .build()
+                .map_err(|e| http_client_error(e, redact_url))?,
         };
 
-        log::trace!("{} {}", request.method(), request.url());
+        let query_len = request.url().query().map_or(0, str::len);
+        log::trace!(
+            "Sending HTTP request: method={} extra_headers={extra_header_count} \
+             query_bytes={query_len} body_bytes={body_len}",
+            request.method(),
+        );
 
         let response = self
             .client
             .execute(request)
             .await
-            .map_err(HttpClientError::from)?;
+            .map_err(|e| http_client_error(e, redact_url))?;
 
-        self.to_response(response).await
+        self.to_response_internal(response, redact_url).await
     }
 
     /// Converts a `reqwest::Response` into an `HttpResponse`.
@@ -480,22 +556,37 @@ impl InnerHttpClient {
     ///
     /// Returns an error if unable to send request or times out.
     pub async fn to_response(&self, response: Response) -> Result<HttpResponse, HttpClientError> {
-        log::trace!("{response:?}");
+        self.to_response_internal(response, false).await
+    }
 
+    async fn to_response_internal(
+        &self,
+        response: Response,
+        redact_url: bool,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let status_code = response.status();
         let resp_headers = response.headers();
-        let mut headers =
-            HashMap::with_capacity(std::cmp::min(self.header_names.len(), resp_headers.len()));
+        let header_count = resp_headers.len();
+        let mut headers = HashMap::with_capacity(std::cmp::min(
+            self.response_headers.len(),
+            resp_headers.len(),
+        ));
 
-        for (name, key_str) in self.header_names.iter().zip(self.header_keys.iter()) {
+        for (key, name) in self.response_headers.iter() {
             if let Some(val) = resp_headers.get(name)
                 && let Ok(v) = val.to_str()
             {
-                headers.insert(key_str.clone(), v.to_owned());
+                headers.insert(key.clone(), v.to_owned());
             }
         }
 
-        let status = HttpStatus::new(response.status());
-        let body = self.read_body_capped(response).await?;
+        let status = HttpStatus::new(status_code);
+        let body = self.read_body_capped(response, redact_url).await?;
+
+        log::trace!(
+            "Received HTTP response: status={status_code} headers={header_count} body_bytes={}",
+            body.len(),
+        );
 
         Ok(HttpResponse {
             status,
@@ -518,6 +609,7 @@ impl InnerHttpClient {
     async fn read_body_capped(
         &self,
         mut response: Response,
+        redact_url: bool,
     ) -> Result<bytes::Bytes, HttpClientError> {
         let max = self.max_response_bytes;
 
@@ -531,7 +623,12 @@ impl InnerHttpClient {
         }
 
         let mut buf = bytes::BytesMut::new();
-        while let Some(chunk) = response.chunk().await.map_err(HttpClientError::from)? {
+
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| http_client_error(e, redact_url))?
+        {
             if buf.len() + chunk.len() > max {
                 return Err(HttpClientError::Error(format!(
                     "HTTP response body exceeds maximum of {max} bytes",
@@ -544,6 +641,14 @@ impl InnerHttpClient {
     }
 }
 
+fn http_client_error(error: reqwest::Error, redact_url: bool) -> HttpClientError {
+    if redact_url {
+        HttpClientError::from(error.without_url())
+    } else {
+        HttpClientError::from(error)
+    }
+}
+
 impl Default for InnerHttpClient {
     /// Creates a new default [`InnerHttpClient`] instance.
     ///
@@ -553,8 +658,7 @@ impl Default for InnerHttpClient {
         let client = reqwest::Client::new();
         Self {
             client,
-            header_keys: Arc::default(),
-            header_names: Arc::default(),
+            response_headers: Arc::default(),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
@@ -565,6 +669,7 @@ impl Default for InnerHttpClient {
 /// Returns `Cow::Borrowed` when no parameters need appending (zero-alloc fast path).
 /// Parameters can have multiple values per key (for doseq=True behavior).
 /// Preserves existing query strings in the URL by appending with '&' instead of '?'.
+/// The query is inserted before any fragment, which is preserved unchanged.
 fn encode_url_params<'a>(
     url: &'a str,
     params: Option<&HashMap<String, Vec<String>>>,
@@ -589,24 +694,150 @@ fn encode_url_params<'a>(
     let query_string = serde_urlencoded::to_string(pairs)
         .map_err(|e| HttpClientError::Error(format!("Failed to encode params: {e}")))?;
 
-    let separator = if url.contains('?') { '&' } else { '?' };
-    Ok(Cow::Owned(format!("{url}{separator}{query_string}")))
+    // The first literal '#' starts the fragment per RFC 3986 section 3.5.
+    // A data '#' in an earlier component must be percent-encoded as "%23".
+    let (base, fragment) = match url.split_once('#') {
+        Some((base, fragment)) => (base, Some(fragment)),
+        None => (url, None),
+    };
+    let separator = if base.contains('?') { '&' } else { '?' };
+
+    Ok(Cow::Owned(match fragment {
+        Some(fragment) => format!("{base}{separator}{query_string}#{fragment}"),
+        None => format!("{base}{separator}{query_string}"),
+    }))
+}
+
+#[cfg(test)]
+mod encode_url_params_tests {
+    use std::{borrow::Cow, collections::HashMap};
+
+    use rstest::rstest;
+
+    use super::encode_url_params;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (key, value) in pairs {
+            map.entry((*key).to_string())
+                .or_default()
+                .push((*value).to_string());
+        }
+
+        map
+    }
+
+    #[rstest]
+    #[case("https://x/y", "https://x/y?a=b")]
+    #[case("https://x/y?old=1", "https://x/y?old=1&a=b")]
+    #[case("https://x/y#frag", "https://x/y?a=b#frag")]
+    #[case("https://x/y?old=1#frag", "https://x/y?old=1&a=b#frag")]
+    #[case(
+        "https://x/y#section?display=full",
+        "https://x/y?a=b#section?display=full"
+    )]
+    #[case("https://x/y#", "https://x/y?a=b#")]
+    fn test_query_is_inserted_before_the_fragment(#[case] url: &str, #[case] expected: &str) {
+        let params = params(&[("a", "b")]);
+
+        assert_eq!(encode_url_params(url, Some(&params)).unwrap(), expected);
+    }
+
+    #[rstest]
+    fn test_url_is_borrowed_when_no_params_are_supplied() {
+        assert!(matches!(
+            encode_url_params("https://x/y#frag", None).unwrap(),
+            Cow::Borrowed("https://x/y#frag")
+        ));
+    }
+
+    #[rstest]
+    fn test_url_is_borrowed_when_params_are_empty() {
+        let params = HashMap::new();
+
+        assert!(matches!(
+            encode_url_params("https://x/y#frag", Some(&params)).unwrap(),
+            Cow::Borrowed("https://x/y#frag")
+        ));
+    }
 }
 
 #[cfg(test)]
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, num::NonZeroU32, sync::Mutex};
 
     use axum::{
         Router,
-        routing::{delete, get, patch, post},
+        body::to_bytes,
+        extract::Request,
+        response::IntoResponse,
+        routing::{any, delete, get, patch, post},
         serve,
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use http::status::StatusCode;
+    use log::{Level, LevelFilter, Log, Metadata, Record};
     use rstest::rstest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::oneshot,
+    };
 
     use super::*;
+
+    async fn capture_request(request: Request) -> impl IntoResponse {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        let default_header = parts.headers.get("x-default").unwrap().to_str().unwrap();
+        let request_header = parts.headers.get("x-request").unwrap().to_str().unwrap();
+        let query = parts.uri.query().unwrap_or_default();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let capture = format!(
+            "{}\n{}\n{query}\n{default_header}\n{request_header}\n{body}",
+            parts.method,
+            parts.uri.path(),
+        );
+
+        ([("x-response-id", "response-42")], capture)
+    }
+
+    #[derive(Default)]
+    struct CapturingTraceLogger {
+        messages: Mutex<Vec<(Level, String)>>,
+    }
+
+    impl CapturingTraceLogger {
+        fn clear(&self) {
+            self.messages.lock().unwrap().clear();
+        }
+
+        fn messages(&self) -> Vec<(Level, String)> {
+            self.messages.lock().unwrap().clone()
+        }
+    }
+
+    impl Log for CapturingTraceLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= Level::Trace
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURING_TRACE_LOGGER: CapturingTraceLogger = CapturingTraceLogger {
+        messages: Mutex::new(Vec::new()),
+    };
 
     fn create_router() -> Router {
         Router::new()
@@ -614,6 +845,7 @@ mod tests {
             .route("/post", post(|| async { StatusCode::OK }))
             .route("/patch", patch(|| async { StatusCode::OK }))
             .route("/delete", delete(|| async { StatusCode::OK }))
+            .route("/capture", any(capture_request))
             .route("/notfound", get(|| async { StatusCode::NOT_FOUND }))
             .route(
                 "/slow",
@@ -640,6 +872,66 @@ mod tests {
         Ok(addr)
     }
 
+    async fn spawn_rejecting_connect_proxy() -> (SocketAddr, oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        (addr, request_rx)
+    }
+
+    #[tokio::test]
+    async fn test_http_client_awaits_multiple_rate_limiters() {
+        let quota = Quota::per_minute(NonZeroU32::MIN);
+        let request_key = Ustr::from("scope:request");
+        let order_key = Ustr::from("scope:order");
+        let request_limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(request_key, quota)],
+        ));
+        let order_limiter = Arc::new(RateLimiter::new_with_quota(None, vec![(order_key, quota)]));
+        let client = HttpClient::new_with_rate_limiters(
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            vec![Arc::clone(&request_limiter), Arc::clone(&order_limiter)],
+        )
+        .unwrap();
+
+        client
+            .await_rate_limits(Some(&[request_key, order_key]))
+            .await;
+
+        assert!(request_limiter.check_key(&request_key).is_err());
+        assert!(order_limiter.check_key(&order_key).is_err());
+    }
+
     #[tokio::test]
     async fn test_get() {
         let addr = start_test_server().await.unwrap();
@@ -658,8 +950,105 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
         assert_eq!(String::from_utf8_lossy(&response.body), "hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_request_preserves_wire_semantics_and_extracts_response_headers() {
+        let addr = start_test_server().await.unwrap();
+        let mut default_headers = HashMap::new();
+        default_headers.insert("x-default".to_string(), "default-a".to_string());
+        let client = HttpClient::new(
+            default_headers,
+            vec!["x-response-id".to_string()],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut params = HashMap::new();
+        params.insert(
+            "tag".to_string(),
+            vec!["A B".to_string(), "C/D".to_string()],
+        );
+        let mut request_headers = HashMap::new();
+        request_headers.insert("x-request".to_string(), "request-b".to_string());
+
+        let response = client
+            .request(
+                Method::PUT,
+                format!("http://{addr}/capture?existing=seed"),
+                Some(&params),
+                Some(request_headers),
+                Some(b"payload-c".to_vec()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(
+            response.headers,
+            HashMap::from([("x-response-id".to_string(), "response-42".to_string())])
+        );
+        assert_eq!(
+            response.body.as_ref(),
+            b"PUT\n/capture\nexisting=seed&tag=A+B&tag=C%2FD\ndefault-a\nrequest-b\npayload-c"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_with_params_serializes_query_fields() {
+        #[derive(serde::Serialize)]
+        struct Query<'a> {
+            symbol: &'a str,
+            limit: u32,
+        }
+
+        let addr = start_test_server().await.unwrap();
+        let mut default_headers = HashMap::new();
+        default_headers.insert("x-default".to_string(), "default-d".to_string());
+        let client = HttpClient::new(
+            default_headers,
+            vec!["x-response-id".to_string()],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut request_headers = HashMap::new();
+        request_headers.insert("x-request".to_string(), "request-e".to_string());
+        let params = Query {
+            symbol: "BTC/USDT",
+            limit: 37,
+        };
+
+        let response = client
+            .request_with_params(
+                Method::GET,
+                format!("http://{addr}/capture"),
+                Some(&params),
+                Some(request_headers),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(
+            response.headers,
+            HashMap::from([("x-response-id".to_string(), "response-42".to_string())])
+        );
+        assert_eq!(
+            response.body.as_ref(),
+            b"GET\n/capture\nsymbol=BTC%2FUSDT&limit=37\ndefault-d\nrequest-e\n"
+        );
     }
 
     #[tokio::test]
@@ -685,7 +1074,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
         assert_eq!(response.body.len(), 1024 * 1024);
     }
 
@@ -736,7 +1125,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -771,7 +1160,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -792,7 +1181,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -813,7 +1202,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -842,13 +1231,10 @@ mod tests {
             .send_request(reqwest::Method::GET, url, None, None, None, Some(1))
             .await;
 
-        match result {
-            Err(HttpClientError::TimeoutError(msg)) => {
-                println!("Got expected timeout error: {msg}");
-            }
-            Err(e) => panic!("Expected a timeout error, was: {e:?}"),
-            Ok(resp) => panic!("Expected a timeout error, but was a successful response: {resp:?}"),
-        }
+        assert!(
+            matches!(&result, Err(HttpClientError::TimeoutError(_))),
+            "Expected a timeout error, was: {result:?}"
+        );
     }
 
     #[rstest]
@@ -864,6 +1250,194 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_http_client_without_proxy_requests_directly() {
+        let addr = start_test_server().await.unwrap();
+        let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(2), None).unwrap();
+        let response = client
+            .request(
+                Method::GET,
+                format!("http://{addr}/get"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("direct request");
+
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(response.body.as_ref(), b"hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_http_client_redacted_url_request_preserves_response() {
+        let addr = start_test_server().await.unwrap();
+        let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(2), None).unwrap();
+        let response = client
+            .request_with_url_redacted(
+                Method::GET,
+                format!("http://{addr}/get"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("direct request with URL redaction");
+
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(response.body.as_ref(), b"hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_http_client_redacted_url_request_removes_endpoint_from_error() {
+        const USERINFO_SECRET: &str = "transport-userinfo-secret";
+        const PATH_SECRET: &str = "transport-path-secret";
+        const QUERY_SECRET: &str = "transport-query-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!(
+            "http://rpc-user:{USERINFO_SECRET}@{addr}/{PATH_SECRET}?api_key={QUERY_SECRET}"
+        );
+        let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(1), None).unwrap();
+
+        let error = client
+            .request_with_url_redacted(Method::GET, url.clone(), None, None, None, None, None)
+            .await
+            .expect_err("an unreachable endpoint should fail");
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(USERINFO_SECRET));
+            assert!(!rendered.contains(PATH_SECRET));
+            assert!(!rendered.contains(QUERY_SECRET));
+            assert!(!rendered.contains(&url));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_client_redacted_url_request_removes_endpoint_from_trace_logs() {
+        const USERINFO_SECRET: &str = "trace-userinfo-secret";
+        const PATH_SECRET: &str = "trace-path-secret";
+        const QUERY_SECRET: &str = "trace-query-secret";
+        let _ = log::set_logger(&CAPTURING_TRACE_LOGGER);
+        log::set_max_level(LevelFilter::Trace);
+        CAPTURING_TRACE_LOGGER.clear();
+        let addr = start_test_server().await.unwrap();
+        let url = format!(
+            "http://rpc-user:{USERINFO_SECRET}@{addr}/{PATH_SECRET}?api_key={QUERY_SECRET}"
+        );
+        let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(2), None).unwrap();
+
+        let response = client
+            .request_with_url_redacted(Method::GET, url.clone(), None, None, None, None, None)
+            .await
+            .expect("credentialized endpoint should return an HTTP response");
+        let messages = CAPTURING_TRACE_LOGGER.messages();
+
+        assert_eq!(response.status.as_u16(), StatusCode::NOT_FOUND.as_u16());
+        assert!(messages.iter().any(|(level, message)| {
+            *level == Level::Trace && message.starts_with("Sending HTTP request: method=GET")
+        }));
+        assert!(messages.iter().any(|(level, message)| {
+            *level == Level::Trace
+                && message.starts_with("Received HTTP response: status=404 Not Found")
+        }));
+
+        for (_, message) in messages {
+            assert!(!message.contains(USERINFO_SECRET));
+            assert!(!message.contains(PATH_SECRET));
+            assert!(!message.contains(QUERY_SECRET));
+            assert!(!message.contains(&url));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_client_uses_connect_and_proxy_authorization_for_https() {
+        const USERNAME: &str = "proxytest";
+        const PASSWORD: &str = "fixture42";
+        let (proxy_addr, request_rx) = spawn_rejecting_connect_proxy().await;
+        let client = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            Some(2),
+            Some(format!("http://{USERNAME}:{PASSWORD}@{proxy_addr}")),
+        )
+        .unwrap();
+        let error = client
+            .request(
+                Method::GET,
+                "https://fixture.example.test/path".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("proxy should reject CONNECT");
+        let request = request_rx.await.expect("captured CONNECT request");
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("CONNECT request line");
+        let auth_value = lines
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    .then_some(value.trim())
+            })
+            .expect("Proxy-Authorization header");
+        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{PASSWORD}")));
+
+        assert_eq!(request_line, "CONNECT fixture.example.test:443 HTTP/1.1");
+        assert_eq!(auth_value, expected_auth);
+        assert!(!error.to_string().contains(PASSWORD));
+        assert!(!error.to_string().contains(&BASE64.encode(PASSWORD)));
+        assert!(!error.to_string().contains(&expected_auth));
+    }
+
+    #[tokio::test]
+    async fn test_http_client_unreachable_proxy_error_redacts_credentials() {
+        const USERNAME: &str = "proxy-user";
+        const SECRET: &str = "unreachable-proxy-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            Some(1),
+            Some(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")),
+        )
+        .unwrap();
+        let error = client
+            .request(
+                Method::GET,
+                "https://fixture.example.test/".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("unreachable proxy should fail");
+
+        assert!(!error.to_string().contains(SECRET));
+        assert!(!error.to_string().contains(&BASE64.encode(SECRET)));
+        assert!(
+            !error
+                .to_string()
+                .contains(&BASE64.encode(format!("{USERNAME}:{SECRET}")))
+        );
     }
 
     #[rstest]
@@ -915,6 +1489,26 @@ mod tests {
     }
 
     #[rstest]
+    fn test_http_client_invalid_proxy_error_redacts_credentials() {
+        const SECRET: &str = "unique-proxy-secret";
+        let result = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(format!("http://proxytest:{SECRET}@[::1")),
+        );
+        let error = result.expect_err("malformed proxy URL should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid proxy URL: proxy URL is malformed"
+        );
+        assert!(!error.to_string().contains(SECRET));
+    }
+
+    #[rstest]
     fn test_http_client_with_empty_proxy_string() {
         // Create client with an empty proxy URL string
         let result = HttpClient::new(
@@ -938,7 +1532,7 @@ mod tests {
         let client = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).unwrap();
         let response = client.get(url, None, None, None, None).await.unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
         assert_eq!(String::from_utf8_lossy(&response.body), "hello-world!");
     }
 
@@ -953,7 +1547,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -967,7 +1561,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 
     #[tokio::test]
@@ -978,6 +1572,6 @@ mod tests {
         let client = HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).unwrap();
         let response = client.delete(url, None, None, None, None).await.unwrap();
 
-        assert!(response.status.is_success());
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
     }
 }

@@ -8,7 +8,7 @@ current Lighter inventory.
 
 The setup uses a Rust [`LiveNode`][live-node], while the strategy itself runs as the native
 Rust `CompositeMarketMaker` strategy. If you are new to the Lighter adapter, start with
-[Get started with Lighter][lighter-get-started] first. That guide isolates the Rust and Python v2
+[Get started with Lighter][lighter-get-started] first. That guide isolates the Rust and Python
 data-client paths before this tutorial adds Databento signal data and live order flow.
 
 ## Introduction
@@ -70,7 +70,7 @@ inside the same event-driven runtime.
 
 ## Prerequisites
 
-- A Rust toolchain (MSRV 1.97.1 or newer).
+- A Rust toolchain (MSRV 1.98.0 or newer).
 - A Cargo project with the Nautilus, Lighter, and Databento crates as
   dependencies (see [Project setup](#project-setup)).
 - Python 3.12+ to regenerate the rendered panels.
@@ -137,10 +137,10 @@ your own project.
 perpetual to `NVDA-PERP.LIGHTER`. This pairs a licensed Databento signal with a
 Lighter traded market:
 
-| Role              | Instrument ID       | Source    | Notes                                      |
-| ----------------- | ------------------- | --------- | ------------------------------------------ |
-| Signal instrument | `NVDA.EQUS`         | Databento | EQUS.MINI top‑of‑book quote updates.       |
-| Target instrument | `NVDA-PERP.LIGHTER` | Lighter   | RWA perpetual traded through Lighter.      |
+| Role              | Instrument ID       | Source    | Notes                                 |
+| ----------------- | ------------------- | --------- | ------------------------------------- |
+| Signal instrument | `NVDA.EQUS`         | Databento | EQUS.MINI top-of-book quote updates.  |
+| Target instrument | `NVDA-PERP.LIGHTER` | Lighter   | RWA perpetual traded through Lighter. |
 
 Subscribing to `NVDA.EQUS` requests top-of-book (`mbp-1`) quotes for `NVDA` from
 Databento's `EQUS.MINI` dataset by default, delivered as a single `QuoteTick`
@@ -179,8 +179,8 @@ instead of hiding it in a custom strategy.
 There are two ways to run this: from a NautilusTrader checkout via the shipped
 [Lighter NVDA composite market maker example][example-script] binary, or by
 copying the node wiring below into a `main` in your own project that depends on
-the crates from [Project setup](#project-setup). A Python v2 counterpart also lives at
-[`python/examples/lighter/nvda_composite_mm.py`][python-example-script]; it uses the same Rust
+the crates from [Project setup](#project-setup). A Python counterpart also lives at
+[`examples/live/lighter/nvda_composite_mm.py`][python-example-script]; it uses the same Rust
 strategy through PyO3.
 
 From a checkout, with the credential variables set, the shipped binary connects
@@ -287,11 +287,11 @@ Databento residual remains zero until the first `NVDA.EQUS` quote arrives.
 | `signal_instrument_id`  | `NVDA.EQUS`         | Databento US Equities Mini signal feed.                        |
 | `trade_size`            | `0.05`              | Size per bid or ask.                                           |
 | `max_position`          | `0.20`              | Hard cap on net Lighter exposure.                              |
-| `half_spread_bps`       | `25`                | Half‑spread around the Lighter anchor.                         |
+| `half_spread_bps`       | `25`                | Half-spread around the Lighter anchor.                         |
 | `inventory_skew_factor` | `2.0`               | Price units per unit of net position.                          |
 | `signal_skew_factor`    | `55.0`              | Price units per unit of normalized Databento residual.         |
 | `signal_baseline`       | First signal mid    | Optional reference price for the Databento residual.           |
-| `requote_threshold_bps` | `5`                 | Anchor or signal‑impact move that triggers cancel and requote. |
+| `requote_threshold_bps` | `5`                 | Anchor or signal-impact move that triggers cancel and requote. |
 
 With a Lighter mid of `207.00` and `half_spread_bps=25`, the unskewed half
 spread is `0.5175` USD. If Databento is 30 bps above its baseline, a
@@ -372,4 +372,4 @@ the Lighter BBO only for post-only and basis limits.
 [market details endpoint]: https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails
 [Databento US Equities]: https://databento.com/blog/introducing-databento-us-equities
 [example-script]: https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/tutorials/src/bin/lighter_nvda_composite_mm.rs
-[python-example-script]: https://github.com/nautechsystems/nautilus_trader/blob/develop/python/examples/lighter/nvda_composite_mm.py
+[python-example-script]: https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/lighter/nvda_composite_mm.py

@@ -31,6 +31,32 @@ use crate::examples::{
     },
 };
 
+macro_rules! impl_strategy_config_base_getters {
+    ($type:ty) => {
+        #[pyo3_stub_gen::derive::gen_stub_pymethods]
+        #[pymethods]
+        impl $type {
+            #[getter]
+            #[pyo3(name = "strategy_id")]
+            fn py_strategy_id(&self) -> Option<StrategyId> {
+                self.base.strategy_id
+            }
+
+            #[getter]
+            #[pyo3(name = "order_id_tag")]
+            fn py_order_id_tag(&self) -> Option<&str> {
+                self.base.order_id_tag.as_deref()
+            }
+        }
+    };
+}
+
+impl_strategy_config_base_getters!(CompositeMarketMakerConfig);
+impl_strategy_config_base_getters!(GridMarketMakerConfig);
+impl_strategy_config_base_getters!(EmaCrossConfig);
+impl_strategy_config_base_getters!(DeltaNeutralVolConfig);
+impl_strategy_config_base_getters!(HurstVpinDirectionalConfig);
+
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl CompositeMarketMakerConfig {
@@ -165,6 +191,8 @@ impl GridMarketMakerConfig {
         requote_threshold_bps=5,
         expire_time_secs=None,
         on_cancel_resubmit=false,
+        use_uuid_client_order_ids=false,
+        use_hyphens_in_client_order_ids=true,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -179,6 +207,8 @@ impl GridMarketMakerConfig {
         requote_threshold_bps: u32,
         expire_time_secs: Option<u64>,
         on_cancel_resubmit: bool,
+        use_uuid_client_order_ids: bool,
+        use_hyphens_in_client_order_ids: bool,
     ) -> Self {
         let mut config = Self::builder()
             .instrument_id(instrument_id)
@@ -199,6 +229,9 @@ impl GridMarketMakerConfig {
         if let Some(tag) = order_id_tag {
             config.base.order_id_tag = Some(tag);
         }
+
+        config.base.use_uuid_client_order_ids = use_uuid_client_order_ids;
+        config.base.use_hyphens_in_client_order_ids = use_hyphens_in_client_order_ids;
 
         config
     }
@@ -246,6 +279,16 @@ impl GridMarketMakerConfig {
     #[getter]
     fn on_cancel_resubmit(&self) -> bool {
         self.on_cancel_resubmit
+    }
+
+    #[getter]
+    fn use_uuid_client_order_ids(&self) -> bool {
+        self.base.use_uuid_client_order_ids
+    }
+
+    #[getter]
+    fn use_hyphens_in_client_order_ids(&self) -> bool {
+        self.base.use_hyphens_in_client_order_ids
     }
 }
 
@@ -446,6 +489,12 @@ impl DeltaNeutralVolConfig {
     #[getter]
     fn entry_premium_offset_ticks(&self) -> Option<i32> {
         self.entry_premium_offset_ticks
+    }
+
+    #[getter]
+    #[pyo3(name = "iv_param_key")]
+    fn py_iv_param_key(&self) -> &str {
+        &self.iv_param_key
     }
 }
 

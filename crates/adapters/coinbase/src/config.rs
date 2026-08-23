@@ -29,7 +29,7 @@ use crate::common::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -68,6 +68,18 @@ pub struct CoinbaseDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(CoinbaseDataClientConfig {
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: CoinbaseEnvironment,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    derivatives_poll_interval_secs: u64,
+    transport_backend: TransportBackend,
+});
 
 impl Default for CoinbaseDataClientConfig {
     fn default() -> Self {
@@ -116,7 +128,7 @@ impl CoinbaseDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -167,6 +179,22 @@ pub struct CoinbaseExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(CoinbaseExecClientConfig {
+    base_url_rest: Option<String>,
+    base_url_ws: Option<String>,
+    environment: CoinbaseEnvironment,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    account_type: AccountType,
+    default_margin_type: Option<CoinbaseMarginType>,
+    default_leverage: Option<rust_decimal::Decimal>,
+    retail_portfolio_id: Option<String>,
+    transport_backend: TransportBackend,
+});
 
 impl Default for CoinbaseExecClientConfig {
     fn default() -> Self {

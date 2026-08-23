@@ -8,21 +8,41 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
+    "KRAKEN",
+    "KRAKEN_CLIENT_ID",
+    "KRAKEN_VENUE",
     "KrakenDataClientConfig",
     "KrakenDataClientFactory",
     "KrakenEnvironment",
     "KrakenExecClientConfig",
     "KrakenExecutionClientFactory",
-    "KrakenFuturesHttpClient",
-    "KrakenFuturesWebSocketClient",
     "KrakenProductType",
-    "KrakenSpotHttpClient",
-    "KrakenSpotWebSocketClient",
-    "kraken_product_type_from_symbol",
 ]
+
+KRAKEN: str
+KRAKEN_CLIENT_ID: model.ClientId
+KRAKEN_VENUE: model.Venue
 
 @typing.final
 class KrakenDataClientConfig:
+    @property
+    def product_type(self) -> KrakenProductType: ...
+    @property
+    def environment(self) -> KrakenEnvironment: ...
+    @property
+    def base_url(self) -> str | None: ...
+    @property
+    def validate_l3_checksum(self) -> bool: ...
+    @property
+    def timeout_secs(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def ws_idle_timeout_ms(self) -> int: ...
+    @property
+    def max_requests_per_second(self) -> int | None: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         product_type: KrakenProductType | None = None,
@@ -41,6 +61,14 @@ class KrakenDataClientConfig:
         max_requests_per_second: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
+    @property
+    def ws_public_url(self) -> str | None: ...
+    @property
+    def ws_private_url(self) -> str | None: ...
+    @property
+    def ws_l3_url(self) -> str | None: ...
 
 @typing.final
 class KrakenDataClientFactory:
@@ -49,6 +77,40 @@ class KrakenDataClientFactory:
 
 @typing.final
 class KrakenExecClientConfig:
+    @property
+    def trader_id(self) -> model.TraderId: ...
+    @property
+    def account_id(self) -> model.AccountId: ...
+    @property
+    def product_type(self) -> KrakenProductType: ...
+    @property
+    def environment(self) -> KrakenEnvironment: ...
+    @property
+    def base_url(self) -> str | None: ...
+    @property
+    def timeout_secs(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def auth_timeout_secs(self) -> int | None: ...
+    @property
+    def max_requests_per_second(self) -> int | None: ...
+    @property
+    def spot_account_type(self) -> model.AccountType: ...
+    @property
+    def default_leverage(self) -> int | None: ...
+    @property
+    def use_spot_position_reports(self) -> bool: ...
+    @property
+    def spot_positions_quote_currency(self) -> str: ...
+    @property
+    def margin_balance_asset(self) -> str | None: ...
+    @property
+    def use_ws_trade(self) -> bool: ...
+    @property
+    def ws_request_timeout_secs(self) -> int: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         trader_id: model.TraderId,
@@ -62,6 +124,7 @@ class KrakenExecClientConfig:
         proxy_url: str | None = None,
         timeout_secs: int | None = None,
         heartbeat_interval_secs: int | None = None,
+        auth_timeout_secs: int | None = None,
         max_requests_per_second: int | None = None,
         spot_account_type: model.AccountType | None = None,
         default_leverage: int | None = None,
@@ -72,6 +135,10 @@ class KrakenExecClientConfig:
         ws_request_timeout_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
+    @property
+    def ws_url(self) -> str | None: ...
 
 @typing.final
 class KrakenExecutionClientFactory:
@@ -187,6 +254,7 @@ class KrakenFuturesWebSocketClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         proxy_url: str | None = None,
+        auth_timeout_secs: int | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...

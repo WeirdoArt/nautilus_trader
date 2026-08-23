@@ -19,10 +19,10 @@ use nautilus_model::{
     data::BarSpecification,
     enums::{
         AggressorSide, AssetClass, BarAggregation, MarketStatusAction, OrderSide, OrderStatus,
-        OrderType, PositionSide, TimeInForce,
+        PositionSide, TimeInForce,
     },
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
 use super::consts::{
@@ -56,7 +56,7 @@ use super::consts::{
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -138,7 +138,7 @@ impl AxEnvironment {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -191,54 +191,48 @@ impl From<AxInstrumentState> for MarketStatusAction {
 
 /// Instrument category as returned by the AX Exchange API.
 ///
-/// Deserialization is case-insensitive; unrecognized values map to `Unknown`.
+/// Unrecognized values map to `Unknown`.
 ///
 /// # References
 /// - <https://docs.architect.exchange/api-reference/symbols-instruments/get-instruments>
 #[derive(
-    Clone, Copy, Debug, Display, Eq, PartialEq, Hash, AsRefStr, EnumIter, EnumString, Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "lowercase")]
 pub enum AxCategory {
     Fx,
     Equities,
     Metals,
     Energy,
+    EnergyEtfs,
+    Treasuries,
+    Compute,
     Crypto,
-    Rates,
-    Indexes,
+    #[serde(other)]
     Unknown,
-}
-
-impl<'de> Deserialize<'de> for AxCategory {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "fx" => Self::Fx,
-            "equities" => Self::Equities,
-            "metals" => Self::Metals,
-            "energy" => Self::Energy,
-            "crypto" => Self::Crypto,
-            "rates" => Self::Rates,
-            "indexes" => Self::Indexes,
-            _ => Self::Unknown,
-        })
-    }
 }
 
 impl From<AxCategory> for AssetClass {
     fn from(category: AxCategory) -> Self {
         match category {
             AxCategory::Fx => Self::FX,
-            AxCategory::Equities => Self::Equity,
+            AxCategory::Equities | AxCategory::EnergyEtfs => Self::Equity,
             AxCategory::Metals | AxCategory::Energy => Self::Commodity,
             AxCategory::Crypto => Self::Cryptocurrency,
-            AxCategory::Rates => Self::Debt,
-            AxCategory::Indexes => Self::Index,
-            AxCategory::Unknown => Self::Alternative,
+            AxCategory::Treasuries => Self::Debt,
+            AxCategory::Compute | AxCategory::Unknown => Self::Alternative,
         }
     }
 }
@@ -268,18 +262,18 @@ impl From<AxCategory> for AssetClass {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
 pub enum AxOrderSide {
     /// Buy order.
-    #[serde(rename = "B", alias = "Buy")]
+    #[serde(rename = "B")]
     #[strum(serialize = "B")]
     Buy,
     /// Sell order.
-    #[serde(rename = "S", alias = "Sell")]
+    #[serde(rename = "S")]
     #[strum(serialize = "S")]
     Sell,
 }
@@ -287,8 +281,8 @@ pub enum AxOrderSide {
 impl From<AxOrderSide> for AggressorSide {
     fn from(side: AxOrderSide) -> Self {
         match side {
-            AxOrderSide::Buy => Self::Buyer,
-            AxOrderSide::Sell => Self::Seller,
+            AxOrderSide::Buy => Self::Buy,
+            AxOrderSide::Sell => Self::Sell,
         }
     }
 }
@@ -323,6 +317,36 @@ impl TryFrom<OrderSide> for AxOrderSide {
     }
 }
 
+/// How a perpetual symbol's funding accrues over a trading day.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/get-funding-slots>
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxFundingVariant {
+    /// A single settlement at the trading-day close.
+    DailyClose,
+    /// A fixed number of intraday slots, each charging its share of the day's TWAP premium.
+    IntradayTwap,
+}
+
+/// Status of one funding slot within a `GET /funding-slots` trading day.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/get-funding-slots>
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxFundingSlotStatus {
+    /// Slot funding has settled.
+    Realized,
+    /// Slot funding is forecast from current mark and underlying TWAPs.
+    Projected,
+    /// Slot did not settle (for example a holiday or suspension); see the slot `reason`.
+    Skipped,
+    /// Slot is scheduled but not yet realized or projected.
+    Pending,
+}
+
 /// Order status as returned by the AX Exchange API.
 ///
 /// # References
@@ -350,7 +374,7 @@ impl TryFrom<OrderSide> for AxOrderSide {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -434,7 +458,7 @@ impl From<AxOrderStatus> for OrderStatus {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -486,75 +510,6 @@ impl TryFrom<TimeInForce> for AxTimeInForce {
     }
 }
 
-/// Order type as defined by the AX Exchange API.
-///
-/// # References
-/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Display,
-    Eq,
-    PartialEq,
-    Hash,
-    AsRefStr,
-    EnumIter,
-    EnumString,
-    Serialize,
-    Deserialize,
-)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        eq,
-        eq_int,
-        frozen,
-        hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE",
-    )
-)]
-pub enum AxOrderType {
-    /// Market order; execute immediately at best available price.
-    Market,
-    /// Limit order; execute no worse than the limit price specified.
-    Limit,
-    /// Stop-limit order; if the trigger price is breached, place a limit order.
-    StopLossLimit,
-    /// Take-profit order; if the trigger price is breached, place a limit order.
-    /// Note: Not currently implemented by Architect.
-    TakeProfitLimit,
-}
-
-impl From<AxOrderType> for OrderType {
-    fn from(order_type: AxOrderType) -> Self {
-        match order_type {
-            AxOrderType::Market => Self::Market,
-            AxOrderType::Limit => Self::Limit,
-            AxOrderType::StopLossLimit => Self::StopLimit,
-            AxOrderType::TakeProfitLimit => Self::LimitIfTouched,
-        }
-    }
-}
-
-impl TryFrom<OrderType> for AxOrderType {
-    type Error = &'static str;
-
-    fn try_from(order_type: OrderType) -> Result<Self, Self::Error> {
-        match order_type {
-            OrderType::Market => Ok(Self::Market),
-            OrderType::Limit => Ok(Self::Limit),
-            OrderType::StopLimit => Ok(Self::StopLossLimit),
-            OrderType::LimitIfTouched => Ok(Self::TakeProfitLimit),
-            _ => Err("Unsupported order type for AX"),
-        }
-    }
-}
-
 /// Market data subscription level.
 ///
 /// The AX API uses `LEVEL_1`, `LEVEL_2`, `LEVEL_3` on the wire (with underscore
@@ -588,7 +543,7 @@ impl TryFrom<OrderType> for AxOrderType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -775,7 +730,7 @@ pub enum AxOrderRequestType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -836,7 +791,7 @@ pub enum AxMdWsMessageType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -911,7 +866,7 @@ pub enum AxOrderWsMessageType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -951,7 +906,7 @@ pub enum AxCancelReason {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        module = "nautilus_trader.adapters.architect_ax",
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
@@ -1045,6 +1000,14 @@ mod tests {
     }
 
     #[rstest]
+    #[case("\"Buy\"")]
+    #[case("\"Sell\"")]
+    fn test_order_side_rejects_long_form(#[case] json: &str) {
+        let error = serde_json::from_str::<AxOrderSide>(json).unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+    }
+
+    #[rstest]
     #[case(AxOrderStatus::Pending, "\"PENDING\"")]
     #[case(AxOrderStatus::Accepted, "\"ACCEPTED\"")]
     #[case(AxOrderStatus::PartiallyFilled, "\"PARTIALLY_FILLED\"")]
@@ -1076,19 +1039,6 @@ mod tests {
 
         let parsed: AxTimeInForce = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, tif);
-    }
-
-    #[rstest]
-    #[case(AxOrderType::Market, "\"MARKET\"")]
-    #[case(AxOrderType::Limit, "\"LIMIT\"")]
-    #[case(AxOrderType::StopLossLimit, "\"STOP_LOSS_LIMIT\"")]
-    #[case(AxOrderType::TakeProfitLimit, "\"TAKE_PROFIT_LIMIT\"")]
-    fn test_order_type_serialization(#[case] order_type: AxOrderType, #[case] expected: &str) {
-        let json = serde_json::to_string(&order_type).unwrap();
-        assert_eq!(json, expected);
-
-        let parsed: AxOrderType = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, order_type);
     }
 
     #[rstest]
@@ -1190,22 +1140,33 @@ mod tests {
 
     #[rstest]
     #[case("\"fx\"", AxCategory::Fx)]
-    #[case("\"FX\"", AxCategory::Fx)]
-    #[case("\"Fx\"", AxCategory::Fx)]
     #[case("\"equities\"", AxCategory::Equities)]
-    #[case("\"EQUITIES\"", AxCategory::Equities)]
     #[case("\"metals\"", AxCategory::Metals)]
-    #[case("\"Metals\"", AxCategory::Metals)]
     #[case("\"energy\"", AxCategory::Energy)]
+    #[case("\"energy_etfs\"", AxCategory::EnergyEtfs)]
+    #[case("\"treasuries\"", AxCategory::Treasuries)]
+    #[case("\"compute\"", AxCategory::Compute)]
     #[case("\"crypto\"", AxCategory::Crypto)]
-    #[case("\"rates\"", AxCategory::Rates)]
-    #[case("\"indexes\"", AxCategory::Indexes)]
     #[case("\"something_new\"", AxCategory::Unknown)]
-    fn test_category_deserialization_case_insensitive(
-        #[case] json: &str,
-        #[case] expected: AxCategory,
-    ) {
+    fn test_category_deserialization(#[case] json: &str, #[case] expected: AxCategory) {
         let parsed: AxCategory = serde_json::from_str(json).unwrap();
         assert_eq!(parsed, expected);
+    }
+
+    #[rstest]
+    #[case(AxCategory::Fx, AssetClass::FX)]
+    #[case(AxCategory::Equities, AssetClass::Equity)]
+    #[case(AxCategory::EnergyEtfs, AssetClass::Equity)]
+    #[case(AxCategory::Metals, AssetClass::Commodity)]
+    #[case(AxCategory::Energy, AssetClass::Commodity)]
+    #[case(AxCategory::Crypto, AssetClass::Cryptocurrency)]
+    #[case(AxCategory::Treasuries, AssetClass::Debt)]
+    #[case(AxCategory::Compute, AssetClass::Alternative)]
+    #[case(AxCategory::Unknown, AssetClass::Alternative)]
+    fn test_category_asset_class_mapping(
+        #[case] category: AxCategory,
+        #[case] expected: AssetClass,
+    ) {
+        assert_eq!(AssetClass::from(category), expected);
     }
 }

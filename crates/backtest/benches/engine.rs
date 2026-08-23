@@ -15,12 +15,19 @@
 
 //! End-to-end benchmarks for the v2 [`BacktestEngine`] run path.
 //!
-//! Each case builds a full engine with a simulated venue, instrument, market data, and optional
-//! strategy outside the measured section. The timed section is `BacktestEngine::run`, while
-//! teardown happens after timing so global message-bus cleanup does not pollute the run profile.
+//! Each case runs a full engine with a simulated venue, instrument, market data, and optional
+//! strategy. Existing groups and `canonical/run_preloaded` build outside the measured section and
+//! time `BacktestEngine::run`. `canonical/load_build_run` includes data loading and engine setup.
+//! Teardown happens after timing so global message-bus cleanup does not pollute either profile.
 //!
 //! Workloads:
+//! - `canonical/run_preloaded`: replay-only, scheduled market-order, passive limit-order, and
+//!   bar-EMA workloads over the same preloaded checked-in data.
+//! - `canonical/load_build_run`: the same four workloads including CSV loading, engine setup, and
+//!   `BacktestEngine::run`.
 //! - `market_data_replay`: interleaved quote and trade ticks with no strategy orders.
+//! - `market_data_replay_4_streams`: the same events split across four streams to exercise heap
+//!   merging.
 //! - `alternating_market_orders`: quote-driven strategy submitting market orders through the full
 //!   strategy, risk, execution client, exchange, matching engine, cache, and portfolio path.
 //! - `passive_limit_orders`: quote-driven strategy accumulating resting limit orders so
@@ -33,6 +40,9 @@
 //!   while quote and trade ticks drive matching and trigger evaluation.
 //!
 //! Run with `cargo bench -p nautilus-backtest --bench engine`.
+
+#[path = "engine/canonical.rs"]
+mod canonical;
 
 use std::{
     fmt::Debug,
@@ -51,7 +61,7 @@ use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, IndexPriceUpdate,
         InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick, depth::DEPTH10_LEN,
+        OrderBookDepth10, QuoteTick, TradeTick, depth::DEPTH10_LEN,
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, BarAggregation, BookAction, BookType,
@@ -67,6 +77,7 @@ use nautilus_trading::{Strategy, StrategyConfig, StrategyCore, nautilus_strategy
 use rust_decimal::Decimal;
 
 const QUOTE_COUNTS: &[usize] = &[1_000, 10_000];
+const DATA_STREAM_COUNT: usize = 4;
 const DATA_ROUTE_COUNT: usize = 1_000;
 const ORDER_SWEEP_QUOTE_COUNT: usize = 1_000;
 const ORDER_TYPE_SWEEP_ORDERS: usize = 9;
@@ -77,6 +88,27 @@ const MARKET_ORDER_INTERVAL: usize = 10;
 const PASSIVE_ORDER_INTERVAL: usize = 20;
 const GTD_ORDER_INTERVAL: usize = 20;
 const GTD_EXPIRY_OFFSET_NS: u64 = TRADE_OFFSET_NS / 2;
+
+fn bench_canonical(c: &mut Criterion) {
+    canonical::verify_matrix().expect("canonical workload matrix should match its fingerprints");
+
+    let mut group = c.benchmark_group("backtest_engine/canonical");
+
+    for scenario in canonical::SCENARIOS {
+        let fixture = canonical::load_fixture().expect("canonical workload fixture should load");
+        let data_count = fixture.len();
+        group.throughput(Throughput::Elements(data_count as u64));
+
+        group.bench_function(BenchmarkId::new("run_preloaded", scenario.name()), |b| {
+            b.iter_custom(|iters| canonical::run_preloaded_iterations(iters, scenario, &fixture));
+        });
+        group.bench_function(BenchmarkId::new("load_build_run", scenario.name()), |b| {
+            b.iter_custom(|iters| canonical::run_full_iterations(iters, scenario));
+        });
+    }
+
+    group.finish();
+}
 
 fn bench_run(c: &mut Criterion) {
     let mut group = c.benchmark_group("backtest_engine/run");
@@ -92,8 +124,23 @@ fn bench_run(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter_custom(|iters| {
-                    run_engine_iterations(iters, data_count, 0, || {
+                    run_engine_iterations(iters, data_count, OrderCounts::default(), || {
                         build_market_data_replay(data.clone())
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!("market_data_replay_{DATA_STREAM_COUNT}_streams"),
+                data_count,
+            ),
+            &data,
+            |b, data| {
+                b.iter_custom(|iters| {
+                    run_engine_iterations(iters, data_count, OrderCounts::default(), || {
+                        build_market_data_replay_multi_stream(data.clone())
                     })
                 });
             },
@@ -105,9 +152,15 @@ fn bench_run(c: &mut Criterion) {
             |b, data| {
                 let expected_orders = quote_count / MARKET_ORDER_INTERVAL;
                 b.iter_custom(|iters| {
-                    run_engine_iterations(iters, data_count, expected_orders, || {
-                        build_alternating_market_orders(data.clone(), quote_count)
-                    })
+                    run_engine_iterations(
+                        iters,
+                        data_count,
+                        OrderCounts {
+                            filled: expected_orders,
+                            ..Default::default()
+                        },
+                        || build_alternating_market_orders(data.clone(), quote_count),
+                    )
                 });
             },
         );
@@ -118,9 +171,15 @@ fn bench_run(c: &mut Criterion) {
             |b, data| {
                 let expected_orders = quote_count / PASSIVE_ORDER_INTERVAL;
                 b.iter_custom(|iters| {
-                    run_engine_iterations(iters, data_count, expected_orders, || {
-                        build_passive_limit_orders(data.clone(), quote_count)
-                    })
+                    run_engine_iterations(
+                        iters,
+                        data_count,
+                        OrderCounts {
+                            canceled: expected_orders,
+                            ..Default::default()
+                        },
+                        || build_passive_limit_orders(data.clone(), quote_count),
+                    )
                 });
             },
         );
@@ -134,8 +193,10 @@ fn bench_run(c: &mut Criterion) {
                     run_engine_iterations_with_expired_orders(
                         iters,
                         data_count,
-                        expected_orders,
-                        expected_orders,
+                        OrderCounts {
+                            expired: expected_orders,
+                            ..Default::default()
+                        },
                         || build_gtd_limit_expiry(data.clone(), quote_count),
                     )
                 });
@@ -188,7 +249,7 @@ fn bench_data_routes(c: &mut Criterion) {
         group.throughput(Throughput::Elements(data_count as u64));
         group.bench_with_input(BenchmarkId::new(name, data_count), &data, |b, data| {
             b.iter_custom(|iters| {
-                run_engine_iterations(iters, data_count, 0, || {
+                run_engine_iterations(iters, data_count, OrderCounts::default(), || {
                     build_engine_with_config(data.clone(), None, config)
                 })
             });
@@ -210,18 +271,27 @@ fn bench_order_types(c: &mut Criterion) {
         &data,
         |b, data| {
             b.iter_custom(|iters| {
-                run_engine_iterations(iters, data_count, ORDER_TYPE_SWEEP_ORDERS, || {
-                    build_engine_with_config(
-                        data.clone(),
-                        Some(StrategyWorkload::OrderSweep(OrderTypeSweep::new(
-                            instrument_id,
-                        ))),
-                        EngineBuildConfig {
-                            reject_stop_orders: false,
-                            ..Default::default()
-                        },
-                    )
-                })
+                run_engine_iterations(
+                    iters,
+                    data_count,
+                    OrderCounts {
+                        filled: ORDER_TYPE_SWEEP_ORDERS - 1,
+                        canceled: 1,
+                        ..Default::default()
+                    },
+                    || {
+                        build_engine_with_config(
+                            data.clone(),
+                            Some(StrategyWorkload::OrderSweep(OrderTypeSweep::new(
+                                instrument_id,
+                            ))),
+                            EngineBuildConfig {
+                                reject_stop_orders: false,
+                                ..Default::default()
+                            },
+                        )
+                    },
+                )
             });
         },
     );
@@ -229,10 +299,26 @@ fn bench_order_types(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OrderCounts {
+    open: usize,
+    filled: usize,
+    rejected: usize,
+    canceled: usize,
+    expired: usize,
+    unexpected: usize,
+}
+
+impl OrderCounts {
+    const fn total(self) -> usize {
+        self.open + self.filled + self.rejected + self.canceled + self.expired + self.unexpected
+    }
+}
+
 fn run_engine_iterations<F>(
     iters: u64,
     expected_iterations: usize,
-    expected_orders: usize,
+    expected_orders: OrderCounts,
     mut build_engine: F,
 ) -> Duration
 where
@@ -250,7 +336,8 @@ where
 
         black_box(engine.iteration());
         assert_eq!(engine.iteration(), expected_iterations);
-        assert_eq!(engine.get_result().total_orders, expected_orders);
+        assert_eq!(engine.get_result().total_orders, expected_orders.total());
+        assert_eq!(order_counts(&engine), expected_orders);
         engine.dispose();
     }
 
@@ -260,8 +347,7 @@ where
 fn run_engine_iterations_with_expired_orders<F>(
     iters: u64,
     expected_iterations: usize,
-    expected_orders: usize,
-    expected_expired_orders: usize,
+    expected_orders: OrderCounts,
     mut build_engine: F,
 ) -> Duration
 where
@@ -279,7 +365,8 @@ where
 
         black_box(engine.iteration());
         assert_eq!(engine.iteration(), expected_iterations);
-        assert_eq!(engine.get_result().total_orders, expected_orders);
+        assert_eq!(engine.get_result().total_orders, expected_orders.total());
+        assert_eq!(order_counts(&engine), expected_orders);
 
         {
             let cache = engine.kernel().cache();
@@ -287,7 +374,7 @@ where
             let closed_orders = cache.orders_closed(None, None, None, None, None);
             assert_eq!(
                 closed_orders.len(),
-                expected_expired_orders,
+                expected_orders.expired,
                 "expected all GTD benchmark orders to be closed",
             );
             let expired_orders = closed_orders
@@ -295,7 +382,7 @@ where
                 .filter(|order| order.status() == OrderStatus::Expired)
                 .count();
             assert_eq!(
-                expired_orders, expected_expired_orders,
+                expired_orders, expected_orders.expired,
                 "expected all closed GTD benchmark orders to be expired",
             );
         }
@@ -306,8 +393,54 @@ where
     elapsed
 }
 
+fn order_counts(engine: &BacktestEngine) -> OrderCounts {
+    let cache = engine.kernel().cache();
+    let cache = cache.borrow();
+    let mut counts = OrderCounts::default();
+
+    for order in cache.orders(None, None, None, None, None) {
+        let status = order.status();
+        if status.is_open() {
+            counts.open += 1;
+        } else {
+            match status {
+                OrderStatus::Denied | OrderStatus::Rejected => counts.rejected += 1,
+                OrderStatus::Canceled => counts.canceled += 1,
+                OrderStatus::Expired => counts.expired += 1,
+                OrderStatus::Filled => counts.filled += 1,
+                _ => counts.unexpected += 1,
+            }
+        }
+    }
+
+    counts
+}
+
 fn build_market_data_replay(data: Vec<Data>) -> BacktestEngine {
     build_engine_with_config(data, None, EngineBuildConfig::default())
+}
+
+fn build_market_data_replay_multi_stream(data: Vec<Data>) -> BacktestEngine {
+    build_engine_with_data_streams(
+        split_data_streams(data, DATA_STREAM_COUNT),
+        None,
+        EngineBuildConfig::default(),
+    )
+}
+
+fn split_data_streams(data: Vec<Data>, stream_count: usize) -> Vec<Vec<Data>> {
+    assert!(stream_count > 1);
+    assert!(data.len() >= stream_count);
+    let stream_capacity = data.len().div_ceil(stream_count);
+    let mut streams: Vec<Vec<Data>> = (0..stream_count)
+        .map(|_| Vec::with_capacity(stream_capacity))
+        .collect();
+
+    for (index, item) in data.into_iter().enumerate() {
+        streams[index % stream_count].push(item);
+    }
+
+    streams
 }
 
 fn build_alternating_market_orders(data: Vec<Data>, quote_count: usize) -> BacktestEngine {
@@ -366,6 +499,14 @@ fn build_engine_with_config(
     strategy: Option<StrategyWorkload>,
     build_config: EngineBuildConfig,
 ) -> BacktestEngine {
+    build_engine_with_data_streams(vec![data], strategy, build_config)
+}
+
+fn build_engine_with_data_streams(
+    data_streams: Vec<Vec<Data>>,
+    strategy: Option<StrategyWorkload>,
+    build_config: EngineBuildConfig,
+) -> BacktestEngine {
     let config = BacktestEngineConfig {
         logging: LoggerConfig::from_spec("bypass_logging")
             .expect("benchmark logger config should be valid"),
@@ -410,9 +551,11 @@ fn build_engine_with_config(
         None => {}
     }
 
-    engine
-        .add_data(data, None, true, true)
-        .expect("market data should be added");
+    for data in data_streams {
+        engine
+            .add_data(data, None, true, true)
+            .expect("market data stream should be added");
+    }
     engine
 }
 
@@ -426,9 +569,9 @@ fn generate_market_data(instrument_id: InstrumentId, quote_count: usize) -> Vec<
         let ask = price_from_cents(mid_cents + 5);
         let trade_price = price_from_cents(mid_cents);
         let aggressor_side = if i % 2 == 0 {
-            AggressorSide::Buyer
+            AggressorSide::Buy
         } else {
-            AggressorSide::Seller
+            AggressorSide::Sell
         };
 
         data.push(Data::Quote(QuoteTick::new(
@@ -540,9 +683,10 @@ fn generate_l2_delta_data(instrument_id: InstrumentId, event_count: usize) -> Ve
         if i.is_multiple_of(2) {
             data.push(Data::Delta(bid));
         } else {
-            data.push(Data::Deltas(OrderBookDeltas_API::new(
-                OrderBookDeltas::new(instrument_id, vec![bid, ask]),
-            )));
+            data.push(Data::Deltas(Box::new(OrderBookDeltas::new(
+                instrument_id,
+                vec![bid, ask],
+            ))));
         }
     }
 
@@ -628,19 +772,19 @@ fn generate_price_status_funding_data(
             MarketStatusAction::Trading
         };
 
-        data.push(Data::MarkPriceUpdate(MarkPriceUpdate::new(
+        data.push(Data::MarkPrice(MarkPriceUpdate::new(
             instrument_id,
             price,
             UnixNanos::from(ts),
             UnixNanos::from(ts),
         )));
-        data.push(Data::IndexPriceUpdate(IndexPriceUpdate::new(
+        data.push(Data::IndexPrice(IndexPriceUpdate::new(
             instrument_id,
             price,
             UnixNanos::from(ts + 1),
             UnixNanos::from(ts + 1),
         )));
-        data.push(Data::FundingRateUpdate(FundingRateUpdate::new(
+        data.push(Data::FundingRate(FundingRateUpdate::new(
             instrument_id,
             Decimal::new(1, 4),
             None,
@@ -696,7 +840,7 @@ fn generate_order_trigger_data(instrument_id: InstrumentId, quote_count: usize) 
             instrument_id,
             Price::from(trade_price.as_str()),
             Quantity::from("1.000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::from(format!("OT-{i}").as_str()),
             trade_ts.into(),
             trade_ts.into(),
@@ -732,7 +876,7 @@ impl AlternatingMarketOrders {
         Self {
             core: StrategyCore::new(config),
             instrument_id,
-            trade_size: Quantity::from("0.010"),
+            trade_size: Quantity::from("0.011"),
             max_orders,
             quote_count: 0,
             orders_submitted: 0,
@@ -1225,5 +1369,11 @@ fn passive_limit_price(side: OrderSide, order_index: usize) -> Price {
     Price::from(price_from_cents(cents).as_str())
 }
 
-criterion_group!(benches, bench_run, bench_data_routes, bench_order_types);
+criterion_group!(
+    benches,
+    bench_canonical,
+    bench_run,
+    bench_data_routes,
+    bench_order_types
+);
 criterion_main!(benches);

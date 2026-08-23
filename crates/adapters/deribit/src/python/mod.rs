@@ -34,9 +34,9 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::consts::DERIBIT,
+    common::consts::{DERIBIT, DERIBIT_CLIENT_ID, DERIBIT_VENUE},
     config::{DeribitDataClientConfig, DeribitExecClientConfig},
-    data_types::{DeribitVolatilityIndex, register_deribit_custom_data},
+    data_types::{DeribitBookSummary, DeribitVolatilityIndex, register_deribit_custom_data},
     factories::{DeribitDataClientFactory, DeribitExecutionClientFactory},
 };
 
@@ -92,13 +92,16 @@ fn extract_deribit_exec_config(
     }
 }
 
-/// Loaded as `nautilus_pyo3.deribit`.
+/// Exposed through `nautilus_trader.adapters.deribit`.
 ///
 /// # Errors
 ///
 /// Returns an error if any bindings fail to register with the Python module.
 #[pymodule]
 pub fn deribit(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(stringify!(DERIBIT), DERIBIT)?;
+    m.add(stringify!(DERIBIT_CLIENT_ID), *DERIBIT_CLIENT_ID)?;
+    m.add(stringify!(DERIBIT_VENUE), *DERIBIT_VENUE)?;
     m.add_class::<super::http::client::DeribitHttpClient>()?;
     m.add_class::<super::websocket::client::DeribitWebSocketClient>()?;
     m.add_class::<crate::common::enums::DeribitCurrency>()?;
@@ -106,6 +109,7 @@ pub fn deribit(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::DeribitEnvironment>()?;
     m.add_class::<crate::websocket::enums::DeribitUpdateInterval>()?;
     m.add_class::<DeribitVolatilityIndex>()?;
+    m.add_class::<DeribitBookSummary>()?;
     m.add_class::<DeribitDataClientConfig>()?;
     m.add_class::<DeribitExecClientConfig>()?;
     m.add_class::<DeribitDataClientFactory>()?;
@@ -151,6 +155,7 @@ pub fn deribit(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     register_deribit_custom_data();
     let _result = ensure_rust_extractor_registered::<DeribitVolatilityIndex>();
+    let _book_summary = ensure_rust_extractor_registered::<DeribitBookSummary>();
 
     Ok(())
 }

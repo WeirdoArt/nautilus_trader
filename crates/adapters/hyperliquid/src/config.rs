@@ -15,6 +15,8 @@
 
 //! Configuration structures for the Hyperliquid adapter.
 
+use std::fmt::Debug;
+
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -31,14 +33,11 @@ use crate::common::{
 /// a full WebSocket reconnect after `stale_stream_max_targeted_resubscribes`
 /// failed attempts; fresh data resets the ladder. See the Hyperliquid integration
 /// guide ("Stream health and recovery") for details.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -95,6 +94,23 @@ pub struct HyperliquidDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(HyperliquidDataClientConfig {
+    environment: HyperliquidEnvironment,
+    base_url_ws: Option<String>,
+    base_url_http: Option<String>,
+    http_timeout_secs: u64,
+    ws_timeout_secs: u64,
+    update_instruments_interval_mins: u64,
+    transport_backend: TransportBackend,
+    stale_stream_receive_timeout_secs: u64,
+    stream_health_check_interval_secs: u64,
+    stale_stream_warning_cooldown_secs: u64,
+    stale_stream_recovery_enabled: bool,
+    stale_stream_recovery_cooldown_secs: u64,
+    stale_stream_max_targeted_resubscribes: u32,
+});
+
 impl Default for HyperliquidDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -133,15 +149,59 @@ impl HyperliquidDataClientConfig {
     }
 }
 
+impl Debug for HyperliquidDataClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct(stringify!(HyperliquidDataClientConfig))
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("base_url_ws", &self.base_url_ws)
+            .field("base_url_http", &self.base_url_http)
+            .field("proxy_url", &self.proxy_url)
+            .field("environment", &self.environment)
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("ws_timeout_secs", &self.ws_timeout_secs)
+            .field(
+                "stale_stream_receive_timeout_secs",
+                &self.stale_stream_receive_timeout_secs,
+            )
+            .field(
+                "stream_health_check_interval_secs",
+                &self.stream_health_check_interval_secs,
+            )
+            .field(
+                "stale_stream_warning_cooldown_secs",
+                &self.stale_stream_warning_cooldown_secs,
+            )
+            .field(
+                "stale_stream_recovery_enabled",
+                &self.stale_stream_recovery_enabled,
+            )
+            .field(
+                "stale_stream_recovery_cooldown_secs",
+                &self.stale_stream_recovery_cooldown_secs,
+            )
+            .field(
+                "stale_stream_max_targeted_resubscribes",
+                &self.stale_stream_max_targeted_resubscribes,
+            )
+            .field(
+                "update_instruments_interval_mins",
+                &self.update_instruments_interval_mins,
+            )
+            .field("transport_backend", &self.transport_backend)
+            .finish()
+    }
+}
+
 /// Configuration for the Hyperliquid execution client.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -217,6 +277,25 @@ pub struct HyperliquidExecClientConfig {
     pub outcome_settlement_poll_secs: u64,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
+    vault_address: Option<String>,
+    account_address: Option<String>,
+    environment: HyperliquidEnvironment,
+    base_url_ws: Option<String>,
+    base_url_http: Option<String>,
+    base_url_exchange: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    normalize_prices: bool,
+    market_order_slippage_bps: u32,
+    include_builder_attribution: bool,
+    ws_post_timeout_secs: u64,
+    transport_backend: TransportBackend,
+});
+
 impl Default for HyperliquidExecClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -246,6 +325,41 @@ impl HyperliquidExecClientConfig {
         self.base_url_http
             .clone()
             .unwrap_or_else(|| info_url(self.environment).to_string())
+    }
+}
+
+impl Debug for HyperliquidExecClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct(stringify!(HyperliquidExecClientConfig))
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("vault_address", &self.vault_address)
+            .field("account_address", &self.account_address)
+            .field("base_url_ws", &self.base_url_ws)
+            .field("base_url_http", &self.base_url_http)
+            .field("base_url_exchange", &self.base_url_exchange)
+            .field("proxy_url", &self.proxy_url)
+            .field("environment", &self.environment)
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay_initial_ms", &self.retry_delay_initial_ms)
+            .field("retry_delay_max_ms", &self.retry_delay_max_ms)
+            .field("normalize_prices", &self.normalize_prices)
+            .field("market_order_slippage_bps", &self.market_order_slippage_bps)
+            .field(
+                "include_builder_attribution",
+                &self.include_builder_attribution,
+            )
+            .field("transport_backend", &self.transport_backend)
+            .field("ws_post_timeout_secs", &self.ws_post_timeout_secs)
+            .field(
+                "outcome_settlement_poll_secs",
+                &self.outcome_settlement_poll_secs,
+            )
+            .finish()
     }
 }
 
@@ -347,5 +461,33 @@ stale_stream_max_targeted_resubscribes = 5
             toml::from_str("include_builder_attribution = false").unwrap();
 
         assert!(!config.include_builder_attribution);
+    }
+
+    #[rstest]
+    fn test_data_config_debug_redacts_private_key() {
+        let config = HyperliquidDataClientConfig {
+            private_key: Some(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            ..HyperliquidDataClientConfig::default()
+        };
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[rstest]
+    fn test_exec_config_debug_redacts_private_key() {
+        let config = HyperliquidExecClientConfig {
+            private_key: Some(
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            ..HyperliquidExecClientConfig::default()
+        };
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 }

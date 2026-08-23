@@ -28,17 +28,18 @@ use nautilus_core::{
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
-    data::{Data, OrderBookDeltas, OrderBookDeltas_API, QuoteTick},
+    data::{Data, OrderBookDeltas, QuoteTick},
     enums::{BookType, OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
-    python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
+    python::{data::data_to_pyobject, instruments::pyobject_to_instrument_any},
     reports::{FillReport, OrderStatusReport},
     types::Quantity,
 };
 use nautilus_network::websocket::{SubscriptionState, TransportBackend};
 use pyo3::{IntoPyObjectExt, prelude::*};
+use rust_decimal_macros::dec;
 
 use crate::{
     common::{
@@ -68,7 +69,7 @@ use crate::{
 impl KrakenFuturesWebSocketClient {
     /// WebSocket client for the Kraken Futures v1 streaming API.
     #[new]
-    #[pyo3(signature = (environment=None, base_url=None, heartbeat_secs=60, api_key=None, api_secret=None, proxy_url=None))]
+    #[pyo3(signature = (environment=None, base_url=None, heartbeat_secs=60, api_key=None, api_secret=None, proxy_url=None, auth_timeout_secs=None))]
     fn py_new(
         environment: Option<KrakenEnvironment>,
         base_url: Option<String>,
@@ -76,6 +77,7 @@ impl KrakenFuturesWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         proxy_url: Option<String>,
+        auth_timeout_secs: Option<u64>,
     ) -> Self {
         let env = environment.unwrap_or(KrakenEnvironment::Live);
         let demo = env == KrakenEnvironment::Demo;
@@ -88,6 +90,7 @@ impl KrakenFuturesWebSocketClient {
             url,
             heartbeat_secs,
             credential,
+            auth_timeout_secs,
             TransportBackend::default(),
             proxy_url,
         )
@@ -762,7 +765,10 @@ fn handle_open_orders_delta(
 
     order_instrument_map.insert(delta.order.order_id.clone(), instrument.id());
 
-    let qty = Quantity::new(delta.order.qty, instrument.size_precision());
+    let Ok(qty) = Quantity::from_decimal_dp(delta.order.qty, instrument.size_precision()) else {
+        log::error!("Failed to parse order quantity: {}", delta.order.qty);
+        return;
+    };
     venue_order_qty.insert(delta.order.order_id.clone(), qty);
 
     match parse_futures_ws_order_status_report(
@@ -926,15 +932,13 @@ fn handle_ticker(
 
     if let Some(mark_price) = parse_futures_ws_mark_price(ticker, instrument, ts_init) {
         Python::attach(|py| {
-            let py_obj = data_to_pycapsule(py, Data::MarkPriceUpdate(mark_price));
-            call_python_threadsafe(py, call_soon, callback, py_obj);
+            send_data_to_python(py, Data::MarkPrice(mark_price), call_soon, callback);
         });
     }
 
     if let Some(index_price) = parse_futures_ws_index_price(ticker, instrument, ts_init) {
         Python::attach(|py| {
-            let py_obj = data_to_pycapsule(py, Data::IndexPriceUpdate(index_price));
-            call_python_threadsafe(py, call_soon, callback, py_obj);
+            send_data_to_python(py, Data::IndexPrice(index_price), call_soon, callback);
         });
     }
 
@@ -962,8 +966,7 @@ fn handle_trade(
     match parse_futures_ws_trade_tick(trade, instrument, ts_init) {
         Ok(tick) => {
             Python::attach(|py| {
-                let py_obj = data_to_pycapsule(py, Data::Trade(tick));
-                call_python_threadsafe(py, call_soon, callback, py_obj);
+                send_data_to_python(py, Data::Trade(tick), call_soon, callback);
             });
         }
         Err(e) => log::error!("Failed to parse futures trade tick: {e}"),
@@ -1025,9 +1028,7 @@ fn handle_book_snapshot(
             let deltas_key = format!("deltas:{}", snapshot.product_id);
             if subscriptions.get_reference_count(&deltas_key) > 0 {
                 Python::attach(|py| {
-                    let py_obj =
-                        data_to_pycapsule(py, Data::Deltas(OrderBookDeltas_API::new(deltas)));
-                    call_python_threadsafe(py, call_soon, callback, py_obj);
+                    send_data_to_python(py, Data::Deltas(Box::new(deltas)), call_soon, callback);
                 });
             }
         }
@@ -1081,9 +1082,7 @@ fn handle_book_delta(
             let deltas_key = format!("deltas:{}", delta.product_id);
             if subscriptions.get_reference_count(&deltas_key) > 0 {
                 Python::attach(|py| {
-                    let py_obj =
-                        data_to_pycapsule(py, Data::Deltas(OrderBookDeltas_API::new(deltas)));
-                    call_python_threadsafe(py, call_soon, callback, py_obj);
+                    send_data_to_python(py, Data::Deltas(Box::new(deltas)), call_soon, callback);
                 });
             }
         }
@@ -1106,9 +1105,9 @@ fn maybe_emit_quote(
         return;
     };
 
-    let bid = bid_price.as_f64();
-    let ask = ask_price.as_f64();
-    if bid > 0.0 && (ask - bid) / bid > 0.25 {
+    let bid = bid_price.as_decimal();
+    let ask = ask_price.as_decimal();
+    if bid > dec!(0) && (ask - bid) / bid > dec!(0.25) {
         log::debug!("Filtered quote with wide spread: bid={bid}, ask={ask}");
         return;
     }
@@ -1130,7 +1129,13 @@ fn maybe_emit_quote(
     last_quotes.insert(instrument_id, quote);
 
     Python::attach(|py| {
-        let py_obj = data_to_pycapsule(py, Data::Quote(quote));
-        call_python_threadsafe(py, call_soon, callback, py_obj);
+        send_data_to_python(py, Data::Quote(quote), call_soon, callback);
     });
+}
+
+fn send_data_to_python(py: Python<'_>, data: Data, call_soon: &Py<PyAny>, callback: &Py<PyAny>) {
+    match data_to_pyobject(py, data) {
+        Ok(py_obj) => call_python_threadsafe(py, call_soon, callback, py_obj),
+        Err(e) => log::error!("Failed to convert data to Python object: {e}"),
+    }
 }

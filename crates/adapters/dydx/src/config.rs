@@ -249,7 +249,7 @@ impl Default for DydxAdapterConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -304,6 +304,11 @@ pub struct DydxDataClientConfig {
     pub per_channel_subscription_limit: usize,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DydxDataClientConfig {
+    network: DydxNetwork,
+});
+
 impl DydxDataClientConfig {
     /// Returns whether this is a testnet configuration.
     #[must_use]
@@ -323,7 +328,7 @@ impl Default for DydxDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -389,6 +394,15 @@ pub struct DydxExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DydxExecClientConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    network: DydxNetwork,
+    wallet_address: Option<String>,
+    subaccount_number: u32,
+});
 
 impl Default for DydxExecClientConfig {
     fn default() -> Self {

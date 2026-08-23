@@ -22,6 +22,7 @@ automatically and should not define __init__.
 
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
+from nautilus_trader.common import ImportableActorConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import ContingencyType
@@ -120,13 +121,18 @@ class ControllerRegistrationProbe(Controller):
 
 class ControllerCreatedStrategy(Strategy):
     started = 0
+    stopped = 0
 
     @classmethod
     def reset(cls):
         cls.started = 0
+        cls.stopped = 0
 
     def on_start(self):
         type(self).started += 1
+
+    def on_stop(self):
+        type(self).stopped += 1
 
 
 class StrategyCreatingController(Controller):
@@ -147,6 +153,103 @@ class StrategyCreatingController(Controller):
                 config={"strategy_id": "ControllerCreatedStrategy-001"},
             ),
         )
+
+
+class ControllerCreatedActor(DataActor):
+    started = 0
+    stopped = 0
+
+    @classmethod
+    def reset(cls):
+        cls.started = 0
+        cls.stopped = 0
+
+    def on_start(self):
+        type(self).started += 1
+
+    def on_stop(self):
+        type(self).stopped += 1
+
+
+class ActorLifecycleController(Controller):
+    """
+    Drives a created actor through the `*_from_id` control aliases.
+
+    Also attempts to remove itself, which the controller must ignore.
+
+    """
+
+    created_actor_id = None
+    steps: list[str] = []
+
+    @classmethod
+    def reset(cls):
+        cls.created_actor_id = None
+        cls.steps = []
+
+    def on_start(self):
+        actor_id = self.create_actor_from_config(
+            ImportableActorConfig(
+                actor_path="tests.unit.common.actor:ControllerCreatedActor",
+                config_path="tests.unit.common.actor:TestControllerConfig",
+                config={"actor_id": "ControllerCreatedActor-001"},
+            ),
+            start=False,
+        )
+        type(self).created_actor_id = actor_id
+        type(self).steps.append("created")
+
+        self.start_actor_from_id(actor_id)
+        type(self).steps.append("started")
+
+        self.stop_actor_from_id(actor_id)
+        type(self).steps.append("stopped")
+
+        # A wrong controller identity would stop and dispose this controller instead
+        self.remove_actor(self.actor_id)
+        type(self).steps.append("self_remove_ignored")
+
+        self.remove_actor_from_id(actor_id)
+        type(self).steps.append("removed")
+
+    def on_stop(self):
+        # Recorded in the same sequence so a premature self-stop is ordered before "removed"
+        type(self).steps.append("controller_stopped")
+
+
+class StrategyLifecycleController(Controller):
+    """
+    Drives a created strategy through one alias and two canonical control methods.
+    """
+
+    created_strategy_id = None
+    steps: list[str] = []
+
+    @classmethod
+    def reset(cls):
+        cls.created_strategy_id = None
+        cls.steps = []
+
+    def on_start(self):
+        strategy_id = self.create_strategy_from_config(
+            ImportableStrategyConfig(
+                strategy_path="tests.unit.common.actor:ControllerCreatedStrategy",
+                config_path="tests.unit.common.actor:TestStrategyConfig",
+                config={"strategy_id": "ControllerCreatedStrategy-001"},
+            ),
+            start=False,
+        )
+        type(self).created_strategy_id = strategy_id
+        type(self).steps.append("created")
+
+        self.start_strategy_from_id(strategy_id)
+        type(self).steps.append("started")
+
+        self.stop_strategy(strategy_id)
+        type(self).steps.append("stopped")
+
+        self.remove_strategy(strategy_id)
+        type(self).steps.append("removed")
 
 
 class NonStartingStrategyCreatingController(StrategyCreatingController):
@@ -197,8 +300,8 @@ class OrderFactoryProbeStrategy(Strategy):
                 Quantity.from_str("100000"),
                 time_in_force=TimeInForce.GTD,
             )
-        except ValueError as exc:
-            type(self).observed_invalid_order_error = str(exc)
+        except ValueError as e:
+            type(self).observed_invalid_order_error = str(e)
 
         type(self).observed_order = order_factory.market(
             InstrumentId.from_str("AUD/USD.SIM"),
@@ -208,6 +311,25 @@ class OrderFactoryProbeStrategy(Strategy):
         type(self).observed_next_client_order_id = self.order_factory.generate_client_order_id()
         type(self).observed_client_order_id_count = order_factory.get_client_order_id_count()
         type(self).observed_order_list_id_count = order_factory.get_order_list_id_count()
+
+
+class OrderFactoryConfigProbeStrategy(Strategy):
+    observed_factory = None
+    observed_config = None
+    observed_client_order_id = None
+
+    @classmethod
+    def reset(cls):
+        cls.observed_factory = None
+        cls.observed_config = None
+        cls.observed_client_order_id = None
+
+    def on_start(self):
+        order_factory = self.order_factory
+
+        type(self).observed_factory = order_factory
+        type(self).observed_config = self.config
+        type(self).observed_client_order_id = order_factory.generate_client_order_id()
 
 
 def _market_order(
@@ -307,6 +429,81 @@ class PortfolioHedgedProbeStrategy(Strategy):
 
         type(self).observed_portfolio = portfolio
         type(self).observed_account = account
+
+
+class PortfolioPositionProbeStrategy(Strategy):
+    observed_portfolio = None
+    observed_account = None
+    observed_initial_account = None
+
+    def on_start(self):
+        self._instrument_id = InstrumentId.from_str("AUD/USD.SIM")
+        self._submitted = False
+        type(self).observed_initial_account = self.portfolio.account(venue=Venue("SIM"))
+        self.subscribe_quotes(self._instrument_id)
+
+    def on_quote(self, tick):
+        if self._submitted:
+            return
+
+        self._submitted = True
+        self.submit_order(
+            _market_order(
+                self,
+                self._instrument_id,
+                OrderSide.BUY,
+                Quantity.from_str("100000"),
+            ),
+        )
+
+    def on_stop(self):
+        portfolio = self.portfolio
+        account = portfolio.account(venue=Venue("SIM"))
+
+        type(self).observed_portfolio = portfolio
+        type(self).observed_account = account
+
+
+class PortfolioMultiVenueProbeStrategy(Strategy):
+    observed_portfolio = None
+    observed_accounts = None
+
+    def on_start(self):
+        self._sides = {
+            InstrumentId.from_str("AUD/USD.SIM"): [OrderSide.BUY],
+            InstrumentId.from_str("GBP/USD.OTHER"): [OrderSide.SELL],
+            InstrumentId.from_str("NZD/USD.CLOSED"): [OrderSide.BUY, OrderSide.SELL],
+        }
+        self._quote_counts = dict.fromkeys(self._sides, 0)
+
+        for instrument_id in self._sides:
+            self.subscribe_quotes(instrument_id)
+
+    def on_quote(self, tick):
+        sides = self._sides.get(tick.instrument_id)
+        if sides is None:
+            return
+
+        quote_count = self._quote_counts[tick.instrument_id]
+        if quote_count < len(sides):
+            self.submit_order(
+                _market_order(
+                    self,
+                    tick.instrument_id,
+                    sides[quote_count],
+                    Quantity.from_str("100000"),
+                ),
+            )
+        self._quote_counts[tick.instrument_id] += 1
+
+    def on_stop(self):
+        portfolio = self.portfolio
+
+        type(self).observed_portfolio = portfolio
+        type(self).observed_accounts = {
+            venue: portfolio.account(venue=venue)
+            for venue in (Venue("SIM"), Venue("OTHER"), Venue("CLOSED"))
+        }
 
 
 class TestExecAlgorithmConfig(DataActorConfig):

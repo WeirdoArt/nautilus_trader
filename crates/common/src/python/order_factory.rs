@@ -37,7 +37,7 @@ use crate::{factories::OrderFactory, python::clock::PyClock};
 /// Wrapper providing shared access to [`OrderFactory`] from Python.
 #[allow(non_camel_case_types)]
 #[pyo3::pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
+    module = "nautilus_trader.common",
     name = "OrderFactory",
     unsendable,
     from_py_object
@@ -95,6 +95,18 @@ impl PyOrderFactory {
             use_uuid_client_order_ids,
             use_hyphens_in_client_order_ids,
         ))))
+    }
+
+    #[getter]
+    #[pyo3(name = "trader_id")]
+    fn py_trader_id(&self) -> TraderId {
+        self.0.borrow().trader_id()
+    }
+
+    #[getter]
+    #[pyo3(name = "strategy_id")]
+    fn py_strategy_id(&self) -> StrategyId {
+        self.0.borrow().strategy_id()
     }
 
     #[pyo3(name = "get_client_order_id_count")]

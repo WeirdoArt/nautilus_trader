@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from nautilus_trader.common import DataActor
 from nautilus_trader.common import DataActorConfig
+from nautilus_trader.common import GreeksCalculator
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
@@ -361,12 +362,13 @@ class RoutedOrderProbe(Strategy):
     def on_quote(self, quote: QuoteTick):
         if not self._sent:
             self._sent = True
+            client_order_id = ClientOrderId(f"{self.strategy_id}-1")
             self.submit_order(
                 MarketOrder(
                     trader_id=self.trader_id,
                     strategy_id=self.strategy_id,
                     instrument_id=self._instrument_id,
-                    client_order_id=ClientOrderId(f"{self.strategy_id}-1"),
+                    client_order_id=client_order_id,
                     order_side=OrderSide.BUY,
                     quantity=self._qty,
                     init_id=UUID4(),
@@ -376,6 +378,7 @@ class RoutedOrderProbe(Strategy):
                     quote_quantity=False,
                     contingency_type=ContingencyType.NO_CONTINGENCY,
                     exec_algorithm_id=self._exec_algorithm_id,
+                    exec_spawn_id=client_order_id,
                 ),
             )
 
@@ -435,8 +438,13 @@ class RoutedOrderExecAlgorithm(DataActor):
 
 
 class RoutedOrderExecutionAlgorithm(ExecutionAlgorithm):
+    cache_instrument_ids = []
+    greeks_types = []
+    portfolio_initialized = []
     received_client_order_ids = []
     received_exec_algorithm_ids = []
+    running_states = []
+    signal_counts_after_unsubscribe = []
     signal_values = []
 
     def __init__(self, config: RoutedOrderExecAlgorithmConfig):
@@ -445,20 +453,38 @@ class RoutedOrderExecutionAlgorithm(ExecutionAlgorithm):
 
     @classmethod
     def reset_observations(cls):
+        cls.cache_instrument_ids = []
+        cls.greeks_types = []
+        cls.portfolio_initialized = []
         cls.received_client_order_ids = []
         cls.received_exec_algorithm_ids = []
+        cls.running_states = []
+        cls.signal_counts_after_unsubscribe = []
         cls.signal_values = []
 
     def on_start(self):
         type(self).reset_observations()
+        self.subscribe_signal(self._signal_name)
+
+    def on_stop(self):
+        self.unsubscribe_signal(self._signal_name)
+        self.publish_signal(self._signal_name, "after-unsubscribe")
+        type(self).signal_counts_after_unsubscribe.append(len(type(self).signal_values))
 
     def on_order(self, order):
         client_order_id = str(order.client_order_id)
+        instrument = self.cache.instrument(order.instrument_id)
 
+        type(self).cache_instrument_ids.append(str(instrument.id))
+        type(self).greeks_types.append(type(GreeksCalculator(self.cache, self.clock)).__name__)
+        type(self).portfolio_initialized.append(self.portfolio.is_initialized())
         type(self).received_client_order_ids.append(client_order_id)
         type(self).received_exec_algorithm_ids.append(order.exec_algorithm_id)
-        type(self).signal_values.append(client_order_id)
+        type(self).running_states.append(self.is_running())
         self.publish_signal(self._signal_name, client_order_id)
+
+    def on_signal(self, signal):
+        type(self).signal_values.append(signal.value)
 
 
 class DoubleSpawnExecutionAlgorithm(ExecutionAlgorithm):
@@ -503,8 +529,8 @@ class OversizedSpawnExecutionAlgorithm(ExecutionAlgorithm):
     def on_order(self, order):
         try:
             self.spawn_market(order, Quantity.from_str("0.11000"))
-        except ValueError as exc:
-            type(self).error_messages.append(str(exc))
+        except ValueError as e:
+            type(self).error_messages.append(str(e))
         else:
             type(self).error_messages.append("no error")
 

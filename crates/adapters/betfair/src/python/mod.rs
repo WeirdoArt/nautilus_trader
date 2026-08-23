@@ -24,7 +24,7 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::consts::BETFAIR,
+    common::consts::{BETFAIR, BETFAIR_CLIENT_ID, BETFAIR_VENUE},
     config::{BetfairDataConfig, BetfairExecConfig},
     factories::{BetfairDataClientFactory, BetfairExecutionClientFactory},
 };
@@ -83,13 +83,16 @@ fn extract_betfair_exec_config(
 
 /// Betfair adapter Python module.
 ///
-/// Loaded as `nautilus_pyo3.betfair`.
+/// Exposed through `nautilus_trader.adapters.betfair`.
 ///
 /// # Errors
 ///
 /// Returns an error if module initialization fails.
 #[pymodule]
 pub fn betfair(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(stringify!(BETFAIR), BETFAIR)?;
+    m.add(stringify!(BETFAIR_CLIENT_ID), *BETFAIR_CLIENT_ID)?;
+    m.add(stringify!(BETFAIR_VENUE), *BETFAIR_VENUE)?;
     m.add_class::<BetfairDataConfig>()?;
     m.add_class::<BetfairExecConfig>()?;
     m.add_class::<BetfairDataClientFactory>()?;

@@ -32,8 +32,8 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType, OKXPositionMode,
-        OKXPositionSide, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
+        OKXPositionMode, OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
@@ -77,7 +77,7 @@ pub struct GetPositionTiersParams {
     pub tier: Option<String>,
 }
 
-/// Parameters for the GET /api/v5/public/instruments endpoint.
+/// Parameters for the public and account instrument endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
 #[builder(setter(into, strip_option))]
@@ -486,6 +486,19 @@ pub struct GetOrderBookParams {
     pub sz: Option<u32>,
 }
 
+/// Parameters for the GET /api/v5/market/books-rpi endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetRpiOrderBookParams {
+    /// Instrument ID, e.g. "BTC-USDT".
+    pub inst_id: String,
+    /// Order book depth per side. Maximum 400, default 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sz: Option<u32>,
+}
+
 /// Parameters for the GET /api/v5/public/funding-rate-history endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
@@ -568,7 +581,21 @@ pub struct GetOrderListParams {
     pub limit: Option<u32>,
 }
 
-/// Parameters for the GET /api/v5/trade/order-algo-* endpoints.
+/// Parameters for the GET /api/v5/trade/order-algo endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetAlgoOrderParams {
+    /// Algo order identifier assigned by OKX (optional).
+    #[serde(rename = "algoId", skip_serializing_if = "Option::is_none")]
+    pub algo_id: Option<String>,
+    /// Client supplied algo order identifier (optional).
+    #[serde(rename = "algoClOrdId", skip_serializing_if = "Option::is_none")]
+    pub algo_cl_ord_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/trade/orders-algo-* endpoints.
 #[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
 #[builder(default)]
 #[builder(setter(into, strip_option))]
@@ -590,11 +617,11 @@ pub struct GetAlgoOrdersParams {
     pub ord_type: Option<OKXAlgoOrderType>,
     /// State filter (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<OKXOrderStatus>,
-    /// Pagination cursor – fetch records after this value (optional).
+    pub state: Option<OKXAlgoOrderStatus>,
+    /// Pagination cursor - fetch records after this value (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    /// Pagination cursor – fetch records before this value (optional).
+    /// Pagination cursor - fetch records before this value (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
     /// Maximum number of records to return (optional, default 100).
@@ -676,7 +703,8 @@ pub struct GetPositionsHistoryParams {
 #[builder(setter(into, strip_option))]
 #[serde(rename_all = "camelCase")]
 pub struct GetOrderParams {
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Instrument type retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub inst_type: OKXInstrumentType,
     /// Instrument ID, e.g. "BTC-USDT".
     pub inst_id: String,
@@ -686,8 +714,8 @@ pub struct GetOrderParams {
     /// User-assigned client order ID (optional if order ID is provided).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// Position side (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Position side retained for API compatibility; not accepted by this endpoint.
+    #[serde(skip_serializing)]
     pub pos_side: Option<OKXPositionSide>,
 }
 

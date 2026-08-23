@@ -15,10 +15,11 @@
 
 //! Value conversions between Nautilus domain types and Binance Futures venue types.
 
+use nautilus_core::UnixNanos;
 use nautilus_model::{enums::OrderSide, types::Currency};
 use rust_decimal::Decimal;
 
-use crate::common::enums::BinancePositionSide;
+use crate::common::{enums::BinancePositionSide, parse::parse_millis};
 
 const BNFCR_ASSET: &str = "BNFCR";
 
@@ -44,19 +45,21 @@ pub(crate) fn normalize_futures_asset<T: AsRef<str>>(
 /// Determines the Binance `positionSide` for hedge mode from the Nautilus order side.
 ///
 /// Returns `None` when not in hedge mode (one-way mode orders omit `positionSide`).
-/// In hedge mode, `reduce_only` flips the mapping so that Buy closes Short and
-/// Sell closes Long.
+/// In hedge mode, `is_closing` flips the mapping so that Buy closes Short and
+/// Sell closes Long. Close intent comes from the Nautilus `reduce_only` flag for
+/// explicit-quantity orders and from the `close_position` order parameter for
+/// whole-leg exits, which cannot carry `reduce_only`.
 #[must_use]
 pub(crate) fn determine_position_side(
     is_hedge_mode: bool,
     order_side: OrderSide,
-    reduce_only: bool,
+    is_closing: bool,
 ) -> Option<BinancePositionSide> {
     if !is_hedge_mode {
         return None;
     }
 
-    Some(if reduce_only {
+    Some(if is_closing {
         match order_side {
             OrderSide::Buy => BinancePositionSide::Short,
             OrderSide::Sell => BinancePositionSide::Long,
@@ -126,6 +129,14 @@ pub(crate) fn format_callback_rate(rate: Decimal) -> String {
     }
 }
 
+pub(crate) fn parse_good_till_date(value: Option<i64>) -> anyhow::Result<Option<UnixNanos>> {
+    let Some(value) = value.filter(|value| *value != 0) else {
+        return Ok(None);
+    };
+
+    parse_millis(value, "goodTillDate").map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::enums::CurrencyType;
@@ -155,6 +166,33 @@ mod tests {
     }
 
     #[rstest]
+    #[case::missing(None)]
+    #[case::zero(Some(0))]
+    fn test_parse_good_till_date_omits_missing_expiry(#[case] value: Option<i64>) {
+        assert_eq!(parse_good_till_date(value).unwrap(), None);
+    }
+
+    #[rstest]
+    fn test_parse_good_till_date_preserves_milliseconds() {
+        let value = 1_700_000_000_000;
+        assert_eq!(
+            parse_good_till_date(Some(value)).unwrap(),
+            Some(UnixNanos::from_millis(value as u64)),
+        );
+    }
+
+    #[rstest]
+    #[case::negative(-1, "invalid negative Binance goodTillDate")]
+    #[case::overflow(i64::MAX, "outside the UnixNanos range")]
+    fn test_parse_good_till_date_rejects_invalid_values(
+        #[case] value: i64,
+        #[case] expected: &str,
+    ) {
+        let error = parse_good_till_date(Some(value)).unwrap_err();
+        assert!(error.to_string().contains(expected));
+    }
+
+    #[rstest]
     #[case::one_way_buy(false, OrderSide::Buy, false, None)]
     #[case::one_way_sell(false, OrderSide::Sell, false, None)]
     #[case::one_way_buy_reduce(false, OrderSide::Buy, true, None)]
@@ -166,11 +204,11 @@ mod tests {
     fn test_determine_position_side(
         #[case] is_hedge_mode: bool,
         #[case] order_side: OrderSide,
-        #[case] reduce_only: bool,
+        #[case] is_closing: bool,
         #[case] expected: Option<BinancePositionSide>,
     ) {
         assert_eq!(
-            determine_position_side(is_hedge_mode, order_side, reduce_only),
+            determine_position_side(is_hedge_mode, order_side, is_closing),
             expected,
         );
     }

@@ -20,15 +20,20 @@
 
 mod data;
 mod execution;
+mod socket;
 
 use std::fmt::{Debug, Display};
 
 pub use data::DataClient;
 pub use execution::{DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient};
+pub use socket::{
+    SocketReconnectHandle, SocketReconnectLookup, SocketReconnectRegistration,
+    SocketReconnectRegistry, SocketReconnectRequestOutcome,
+};
 
 #[inline(always)]
 fn log_not_implemented<T: Debug>(cmd: &T) {
-    log::warn!("{cmd:?} – handler not implemented");
+    log::warn!("{cmd:?} - handler not implemented");
 }
 
 #[inline(always)]

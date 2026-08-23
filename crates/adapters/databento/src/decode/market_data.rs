@@ -13,8 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{ffi::c_char, num::NonZeroUsize};
+use core::fmt::NumBuffer;
+use std::{collections::VecDeque, ffi::c_char, num::NonZeroUsize};
 
+use ahash::AHashMap;
 use databento::dbn;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_SECOND};
 use nautilus_model::{
@@ -83,7 +85,7 @@ fn fnv1a_mix(hash: &mut u64, bytes: &[u8]) {
 /// Derives a deterministic [`TradeId`] for Databento schemas that do not
 /// publish a native trade identifier (e.g. CMBP1, TCBBO).
 ///
-/// The hash combines the instrument, timestamps, price, size and aggressor
+/// The hash combines the instrument, timestamps, price, size, and aggressor
 /// side so that replayed data yields the same identifier across runs.
 pub(super) fn derive_cmbp_trade_id(
     instrument_id: InstrumentId,
@@ -156,7 +158,7 @@ pub fn decode_mbo_msg(
             let price = decode_price_or_undef(msg.price, price_precision);
             let size = decode_quantity(msg.size as u64);
             let aggressor_side = parse_aggressor_side(msg.side);
-            let trade_id = TradeId::new(itoa::Buffer::new().format(msg.sequence));
+            let trade_id = TradeId::new(msg.sequence.format_into(&mut NumBuffer::new()));
             let ts_event = msg.ts_recv.into();
             let ts_init = ts_init.unwrap_or(ts_event);
 
@@ -179,7 +181,7 @@ pub fn decode_mbo_msg(
     // attribution for a resting order, and its book impact arrives as the
     // explicit Cancel/Modify records of the same match event (CME MDP3
     // semantics as normalized by Databento). Decoding fills as deltas
-    // corrupts the book — an iceberg hidden-part fill carries an order ID
+    // corrupts the book - an iceberg hidden-part fill carries an order ID
     // that was never Added, so `BookAction::Update` materializes a phantom
     // order which nothing ever deletes (observed as a crossed book on GLBX).
     if matches!(msg.action(), Ok(dbn::Action::Fill | dbn::Action::None)) {
@@ -194,17 +196,113 @@ pub fn decode_mbo_msg(
     let ts_event = msg.ts_recv.into();
     let ts_init = ts_init.unwrap_or(ts_event);
 
+    // A replayed snapshot can carry source packet sequences in non-monotonic order,
+    // so it must not advance the book's incremental high-water mark.
+    let sequence = if msg.flags.is_snapshot() {
+        0
+    } else {
+        msg.sequence
+    };
+
     let delta = OrderBookDelta::new(
         instrument_id,
         action,
         order,
         msg.flags.raw(),
-        msg.sequence.into(),
+        sequence.into(),
         ts_event,
         ts_init,
     );
 
     Ok((Some(delta), None))
+}
+
+#[derive(Debug)]
+struct QueuedMboDelta {
+    delta: OrderBookDelta,
+    ready: bool,
+}
+
+// TODO: Consider consolidating this boundary framing with the live client while keeping
+// source-order queuing specific to historical data.
+/// Preserves source order while retaining each instrument's unresolved tail until its raw
+/// `F_LAST` boundary can be attached.
+#[derive(Debug, Default)]
+pub(crate) struct MboDeltaBuffer {
+    queue: VecDeque<QueuedMboDelta>,
+    tail: Option<(InstrumentId, u64)>,
+    tails: AHashMap<InstrumentId, u64>,
+    head: u64,
+    next: u64,
+}
+
+impl MboDeltaBuffer {
+    pub(crate) fn push(
+        &mut self,
+        msg: &dbn::MboMsg,
+        instrument_id: InstrumentId,
+        delta: Option<OrderBookDelta>,
+    ) {
+        if let Some(delta) = delta {
+            self.release(instrument_id, 0);
+
+            let index = self.next;
+            self.next = self.next.checked_add(1).expect("MBO delta index overflow");
+            let ready = msg.flags.is_last();
+            self.queue.push_back(QueuedMboDelta { delta, ready });
+
+            if !ready
+                && let Some((tail_instrument_id, tail)) = self.tail.replace((instrument_id, index))
+            {
+                self.tails.insert(tail_instrument_id, tail);
+            }
+        } else if msg.flags.is_last() {
+            self.release(instrument_id, dbn::flags::LAST);
+        }
+    }
+
+    pub(crate) fn pop_ready(&mut self) -> Option<OrderBookDelta> {
+        if !self.queue.front().is_some_and(|queued| queued.ready) {
+            return None;
+        }
+
+        self.head = self.head.checked_add(1).expect("MBO delta index overflow");
+        self.queue.pop_front().map(|queued| queued.delta)
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.tail = None;
+        self.tails.clear();
+
+        for queued in &mut self.queue {
+            queued.ready = true;
+        }
+    }
+
+    fn release(&mut self, instrument_id: InstrumentId, flags: u8) {
+        let tail = match self.tail {
+            Some((tail_instrument_id, tail)) if tail_instrument_id == instrument_id => {
+                self.tail = None;
+                tail
+            }
+            _ => {
+                let Some(tail) = self.tails.remove(&instrument_id) else {
+                    return;
+                };
+                tail
+            }
+        };
+        let offset = tail
+            .checked_sub(self.head)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .expect("MBO delta tail must be queued");
+        let queued = self
+            .queue
+            .get_mut(offset)
+            .expect("MBO delta tail must be queued");
+        queued.delta.flags |= flags;
+        queued.ready = true;
+    }
 }
 
 /// Decodes a Databento Trade message into a `TradeTick`.
@@ -226,7 +324,7 @@ pub fn decode_trade_msg(
         decode_price_or_undef(msg.price, price_precision),
         decode_quantity(msg.size as u64),
         parse_aggressor_side(msg.side),
-        TradeId::new(itoa::Buffer::new().format(msg.sequence)),
+        TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
         ts_event,
         ts_init,
     );
@@ -271,7 +369,7 @@ pub fn decode_tbbo_msg(
         decode_price_or_undef(msg.price, price_precision),
         decode_quantity(msg.size as u64),
         parse_aggressor_side(msg.side),
-        TradeId::new(itoa::Buffer::new().format(msg.sequence)),
+        TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
         ts_event,
         ts_init,
     );
@@ -317,7 +415,7 @@ pub fn decode_mbp1_msg(
             decode_price_or_undef(msg.price, price_precision),
             decode_quantity(msg.size as u64),
             parse_aggressor_side(msg.side),
-            TradeId::new(itoa::Buffer::new().format(msg.sequence)),
+            TradeId::new(msg.sequence.format_into(&mut NumBuffer::new())),
             ts_event,
             ts_init,
         ))

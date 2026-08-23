@@ -18,7 +18,7 @@
 use std::{num::NonZero, str::FromStr};
 
 use ahash::AHashMap;
-use chrono::Timelike;
+use jiff::tz::Offset;
 use nautilus_core::{UnixNanos, uuid::UUID4};
 #[cfg(test)]
 use nautilus_model::types::Currency;
@@ -596,7 +596,7 @@ pub fn parse_order_msg(
     }
 
     if let Some(avg_px) = msg.avg_px {
-        report = report.with_avg_px(avg_px)?;
+        report = report.with_avg_px(avg_px);
     }
 
     if let Some(trigger_price) = msg.stop_px {
@@ -793,7 +793,7 @@ pub fn parse_order_update_msg(
     // Uses external IDs; callers enrich with tracked identity when available
     let trader_id = TraderId::external();
     let strategy_id = StrategyId::external();
-    let instrument_id = parse_instrument_id(msg.symbol);
+    let instrument_id = parse_instrument_id(msg.symbol?);
     let venue_order_id = Some(VenueOrderId::new(msg.order_id.to_string()));
     let client_order_id = msg
         .cl_ord_id
@@ -808,6 +808,8 @@ pub fn parse_order_update_msg(
     };
     let price = msg
         .price
+        .value()
+        .copied()
         .map(|p| Price::new(p, instrument.price_precision()));
 
     // BitMEX doesn't send trigger price in regular order updates?
@@ -1048,7 +1050,7 @@ pub fn parse_instrument_msg(
     let ts_event = parse_optional_datetime_to_unix_nanos(&Some(msg.timestamp), "");
 
     // Look up instrument for proper precision
-    let price_precision = match instruments_cache.get(&Ustr::from(&msg.symbol)) {
+    let price_precision = match instruments_cache.get(&msg.symbol) {
         Some(instrument) => instrument.price_precision(),
         None => {
             // BitMEX sends updates for all instruments on the instrument channel,
@@ -1070,7 +1072,7 @@ pub fn parse_instrument_msg(
     // For index symbols, markPrice equals lastPrice and is valid to emit
     if let Some(mark_price) = effective_mark_price {
         let price = Price::new(mark_price, price_precision);
-        updates.push(Data::MarkPriceUpdate(MarkPriceUpdate::new(
+        updates.push(Data::MarkPrice(MarkPriceUpdate::new(
             instrument_id,
             price,
             ts_event,
@@ -1081,7 +1083,7 @@ pub fn parse_instrument_msg(
     // Add index price update if present
     if let Some(index_price) = effective_index_price {
         let price = Price::new(index_price, price_precision);
-        updates.push(Data::IndexPriceUpdate(IndexPriceUpdate::new(
+        updates.push(Data::IndexPrice(IndexPriceUpdate::new(
             instrument_id,
             price,
             ts_event,
@@ -1100,9 +1102,10 @@ pub fn parse_instrument_msg(
 #[must_use]
 pub fn parse_funding_msg(msg: &BitmexFundingMsg, ts_init: UnixNanos) -> FundingRateUpdate {
     let instrument_id = InstrumentId::from(format!("{}.BITMEX", msg.symbol));
-    let interval_hours = msg.funding_interval.hour();
-    let interval_minutes = msg.funding_interval.minute();
-    let interval = Some((interval_hours * 60 + interval_minutes) as u16);
+    let funding_interval = Offset::UTC.to_datetime(msg.funding_interval);
+    let interval_hours = u16::from(funding_interval.hour().cast_unsigned());
+    let interval_minutes = u16::from(funding_interval.minute().cast_unsigned());
+    let interval = Some(interval_hours * 60 + interval_minutes);
     let ts_event = parse_optional_datetime_to_unix_nanos(&Some(msg.timestamp), "");
 
     FundingRateUpdate::new(
@@ -1200,7 +1203,7 @@ pub fn parse_margin_account_state(msg: &BitmexMarginMsg, ts_init: UnixNanos) -> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use nautilus_model::{
         enums::{AggressorSide, BookAction, LiquiditySide, PositionSide},
         identifiers::Symbol,
@@ -1399,7 +1402,7 @@ mod tests {
         assert_eq!(trade.instrument_id, instrument_id);
         assert_eq!(trade.price, Price::from("98570.9"));
         assert_eq!(trade.size, Quantity::from(100));
-        assert_eq!(trade.aggressor_side, AggressorSide::Seller);
+        assert_eq!(trade.aggressor_side, AggressorSide::Sell);
         assert_eq!(
             trade.trade_id.to_string(),
             "00000000-006d-1000-0000-000e8737d536"
@@ -1487,9 +1490,7 @@ mod tests {
         let instrument = create_test_perpetual_instrument();
 
         let msg = BitmexTradeBinMsg {
-            timestamp: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            timestamp: "2024-01-01T00:00:00Z".parse::<Timestamp>().unwrap(),
             symbol: Ustr::from("XBTUSD"),
             open: 50_000.0,
             high: 49_990.0,
@@ -1524,7 +1525,8 @@ mod tests {
     #[rstest]
     fn test_parse_order_msg() {
         let json_data = load_test_json("ws_order.json");
-        let msg: BitmexOrderMsg = serde_json::from_str(&json_data).unwrap();
+        let mut msg: BitmexOrderMsg = serde_json::from_str(&json_data).unwrap();
+        msg.avg_px = Some(Decimal::from_str("30000.500000000004").unwrap());
         let mut cache = AHashMap::new();
         let instrument = create_test_perpetual_instrument();
         let report = parse_order_msg(&msg, &instrument, &mut cache, UnixNanos::default()).unwrap();
@@ -1546,6 +1548,10 @@ mod tests {
         assert_eq!(report.quantity, Quantity::from(100));
         assert_eq!(report.filled_qty, Quantity::from(0));
         assert_eq!(report.price.unwrap(), Price::from("98000.0"));
+        assert_eq!(
+            report.avg_px,
+            Some(Decimal::from_str("30000.500000000004").unwrap())
+        );
         assert_eq!(report.ts_accepted, 1732530600000000000); // 2024-11-25T10:30:00.000Z
     }
 
@@ -1921,7 +1927,7 @@ mod tests {
             withdrawable_margin: None,
             maker_fee_discount: None,
             taker_fee_discount: None,
-            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            timestamp: Timestamp::from_second(1_700_000_000).unwrap(),
             foreign_margin_balance: None,
             foreign_requirement: None,
         };
@@ -1972,7 +1978,7 @@ mod tests {
             withdrawable_margin: None,
             maker_fee_discount: None,
             taker_fee_discount: None,
-            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            timestamp: Timestamp::from_second(1_700_000_000).unwrap(),
             foreign_margin_balance: None,
             foreign_requirement: None,
         };
@@ -1999,7 +2005,7 @@ mod tests {
         assert_eq!(updates.len(), 2);
 
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95125.7);
             }
@@ -2007,7 +2013,7 @@ mod tests {
         }
 
         match &updates[1] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95126.0);
             }
@@ -2030,7 +2036,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95125.7);
             }
@@ -2053,7 +2059,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value.as_f64(), 95126.0);
             }
@@ -2135,7 +2141,7 @@ mod tests {
 
         // Check mark price update
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), ".BXBT.BITMEX");
                 assert_eq!(update.value, Price::from("119163.05"));
             }
@@ -2144,7 +2150,7 @@ mod tests {
 
         // Check index price update
         match &updates[1] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), ".BXBT.BITMEX");
                 assert_eq!(update.value, Price::from("119163.05"));
                 assert_eq!(update.ts_init, UnixNanos::from(1));
@@ -2198,7 +2204,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::MarkPriceUpdate(update) => {
+            Data::MarkPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "DOTUSDT.BITMEX");
                 assert_eq!(update.value, Price::from("1.2669"));
             }
@@ -2222,7 +2228,7 @@ mod tests {
 
         assert_eq!(updates.len(), 1);
         match &updates[0] {
-            Data::IndexPriceUpdate(update) => {
+            Data::IndexPrice(update) => {
                 assert_eq!(update.instrument_id.to_string(), "XBTUSD.BITMEX");
                 assert_eq!(update.value, Price::from("75847.62"));
             }

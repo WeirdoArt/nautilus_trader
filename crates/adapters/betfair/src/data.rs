@@ -23,7 +23,7 @@ use std::sync::{
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::DataClient,
+    clients::{DataClient, SocketReconnectRegistration, SocketReconnectRegistry},
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
         DataEvent,
@@ -36,17 +36,16 @@ use nautilus_common::{
     },
     providers::InstrumentProvider,
 };
-use nautilus_core::{AtomicMap, Params};
+use nautilus_core::{
+    AtomicMap, Params,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_model::{
-    data::{
-        CustomData, CustomDataTrait, Data, DataType, OrderBookDeltas, OrderBookDeltas_API,
-        TradeTick,
-    },
+    data::{CustomData, CustomDataTrait, Data, DataType, OrderBookDeltas, TradeTick},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Currency, Money},
 };
-use nautilus_network::socket::TcpMessageHandler;
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 
@@ -54,20 +53,24 @@ use crate::{
     common::{
         consts::{BETFAIR_RACE_STREAM_HOST, BETFAIR_VENUE},
         credential::BetfairCredential,
-        enums::{MarketDataFilterField, MarketStatus},
+        enums::{MarketDataFilterField, MarketStatus, SegmentType},
         parse::{
             extract_market_id, make_instrument_id, parse_betfair_price, parse_betfair_quantity,
             parse_market_definition, parse_millis_timestamp,
         },
+        socket::{DATA_STREAMS_ENDPOINT, SocketControl, SocketStatePublisher},
     },
     config::BetfairDataConfig,
     data_types::{BetfairSequenceCompleted, register_betfair_custom_data},
     http::client::BetfairHttpClient,
     provider::{BetfairInstrumentProvider, NavigationFilter},
     stream::{
-        client::{BetfairRaceStreamClient, BetfairStreamClient},
+        client::{
+            BetfairRaceStreamClient, BetfairStreamClient, HeartbeatTimeoutSource,
+            StreamMessageHandler,
+        },
         config::BetfairStreamConfig,
-        messages::{MarketDataFilter, StreamMarketFilter, StreamMessage, stream_decode},
+        messages::{MarketDataFilter, StreamMarketFilter, StreamMessage},
         parse::{
             make_trade_tick, parse_betfair_starting_prices, parse_betfair_ticker,
             parse_bsp_book_deltas, parse_cricket_match, parse_instrument_closes,
@@ -79,6 +82,33 @@ use crate::{
 
 /// Keep-alive interval in seconds (10 hours, matching Python default).
 const KEEP_ALIVE_INTERVAL_SECS: u64 = 36_000;
+
+/// Betfair live data client.
+#[derive(Debug)]
+pub struct BetfairDataClient {
+    clock: &'static AtomicTime,
+    client_id: ClientId,
+    http_client: Arc<BetfairHttpClient>,
+    provider: BetfairInstrumentProvider,
+    stream_client: Option<Arc<BetfairStreamClient>>,
+    socket_registry: SocketReconnectRegistry,
+    socket_control: Option<SocketControl>,
+    socket_registration: Option<SocketReconnectRegistration>,
+    race_stream_client: Option<Arc<BetfairRaceStreamClient>>,
+    cricket_stream_client: Option<Arc<BetfairRaceStreamClient>>,
+    credential: BetfairCredential,
+    stream_config: BetfairStreamConfig,
+    config: BetfairDataConfig,
+    currency: Currency,
+    is_connected: AtomicBool,
+    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    subscribed_market_ids: AHashSet<String>,
+    keep_alive_handle: Option<JoinHandle<()>>,
+    reconnect_handle: Option<JoinHandle<()>>,
+    race_fatal_handle: Option<JoinHandle<()>>,
+    cricket_fatal_handle: Option<JoinHandle<()>>,
+}
 
 /// Wraps a custom data value with its instrument_id in both metadata (for
 /// topic routing) and identifier (for catalog partitioning).
@@ -99,29 +129,6 @@ pub(crate) fn custom_data_with_instrument(
     CustomData::new(value, data_type)
 }
 
-/// Betfair live data client.
-#[derive(Debug)]
-pub struct BetfairDataClient {
-    client_id: ClientId,
-    http_client: Arc<BetfairHttpClient>,
-    provider: BetfairInstrumentProvider,
-    stream_client: Option<Arc<BetfairStreamClient>>,
-    race_stream_client: Option<Arc<BetfairRaceStreamClient>>,
-    cricket_stream_client: Option<Arc<BetfairRaceStreamClient>>,
-    credential: BetfairCredential,
-    stream_config: BetfairStreamConfig,
-    config: BetfairDataConfig,
-    currency: Currency,
-    is_connected: AtomicBool,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    subscribed_market_ids: AHashSet<String>,
-    keep_alive_handle: Option<JoinHandle<()>>,
-    reconnect_handle: Option<JoinHandle<()>>,
-    race_fatal_handle: Option<JoinHandle<()>>,
-    cricket_fatal_handle: Option<JoinHandle<()>>,
-}
-
 impl BetfairDataClient {
     /// Creates a new [`BetfairDataClient`] instance.
     #[must_use]
@@ -138,6 +145,9 @@ impl BetfairDataClient {
     ) -> Self {
         let data_sender = get_data_event_sender();
         let http_client = Arc::new(http_client);
+        let socket_registry = SocketReconnectRegistry::default();
+        let socket_control = SocketStatePublisher::new(client_id, socket_registry.clone())
+            .map(|publisher| publisher.control(DATA_STREAMS_ENDPOINT));
         let provider = BetfairInstrumentProvider::new(
             Arc::clone(&http_client),
             nav_filter,
@@ -146,10 +156,14 @@ impl BetfairDataClient {
         );
 
         Self {
+            clock: get_atomic_clock_realtime(),
             client_id,
             http_client,
             provider,
             stream_client: None,
+            socket_registry,
+            socket_control,
+            socket_registration: None,
             race_stream_client: None,
             cricket_stream_client: None,
             credential,
@@ -173,21 +187,16 @@ impl BetfairDataClient {
         currency: Currency,
         min_notional: Option<Money>,
         reconnect_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    ) -> TcpMessageHandler {
+        clock: &'static AtomicTime,
+    ) -> StreamMessageHandler {
         // Track cumulative traded volumes per (instrument_id, price) to compute
         // incremental trade sizes. Betfair `trd` fields report totals, not deltas.
         let traded_volumes: Arc<Mutex<AHashMap<(InstrumentId, Decimal), Decimal>>> =
             Arc::new(Mutex::new(AHashMap::new()));
         let has_initial_connection = Arc::new(AtomicBool::new(false));
 
-        Arc::new(move |data: &[u8]| {
-            let msg = match stream_decode(data) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    log::warn!("Failed to decode stream message: {e}");
-                    return;
-                }
-            };
+        Arc::new(move |msg: StreamMessage| {
+            let ts_init = clock.get_time_ns();
 
             match msg {
                 StreamMessage::MarketChange(mcm) => {
@@ -195,12 +204,15 @@ impl BetfairDataClient {
                         return;
                     }
 
+                    let sequence_complete = mcm
+                        .segment_type
+                        .is_none_or(|segment| segment == SegmentType::SegEnd);
+
                     let Some(market_changes) = &mcm.mc else {
                         return;
                     };
 
                     let ts_event = parse_millis_timestamp(mcm.pt);
-                    let ts_init = ts_event;
 
                     for mc in market_changes {
                         let is_snapshot = mc.img;
@@ -214,6 +226,7 @@ impl BetfairDataClient {
                                 &mc.id,
                                 def,
                                 currency,
+                                ts_event,
                                 ts_init,
                                 min_notional,
                             ) {
@@ -298,7 +311,7 @@ impl BetfairDataClient {
                                     Ok(Some(deltas)) => {
                                         if is_snapshot {
                                             if let Err(e) = data_sender.send(DataEvent::Data(
-                                                Data::Deltas(OrderBookDeltas_API::new(deltas)),
+                                                Data::Deltas(Box::new(deltas)),
                                             )) {
                                                 log::warn!("Failed to send book deltas: {e}");
                                             }
@@ -396,9 +409,9 @@ impl BetfairDataClient {
                         }
 
                         for deltas in buffered_deltas {
-                            if let Err(e) = data_sender.send(DataEvent::Data(Data::Deltas(
-                                OrderBookDeltas_API::new(deltas),
-                            ))) {
+                            if let Err(e) =
+                                data_sender.send(DataEvent::Data(Data::Deltas(Box::new(deltas))))
+                            {
                                 log::warn!("Failed to send book deltas: {e}");
                             }
                         }
@@ -419,10 +432,12 @@ impl BetfairDataClient {
                         }
                     }
 
-                    let completed = BetfairSequenceCompleted::new(ts_event, ts_init);
-                    let custom = CustomData::from_arc(Arc::new(completed));
-                    if let Err(e) = data_sender.send(DataEvent::Data(Data::Custom(custom))) {
-                        log::warn!("Failed to send sequence completed: {e}");
+                    if sequence_complete {
+                        let completed = BetfairSequenceCompleted::new(ts_event, ts_init);
+                        let custom = CustomData::from_arc(Arc::new(completed));
+                        if let Err(e) = data_sender.send(DataEvent::Data(Data::Custom(custom))) {
+                            log::warn!("Failed to send sequence completed: {e}");
+                        }
                     }
                 }
                 StreamMessage::Connection(_) => {
@@ -444,7 +459,7 @@ impl BetfairDataClient {
                 }
                 StreamMessage::RaceChange(rcm) => {
                     if let Some(race_changes) = &rcm.rc {
-                        let ts_init = parse_millis_timestamp(rcm.pt);
+                        let ts_event_fallback = parse_millis_timestamp(rcm.pt);
 
                         for rc in race_changes {
                             let race_id = rc.id.as_deref().unwrap_or("");
@@ -452,7 +467,8 @@ impl BetfairDataClient {
 
                             if let Some(runners) = &rc.rrc {
                                 for rrc in runners {
-                                    let ts_event = rrc.ft.map_or(ts_init, parse_millis_timestamp);
+                                    let ts_event =
+                                        rrc.ft.map_or(ts_event_fallback, parse_millis_timestamp);
 
                                     if let Some(runner) = parse_race_runner_data(
                                         race_id, market_id, rrc, ts_event, ts_init,
@@ -478,7 +494,9 @@ impl BetfairDataClient {
                             }
 
                             if let Some(rpc) = &rc.rpc {
-                                let ts_event = rpc.ft.map_or(ts_init, parse_millis_timestamp);
+                                let ts_event =
+                                    rpc.ft.map_or(ts_event_fallback, parse_millis_timestamp);
+
                                 let progress =
                                     parse_race_progress(race_id, market_id, rpc, ts_event, ts_init);
                                 let mut metadata = Params::new();
@@ -502,11 +520,11 @@ impl BetfairDataClient {
                 }
                 StreamMessage::CricketChange(ccm) => {
                     if let Some(cricket_changes) = &ccm.cc {
-                        let ts_init = parse_millis_timestamp(ccm.pt);
+                        let ts_event = parse_millis_timestamp(ccm.pt);
 
                         for cricket_change in cricket_changes {
                             if let Some(cricket) =
-                                parse_cricket_match(cricket_change, ts_init, ts_init)
+                                parse_cricket_match(cricket_change, ts_event, ts_init)
                             {
                                 let mut metadata = Params::new();
                                 metadata.insert(
@@ -543,6 +561,10 @@ impl DataClient for BetfairDataClient {
         Some(*BETFAIR_VENUE)
     }
 
+    fn socket_reconnect_registry(&self) -> Option<&SocketReconnectRegistry> {
+        Some(&self.socket_registry)
+    }
+
     fn start(&mut self) -> anyhow::Result<()> {
         log::info!("Starting Betfair data client: {}", self.client_id);
         Ok(())
@@ -566,7 +588,10 @@ impl DataClient for BetfairDataClient {
         if let Some(handle) = self.cricket_fatal_handle.take() {
             handle.abort();
         }
+
+        self.socket_registration = None;
         self.is_connected.store(false, Ordering::Relaxed);
+
         Ok(())
     }
 
@@ -588,6 +613,8 @@ impl DataClient for BetfairDataClient {
         if let Some(handle) = self.cricket_fatal_handle.take() {
             handle.abort();
         }
+
+        self.socket_registration = None;
         self.is_connected.store(false, Ordering::Relaxed);
         self.stream_client = None;
         self.race_stream_client = None;
@@ -662,18 +689,27 @@ impl DataClient for BetfairDataClient {
             self.currency,
             self.provider.min_notional(),
             reconnect_tx.clone(),
+            self.clock,
         );
 
-        let stream_client = BetfairStreamClient::connect(
+        let state_sink = self.socket_control.as_ref().map(SocketControl::sink);
+        let stream_client = BetfairStreamClient::connect_with_state_sink(
             &self.credential,
             session_token,
             handler,
             self.stream_config.clone(),
+            HeartbeatTimeoutSource::Outbound,
+            state_sink,
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        self.stream_client = Some(Arc::new(stream_client));
+        let stream_client = Arc::new(stream_client);
+        self.socket_registration = self.socket_control.as_ref().map(|control| {
+            let reconnect_stream = Arc::clone(&stream_client);
+            control.register(move || reconnect_stream.request_reconnect_outcome())
+        });
+        self.stream_client = Some(stream_client);
 
         if self.config.subscribe_race_data {
             let race_config = BetfairStreamConfig {
@@ -693,11 +729,12 @@ impl DataClient for BetfairDataClient {
                 self.currency,
                 self.provider.min_notional(),
                 reconnect_tx.clone(),
+                self.clock,
             );
 
             let (race_fatal_tx, mut race_fatal_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            match BetfairRaceStreamClient::connect(
+            match BetfairRaceStreamClient::connect_decoded(
                 &self.credential,
                 race_session,
                 race_handler,
@@ -750,11 +787,12 @@ impl DataClient for BetfairDataClient {
                 self.currency,
                 self.provider.min_notional(),
                 reconnect_tx.clone(),
+                self.clock,
             );
 
             let (cricket_fatal_tx, mut cricket_fatal_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            match BetfairRaceStreamClient::connect_cricket(
+            match BetfairRaceStreamClient::connect_cricket_decoded(
                 &self.credential,
                 cricket_session,
                 cricket_handler,
@@ -806,32 +844,37 @@ impl DataClient for BetfairDataClient {
             loop {
                 tokio::time::sleep(interval).await;
 
-                match keep_alive_client.keep_alive().await {
-                    Ok(()) => {}
+                let session_replaced = match keep_alive_client.keep_alive_with_token().await {
+                    Ok(_) => false,
                     Err(ref e) if e.is_login_failed() => {
                         log::warn!("Betfair session expired, attempting re-login: {e}");
-                        if let Err(e) = keep_alive_client.reconnect().await {
-                            log::warn!("Betfair re-login failed: {e}");
-                            continue;
+
+                        match keep_alive_client.reconnect_with_token().await {
+                            Ok(_) => true,
+                            Err(e) => {
+                                log::warn!("Betfair re-login failed: {e}");
+                                continue;
+                            }
                         }
                     }
                     Err(e) => {
                         log::warn!("Betfair keep-alive failed (transient): {e}");
                         continue;
                     }
-                }
+                };
 
-                if let Some(token) = keep_alive_client.session_token().await {
-                    keep_alive_stream.update_auth(&keep_alive_app_key, token.clone());
-
-                    if let Some(ref race_stream) = keep_alive_race_stream {
-                        race_stream.update_auth(&keep_alive_app_key, token.clone());
-                    }
-
-                    if let Some(ref cricket_stream) = keep_alive_cricket_stream {
-                        cricket_stream.update_auth(&keep_alive_app_key, token);
-                    }
-                }
+                let _ = keep_alive_client
+                    .with_session_token(|token| {
+                        refresh_stream_sessions(
+                            keep_alive_stream.as_ref(),
+                            keep_alive_race_stream.as_deref(),
+                            keep_alive_cricket_stream.as_deref(),
+                            &keep_alive_app_key,
+                            token,
+                            session_replaced,
+                        );
+                    })
+                    .await;
                 log::debug!("Betfair session keep-alive sent");
             }
         }));
@@ -847,32 +890,37 @@ impl DataClient for BetfairDataClient {
             while reconnect_rx.recv().await.is_some() {
                 log::info!("Handling data stream reconnection");
 
-                match reconnect_http.keep_alive().await {
-                    Ok(()) => {}
+                let session_replaced = match reconnect_http.keep_alive_with_token().await {
+                    Ok(_) => false,
                     Err(ref e) if e.is_login_failed() => {
                         log::warn!("Session expired on reconnect, attempting re-login: {e}");
-                        if let Err(e) = reconnect_http.reconnect().await {
-                            log::warn!("Re-login failed on reconnect: {e}");
-                            continue;
+
+                        match reconnect_http.reconnect_with_token().await {
+                            Ok(_) => true,
+                            Err(e) => {
+                                log::warn!("Re-login failed on reconnect: {e}");
+                                continue;
+                            }
                         }
                     }
                     Err(e) => {
                         log::warn!("Keep-alive failed on reconnect (transient): {e}");
                         continue;
                     }
-                }
+                };
 
-                if let Some(token) = reconnect_http.session_token().await {
-                    reconnect_stream.update_auth(&reconnect_app_key, token.clone());
-
-                    if let Some(ref race_stream) = reconnect_race_stream {
-                        race_stream.update_auth(&reconnect_app_key, token.clone());
-                    }
-
-                    if let Some(ref cricket_stream) = reconnect_cricket_stream {
-                        cricket_stream.update_auth(&reconnect_app_key, token);
-                    }
-                }
+                let _ = reconnect_http
+                    .with_session_token(|token| {
+                        refresh_stream_sessions(
+                            reconnect_stream.as_ref(),
+                            reconnect_race_stream.as_deref(),
+                            reconnect_cricket_stream.as_deref(),
+                            &reconnect_app_key,
+                            token,
+                            session_replaced,
+                        );
+                    })
+                    .await;
             }
         }));
 
@@ -920,6 +968,7 @@ impl DataClient for BetfairDataClient {
         self.http_client.disconnect().await;
         self.is_connected.store(false, Ordering::Relaxed);
         self.subscribed_market_ids.clear();
+        self.socket_registration = None;
 
         log::info!("Betfair data client disconnected: {}", self.client_id);
         Ok(())
@@ -1075,27 +1124,190 @@ impl DataClient for BetfairDataClient {
     }
 }
 
+fn refresh_stream_sessions(
+    stream: &BetfairStreamClient,
+    race_stream: Option<&BetfairRaceStreamClient>,
+    cricket_stream: Option<&BetfairRaceStreamClient>,
+    app_key: &str,
+    token: &str,
+    session_replaced: bool,
+) {
+    stream.update_auth(app_key, token.to_string());
+
+    if let Some(race_stream) = race_stream {
+        race_stream.update_auth(app_key, token.to_string());
+    }
+
+    if let Some(cricket_stream) = cricket_stream {
+        cricket_stream.update_auth(app_key, token.to_string());
+    }
+
+    if !session_replaced {
+        return;
+    }
+
+    let _ = stream.request_reconnect();
+
+    if let Some(race_stream) = race_stream {
+        let _ = race_stream.request_reconnect();
+    }
+
+    if let Some(cricket_stream) = cricket_stream {
+        let _ = cricket_stream.request_reconnect();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use nautilus_core::UnixNanos;
     use rstest::rstest;
 
     use super::*;
-    use crate::{common::testing::load_test_json, data_types::BetfairCricketMatch};
+    use crate::{
+        common::testing::load_test_json,
+        data_types::{BetfairCricketMatch, BetfairRaceRunnerData, BetfairSequenceCompleted},
+        stream::messages::stream_decode,
+    };
 
-    #[rstest]
-    fn test_stream_handler_emits_cricket_match_custom_data() {
-        let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+    fn stream_handler_at(
+        ts_init: UnixNanos,
+    ) -> (
+        StreamMessageHandler,
+        tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) {
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
         let (reconnect_tx, _reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Box::leak(Box::new(AtomicTime::new(false, ts_init)));
         let handler = BetfairDataClient::create_stream_handler(
             data_tx,
             Arc::new(AtomicMap::new()),
             Currency::GBP(),
             None,
             reconnect_tx,
+            clock,
         );
+
+        (handler, data_rx)
+    }
+
+    fn receive_custom<T: 'static>(
+        data_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) -> Arc<dyn CustomDataTrait> {
+        while let Ok(event) = data_rx.try_recv() {
+            if let DataEvent::Data(Data::Custom(custom)) = event
+                && custom.data.as_any().is::<T>()
+            {
+                return custom.data;
+            }
+        }
+
+        panic!("expected {} custom data", std::any::type_name::<T>());
+    }
+
+    #[rstest]
+    fn test_stream_handler_sets_mcm_init_from_clock() {
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_001);
+
+        let (handler, mut data_rx) = stream_handler_at(ts_init);
+        let data = load_test_json("stream/mcm_UPDATE.json");
+
+        handler(stream_decode(data.as_bytes()).unwrap());
+
+        let custom = receive_custom::<BetfairSequenceCompleted>(&mut data_rx);
+        let completed = custom
+            .as_any()
+            .downcast_ref::<BetfairSequenceCompleted>()
+            .unwrap();
+
+        assert_eq!(
+            completed.ts_event,
+            UnixNanos::from(1_471_370_160_471_000_000)
+        );
+        assert_eq!(completed.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_stream_handler_completes_segmented_mcm_on_final_segment() {
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_005);
+        let (handler, mut data_rx) = stream_handler_at(ts_init);
+        let data = load_test_json("stream/mcm_SEGMENTS.jsonl");
+        let mut segments = data.lines();
+
+        handler(stream_decode(segments.next().unwrap().as_bytes()).unwrap());
+        handler(stream_decode(segments.next().unwrap().as_bytes()).unwrap());
+
+        assert!(data_rx.try_recv().is_err());
+
+        handler(stream_decode(segments.next().unwrap().as_bytes()).unwrap());
+
+        let custom = receive_custom::<BetfairSequenceCompleted>(&mut data_rx);
+        let completed = custom
+            .as_any()
+            .downcast_ref::<BetfairSequenceCompleted>()
+            .unwrap();
+        assert_eq!(
+            completed.ts_event,
+            UnixNanos::from(1_700_000_000_000_000_000)
+        );
+        assert_eq!(completed.ts_init, ts_init);
+        assert!(segments.next().is_none());
+        assert!(data_rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_stream_handler_sets_rcm_init_from_clock() {
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_002);
+
+        let (handler, mut data_rx) = stream_handler_at(ts_init);
+        let data = load_test_json("stream/rcm_single.json");
+
+        handler(stream_decode(data.as_bytes()).unwrap());
+
+        let custom = receive_custom::<BetfairRaceRunnerData>(&mut data_rx);
+        let runner = custom
+            .as_any()
+            .downcast_ref::<BetfairRaceRunnerData>()
+            .unwrap();
+
+        assert_eq!(runner.ts_event, UnixNanos::from(1_518_626_674_000_000_000));
+        assert_eq!(runner.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_stream_handler_uses_rcm_publish_time_without_feed_time() {
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_003);
+
+        let (handler, mut data_rx) = stream_handler_at(ts_init);
+        let data = load_test_json("stream/rcm_single.json");
+        let mut message: serde_json::Value = serde_json::from_str(&data).unwrap();
+        message
+            .pointer_mut("/rc/0/rrc/0")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("ft");
+        let data = message.to_string();
+
+        handler(stream_decode(data.as_bytes()).unwrap());
+
+        let custom = receive_custom::<BetfairRaceRunnerData>(&mut data_rx);
+        let runner = custom
+            .as_any()
+            .downcast_ref::<BetfairRaceRunnerData>()
+            .unwrap();
+
+        assert_eq!(runner.ts_event, UnixNanos::from(1_518_626_764_000_000_000));
+        assert_eq!(runner.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_stream_handler_emits_cricket_match_custom_data() {
+        let ts_init = UnixNanos::from(1_800_000_000_000_000_004);
+
+        let (handler, mut data_rx) = stream_handler_at(ts_init);
         let data = load_test_json("stream/ccm_single.json");
 
-        handler(data.as_bytes());
+        handler(stream_decode(data.as_bytes()).unwrap());
 
         let event = data_rx.try_recv().expect("expected cricket custom data");
         let DataEvent::Data(Data::Custom(custom)) = event else {
@@ -1110,6 +1322,8 @@ mod tests {
 
         assert_eq!(cricket.event_id, "35741575");
         assert_eq!(cricket.market_id, "1.259334639");
+        assert_eq!(cricket.ts_event, UnixNanos::from(1_700_000_000_000_000_000));
+        assert_eq!(cricket.ts_init, ts_init);
         assert_eq!(
             metadata.get("event_id"),
             Some(&serde_json::Value::String("35741575".to_string())),

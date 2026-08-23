@@ -7,31 +7,29 @@ import typing
 from nautilus_trader import model
 
 __all__ = [
-    "DydxClientOrderIdEncoder",
+    "DYDX",
+    "DYDX_CLIENT_ID",
+    "DYDX_VENUE",
     "DydxDataClientConfig",
     "DydxDataClientFactory",
     "DydxExecClientConfig",
     "DydxExecutionClientFactory",
-    "DydxGrpcClient",
-    "DydxHttpClient",
     "DydxNetwork",
-    "DydxOraclePrice",
-    "DydxOrderSide",
-    "DydxOrderSubmitter",
-    "DydxOrderType",
-    "DydxWallet",
-    "DydxWebSocketClient",
-    "get_dydx_grpc_url",
-    "get_dydx_grpc_urls",
-    "get_dydx_http_url",
-    "get_dydx_ws_url",
 ]
+
+DYDX: str
+DYDX_CLIENT_ID: model.ClientId
+DYDX_VENUE: model.Venue
 
 @typing.final
 class DydxDataClientConfig:
+    @property
+    def network(self) -> DydxNetwork: ...
     def __init__(
         self, proxy_url: str | None = None, network: DydxNetwork | None = None
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class DydxDataClientFactory:
@@ -40,6 +38,16 @@ class DydxDataClientFactory:
 
 @typing.final
 class DydxExecClientConfig:
+    @property
+    def trader_id(self) -> model.TraderId: ...
+    @property
+    def account_id(self) -> model.AccountId: ...
+    @property
+    def network(self) -> DydxNetwork: ...
+    @property
+    def wallet_address(self) -> str | None: ...
+    @property
+    def subaccount_number(self) -> int: ...
     def __init__(
         self,
         trader_id: model.TraderId,
@@ -50,6 +58,8 @@ class DydxExecClientConfig:
         wallet_address: str | None = None,
         subaccount_number: int = 0,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class DydxExecutionClientFactory:
@@ -157,7 +167,7 @@ class DydxOraclePrice:
 class DydxWebSocketClient:
     @staticmethod
     def new_public(
-        url: str, heartbeat: int | None = None, proxy_url: str | None = None
+        url: str, heartbeat: int | None = ..., proxy_url: str | None = None
     ) -> DydxWebSocketClient: ...
     @staticmethod
     def new_private(
@@ -165,7 +175,7 @@ class DydxWebSocketClient:
         private_key: str,
         authenticator_ids: typing.Sequence[int],
         account_id: model.AccountId,
-        heartbeat: int | None = None,
+        heartbeat: int | None = ...,
         proxy_url: str | None = None,
     ) -> DydxWebSocketClient: ...
     def is_connected(self) -> bool: ...

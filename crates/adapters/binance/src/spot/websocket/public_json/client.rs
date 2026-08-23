@@ -73,6 +73,7 @@ pub struct BinanceSpotPublicJsonWebSocketClient {
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     transport_backend: TransportBackend,
+    proxy_url: Option<String>,
 }
 
 impl Debug for BinanceSpotPublicJsonWebSocketClient {
@@ -113,7 +114,15 @@ impl BinanceSpotPublicJsonWebSocketClient {
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
             transport_backend,
+            proxy_url: None,
         }
+    }
+
+    /// Configures the proxy used by every connection in the stream pool.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
     }
 
     /// Returns whether any connection in the pool is active.
@@ -345,6 +354,15 @@ impl BinanceSpotPublicJsonWebSocketClient {
         });
     }
 
+    /// Replaces the complete instrument cache.
+    pub fn replace_instruments(&self, instruments: &[InstrumentAny]) {
+        let cache = instruments
+            .iter()
+            .map(|instrument| (instrument.raw_symbol().inner(), instrument.clone()))
+            .collect();
+        self.instruments_cache.store(cache);
+    }
+
     /// Returns a shared reference to the instruments cache.
     #[must_use]
     pub fn instruments_cache(&self) -> Arc<AtomicMap<Ustr, InstrumentAny>> {
@@ -365,17 +383,18 @@ impl BinanceSpotPublicJsonWebSocketClient {
         let config = WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
-            heartbeat: self.heartbeat,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(5_000),
+            heartbeat_interval_secs: self.heartbeat,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(5_000),
             reconnect_delay_initial_ms: Some(500),
             reconnect_delay_max_ms: Some(5_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
-            proxy_url: None,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let keyed_quotas = vec![(
@@ -387,7 +406,6 @@ impl BinanceSpotPublicJsonWebSocketClient {
             config,
             Some(raw_handler),
             Some(ping_handler),
-            None,
             keyed_quotas,
             Some(*BINANCE_WS_CONNECTION_QUOTA),
         )
@@ -512,6 +530,18 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_with_proxy_preserves_proxy_url() {
+        let client =
+            BinanceSpotPublicJsonWebSocketClient::new(None, None, TransportBackend::default())
+                .with_proxy(Some("http://proxy.example:8080".to_string()));
+
+        assert_eq!(
+            client.proxy_url.as_deref(),
+            Some("http://proxy.example:8080")
+        );
+    }
 
     fn make_slot_with_streams(
         streams: Vec<String>,

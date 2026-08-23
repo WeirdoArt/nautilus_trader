@@ -26,6 +26,8 @@ use nautilus_core::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "defi")]
+use crate::types::fixed::MAX_FLOAT_PRECISION;
 use crate::{
     expressions::{Bindings, CompiledExpression, ExpressionError, compile_numeric},
     identifiers::{InstrumentId, Symbol, Venue},
@@ -71,7 +73,7 @@ impl SyntheticInstrumentError {
 #[derive(Clone, Debug, Builder)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -169,8 +171,21 @@ impl SyntheticInstrument {
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Result<Self, SyntheticInstrumentError> {
-        let price_increment =
-            Price::new_checked(10f64.powi(-i32::from(price_precision)), price_precision)?;
+        #[cfg(feature = "defi")]
+        if price_precision > MAX_FLOAT_PRECISION {
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "`precision` exceeded maximum float precision ({MAX_FLOAT_PRECISION}), use `Price::from_wei()` for wei values instead"
+                ),
+            }
+            .into());
+        }
+
+        let price_increment = Price::from_mantissa_exponent_checked(
+            1,
+            -price_precision.cast_signed(),
+            price_precision,
+        )?;
         let component_names = component_names_from_components(&components);
         let compiled_formula = compile_formula(formula, &component_names)?;
 
@@ -370,7 +385,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::types::fixed::FIXED_PRECISION;
+    use crate::types::{fixed::FIXED_PRECISION, price::PriceRaw};
 
     #[rstest]
     fn test_calculate_from_map() {
@@ -479,6 +494,32 @@ mod tests {
     }
 
     #[rstest]
+    #[case(0)]
+    #[case(5)]
+    #[case(FIXED_PRECISION)]
+    fn test_new_checked_constructs_exact_price_increment(#[case] price_precision: u8) {
+        let components = vec![
+            InstrumentId::from_str("BTC.BINANCE").unwrap(),
+            InstrumentId::from_str("LTC.BINANCE").unwrap(),
+        ];
+
+        let synth = SyntheticInstrument::new_checked(
+            Symbol::from("BTC-LTC"),
+            price_precision,
+            components,
+            "BTC.BINANCE + LTC.BINANCE",
+            0.into(),
+            0.into(),
+        )
+        .unwrap();
+        let expected_raw = PriceRaw::from(10_u8).pow(u32::from(FIXED_PRECISION - price_precision));
+
+        assert_eq!(synth.price_precision, price_precision);
+        assert_eq!(synth.price_increment.raw, expected_raw);
+        assert_eq!(synth.price_increment.precision, price_precision);
+    }
+
+    #[rstest]
     fn test_new_checked_rejects_unknown_formula_symbol_with_expression_error() {
         let components = vec![
             InstrumentId::from_str("BTC.BINANCE").unwrap(),
@@ -500,6 +541,32 @@ mod tests {
             SyntheticInstrumentError::Expression { .. }
         ));
         assert_eq!(error.to_string(), "Unknown symbol `missing`");
+    }
+
+    #[rstest]
+    fn test_new_checked_rejects_excessive_expression_depth() {
+        let formula = std::iter::repeat_n("1", 129)
+            .collect::<Vec<_>>()
+            .join(" + ");
+
+        let error = SyntheticInstrument::new_checked(
+            Symbol::from("DEEP"),
+            2,
+            Vec::new(),
+            &formula,
+            0.into(),
+            0.into(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            SyntheticInstrumentError::Expression { .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Expression nesting depth 129 exceeds maximum 128 (the top-level expression counts as one level)"
+        );
     }
 
     #[rstest]
@@ -712,7 +779,7 @@ mod tests {
         let components: Vec<InstrumentId> = (0..count)
             .map(|i| InstrumentId::from(format!("C{i}.VENUE").as_str()))
             .collect();
-        let terms: Vec<String> = components.iter().map(|c| c.to_string()).collect();
+        let terms: Vec<String> = components.iter().map(ToString::to_string).collect();
         let formula = terms.join(" + ");
 
         let synth = SyntheticInstrument::new(

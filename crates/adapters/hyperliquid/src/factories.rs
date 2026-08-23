@@ -52,10 +52,7 @@ impl ClientConfig for HyperliquidExecClientConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -116,10 +113,7 @@ impl DataClientFactory for HyperliquidDataClientFactory {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -134,6 +128,13 @@ pub struct HyperliquidExecFactoryConfig {
     pub config: HyperliquidExecClientConfig,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(HyperliquidExecFactoryConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    config: HyperliquidExecClientConfig,
+});
+
 impl ClientConfig for HyperliquidExecFactoryConfig {
     fn as_any(&self) -> &dyn Any {
         self
@@ -144,10 +145,7 @@ impl ClientConfig for HyperliquidExecFactoryConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

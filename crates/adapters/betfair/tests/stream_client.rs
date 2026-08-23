@@ -83,8 +83,8 @@ fn plain_config(port: u16) -> BetfairStreamConfig {
     BetfairStreamConfig {
         host: "127.0.0.1".to_string(),
         port,
-        heartbeat_ms: 5_000,
-        idle_timeout_ms: 60_000,
+        heartbeat_secs: None,
+        heartbeat_timeout_secs: 60,
         reconnect_delay_initial_ms: 200,
         reconnect_delay_max_ms: 1_000,
         use_tls: false,
@@ -124,6 +124,137 @@ async fn test_connect_sends_auth() {
     assert_eq!(json["op"], "authentication");
     assert_eq!(json["appKey"], "test-app-key");
     assert_eq!(json["session"], "sess-token");
+
+    client.close().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_sends_configured_outbound_heartbeat() {
+    let (port, listener) = bind().await;
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = socket.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_line(
+            &mut write_half,
+            r#"{"op":"connection","connectionId":"heartbeat-on"}"#,
+        )
+        .await;
+        read_line(&mut reader).await;
+        read_line(&mut reader).await
+    });
+
+    let config = BetfairStreamConfig {
+        heartbeat_secs: Some(1),
+        ..plain_config(port)
+    };
+    let client = BetfairStreamClient::connect(
+        &test_credential(),
+        "tok".to_string(),
+        Arc::new(|_| {}),
+        config,
+    )
+    .await
+    .unwrap();
+
+    let heartbeat = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("configured outbound heartbeat was not sent")
+        .unwrap();
+    let heartbeat: serde_json::Value = serde_json::from_str(&heartbeat).unwrap();
+    assert_eq!(heartbeat, serde_json::json!({"op": "heartbeat"}));
+
+    client.close().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_without_heartbeat_keeps_idle_connection_active() {
+    let (port, listener) = bind().await;
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = socket.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        write_line(
+            &mut write_half,
+            r#"{"op":"connection","connectionId":"heartbeat-off"}"#,
+        )
+        .await;
+        read_line(&mut reader).await;
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(6), reader.read_line(&mut line)).await
+    });
+
+    let config = BetfairStreamConfig {
+        heartbeat_timeout_secs: 1,
+        ..plain_config(port)
+    };
+    let client = BetfairStreamClient::connect(
+        &test_credential(),
+        "tok".to_string(),
+        Arc::new(|_| {}),
+        config,
+    )
+    .await
+    .unwrap();
+
+    let heartbeat = server.await.unwrap();
+    assert!(
+        heartbeat.is_err(),
+        "idle stream must not send a heartbeat or reconnect"
+    );
+    assert!(client.is_active());
+
+    client.close().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_aux_stream_without_heartbeat_keeps_idle_connection_active() {
+    use nautilus_betfair::stream::client::BetfairRaceStreamClient;
+
+    let (port, listener) = bind().await;
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read_half, _write_half) = socket.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        read_line(&mut reader).await;
+        read_line(&mut reader).await;
+
+        tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+    });
+
+    let config = BetfairStreamConfig {
+        heartbeat_timeout_secs: 1,
+        reconnect_delay_initial_ms: 100,
+        reconnect_delay_max_ms: 500,
+        ..plain_config(port)
+    };
+    let (fatal_tx, _fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = BetfairRaceStreamClient::connect(
+        &test_credential(),
+        "tok".to_string(),
+        Arc::new(|_| {}),
+        config,
+        fatal_tx,
+    )
+    .await
+    .unwrap();
+
+    let reconnect = server.await.unwrap();
+    assert!(
+        reconnect.is_err(),
+        "idle auxiliary stream must not reconnect"
+    );
+    assert!(client.is_active());
 
     client.close().await;
 }
@@ -170,13 +301,15 @@ async fn test_subscribe_markets_includes_market_filter_and_fields() {
     };
 
     client
-        .subscribe_markets(market_filter, data_filter, None, None)
+        .subscribe_markets(market_filter, data_filter, Some(2_345), None)
         .await
         .unwrap();
 
     let msg = server.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
     assert_eq!(json["op"], "marketSubscription");
+    assert_eq!(json["heartbeatMs"], 2_345);
+    assert_eq!(json["segmentationEnabled"], true);
 
     let market_ids = json["marketFilter"]["marketIds"]
         .as_array()
@@ -235,6 +368,8 @@ async fn test_subscribe_markets_sends_subscription() {
     let msg = server.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
     assert_eq!(json["op"], "marketSubscription");
+    assert_eq!(json["heartbeatMs"], 5_000);
+    assert_eq!(json["segmentationEnabled"], true);
 
     client.close().await;
 }
@@ -276,13 +411,15 @@ async fn test_subscribe_orders_includes_order_filter_payload() {
     };
 
     client
-        .subscribe_orders(Some(order_filter), None)
+        .subscribe_orders(Some(order_filter), Some(3_456))
         .await
         .unwrap();
 
     let msg = server.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
     assert_eq!(json["op"], "orderSubscription");
+    assert_eq!(json["heartbeatMs"], 3_456);
+    assert_eq!(json["segmentationEnabled"], true);
     assert_eq!(json["orderFilter"]["includeOverallPosition"], false);
     assert_eq!(json["orderFilter"]["partitionMatchedByStrategyRef"], true);
 
@@ -603,6 +740,8 @@ async fn test_subscribe_orders_sends_subscription() {
     let msg = server.await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
     assert_eq!(json["op"], "orderSubscription");
+    assert_eq!(json["heartbeatMs"], 5_000);
+    assert_eq!(json["segmentationEnabled"], true);
 
     client.close().await;
 }
@@ -983,41 +1122,34 @@ async fn test_reconnect_replays_both_subscriptions() {
     client.close().await;
 }
 
-/// After calling `update_auth`, the next reconnection uses the refreshed session token.
+/// An explicit reconnect opens a replacement socket and replays current auth before the retained
+/// market subscription, including its latest clock pair.
 #[rstest]
 #[tokio::test]
-async fn test_reconnect_uses_updated_auth_token() {
+async fn test_request_reconnect_uses_updated_auth_and_clk() {
     let (port, listener) = bind().await;
 
-    let reconnected = Arc::new(AtomicBool::new(false));
-    let reconnect_session = Arc::new(tokio::sync::Mutex::new(String::new()));
     let mcm_received = Arc::new(AtomicBool::new(false));
 
-    let reconnected2 = Arc::clone(&reconnected);
-    let reconnect_session2 = Arc::clone(&reconnect_session);
     let mcm_received_server = Arc::clone(&mcm_received);
     let mcm_received_handler = Arc::clone(&mcm_received);
 
     let server = tokio::spawn(async move {
-        // First connection
         let (socket, _) = listener.accept().await.unwrap();
         let (read_half, mut write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
-
-        write_line(
-            &mut write_half,
-            r#"{"op":"connection","connectionId":"first"}"#,
-        )
-        .await;
 
         let auth_msg = read_line(&mut reader).await;
         let auth_json: serde_json::Value = serde_json::from_str(&auth_msg).unwrap();
         assert_eq!(auth_json["session"], "old-token");
 
-        // Send MCM so clk is stored
+        let initial_sub = read_line(&mut reader).await;
+        let initial_sub_json: serde_json::Value = serde_json::from_str(&initial_sub).unwrap();
+        assert_eq!(initial_sub_json["op"], "marketSubscription");
+
         write_line(
             &mut write_half,
-            r#"{"op":"mcm","pt":1000,"clk":"clk1","mc":[{"id":"1.111"}]}"#,
+            r#"{"op":"mcm","pt":1000,"clk":"clk1","initialClk":"initial-clk1","mc":[{"id":"1.111"}]}"#,
         )
         .await;
 
@@ -1030,27 +1162,21 @@ async fn test_reconnect_uses_updated_auth_token() {
         )
         .await;
 
-        // Drop to trigger reconnect
-        drop(write_half);
-        drop(reader);
-
-        // Second connection, should use refreshed token
         let (socket, _) = listener.accept().await.unwrap();
-        let (read_half, mut write_half) = socket.into_split();
+        let (read_half, _write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
-
-        write_line(
-            &mut write_half,
-            r#"{"op":"connection","connectionId":"second"}"#,
-        )
-        .await;
 
         let auth_msg = read_line(&mut reader).await;
         let auth_json: serde_json::Value = serde_json::from_str(&auth_msg).unwrap();
-        *reconnect_session2.lock().await = auth_json["session"].as_str().unwrap_or("").to_string();
+        assert_eq!(auth_json["op"], "authentication");
+        assert_eq!(auth_json["session"], "refreshed-token");
 
-        reconnected2.store(true, Ordering::Relaxed);
-        drop(write_half);
+        let replayed_sub = read_line(&mut reader).await;
+        let replayed_sub_json: serde_json::Value = serde_json::from_str(&replayed_sub).unwrap();
+        assert_eq!(replayed_sub_json["op"], "marketSubscription");
+        assert_eq!(replayed_sub_json["id"], initial_sub_json["id"]);
+        assert_eq!(replayed_sub_json["clk"], "clk1");
+        assert_eq!(replayed_sub_json["initialClk"], "initial-clk1");
     });
 
     let cred = test_credential();
@@ -1074,7 +1200,6 @@ async fn test_reconnect_uses_updated_auth_token() {
         .await
         .unwrap();
 
-    // Push a refreshed token before the reconnect happens
     wait_until_async(
         || {
             let r = Arc::clone(&mcm_received);
@@ -1085,25 +1210,53 @@ async fn test_reconnect_uses_updated_auth_token() {
     .await;
 
     client.update_auth("test-app-key", "refreshed-token".to_string());
+    assert!(client.request_reconnect());
+    assert!(
+        !client.request_reconnect(),
+        "a duplicate request must be coalesced while reconnecting"
+    );
 
     server.await.unwrap();
 
-    wait_until_async(
-        || {
-            let r = Arc::clone(&reconnected);
-            async move { r.load(Ordering::Relaxed) }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let session = reconnect_session.lock().await;
-    assert_eq!(
-        *session, "refreshed-token",
-        "reconnect should use the token pushed via update_auth"
-    );
-
     client.close().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_reconnect_after_close_does_not_open_connection() {
+    let (port, listener) = bind().await;
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (read_half, _write_half) = socket.into_split();
+        let mut reader = BufReader::new(read_half);
+        let _ = accepted_tx.send(());
+        let _ = read_line(&mut reader).await;
+
+        let accepted = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "a reconnect request after close must not open a replacement socket"
+        );
+    });
+
+    let cred = test_credential();
+    let handler: TcpMessageHandler = Arc::new(|_| {});
+    let client = BetfairStreamClient::connect(
+        &cred,
+        "session-token".to_string(),
+        handler,
+        plain_config(port),
+    )
+    .await
+    .unwrap();
+
+    accepted_rx.await.unwrap();
+    client.close().await;
+    assert!(!client.request_reconnect());
+
+    server.await.unwrap();
 }
 
 /// `MAX_CONNECTION_LIMIT_EXCEEDED` from the race stream is unrecoverable
@@ -1173,64 +1326,48 @@ async fn test_race_stream_max_connection_limit_signals_fatal() {
     server.await.unwrap();
 }
 
-/// After calling `update_auth` on the race stream client, reconnection uses the
-/// refreshed session token.
+/// Both auxiliary stream variants delegate explicit reconnects to the same socket path and replay
+/// current auth before their retained subscription.
 #[rstest]
+#[case::race(false, "raceSubscription")]
+#[case::cricket(true, "cricketSubscription")]
 #[tokio::test]
-async fn test_race_stream_reconnect_uses_updated_auth_token() {
+async fn test_aux_stream_request_reconnect_uses_updated_auth(
+    #[case] cricket: bool,
+    #[case] subscription_op: &'static str,
+) {
     use nautilus_betfair::stream::client::BetfairRaceStreamClient;
 
     let (port, listener) = bind().await;
 
-    let reconnected = Arc::new(AtomicBool::new(false));
-    let reconnect_session = Arc::new(tokio::sync::Mutex::new(String::new()));
-
-    let reconnected2 = Arc::clone(&reconnected);
-    let reconnect_session2 = Arc::clone(&reconnect_session);
-
     let (race_fatal_tx, _race_fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (initial_read_tx, initial_read_rx) = tokio::sync::oneshot::channel();
 
     let server = tokio::spawn(async move {
-        // First connection
         let (socket, _) = listener.accept().await.unwrap();
-        let (read_half, mut write_half) = socket.into_split();
+        let (read_half, _write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
 
-        write_line(
-            &mut write_half,
-            r#"{"op":"connection","connectionId":"race-1"}"#,
-        )
-        .await;
+        let initial_auth = read_line(&mut reader).await;
+        let initial_auth_json: serde_json::Value = serde_json::from_str(&initial_auth).unwrap();
+        assert_eq!(initial_auth_json["session"], "old-race-token");
+        let initial_sub = read_line(&mut reader).await;
+        let initial_sub_json: serde_json::Value = serde_json::from_str(&initial_sub).unwrap();
+        assert_eq!(initial_sub_json["op"], subscription_op);
+        let _ = initial_read_tx.send(());
 
-        // Read auth + raceSubscription (may arrive as one or two lines)
-        let _first = read_line(&mut reader).await;
-
-        // Brief pause then drop to trigger reconnect
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        drop(write_half);
-        drop(reader);
-
-        // Second connection
         let (socket, _) = listener.accept().await.unwrap();
-        let (read_half, mut write_half) = socket.into_split();
+        let (read_half, _write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
 
-        write_line(
-            &mut write_half,
-            r#"{"op":"connection","connectionId":"race-2"}"#,
-        )
-        .await;
+        let auth = read_line(&mut reader).await;
+        let auth_json: serde_json::Value = serde_json::from_str(&auth).unwrap();
+        assert_eq!(auth_json["op"], "authentication");
+        assert_eq!(auth_json["session"], "new-race-token");
 
-        // Read reconnect auth
-        let msg = read_line(&mut reader).await;
-        // post_reconnection sends auth + sub in one combined write; parse the auth portion
-        if let Ok(auth_json) = serde_json::from_str::<serde_json::Value>(&msg) {
-            *reconnect_session2.lock().await =
-                auth_json["session"].as_str().unwrap_or("").to_string();
-        }
-
-        reconnected2.store(true, Ordering::Relaxed);
-        drop(write_half);
+        let replayed_sub = read_line(&mut reader).await;
+        let replayed_sub_json: serde_json::Value = serde_json::from_str(&replayed_sub).unwrap();
+        assert_eq!(replayed_sub_json, initial_sub_json);
     });
 
     let cred = test_credential();
@@ -1241,35 +1378,33 @@ async fn test_race_stream_reconnect_uses_updated_auth_token() {
         ..plain_config(port)
     };
 
-    let client = BetfairRaceStreamClient::connect(
-        &cred,
-        "old-race-token".to_string(),
-        handler,
-        config,
-        race_fatal_tx,
-    )
-    .await
-    .unwrap();
+    let client = if cricket {
+        BetfairRaceStreamClient::connect_cricket(
+            &cred,
+            "old-race-token".to_string(),
+            handler,
+            config,
+            race_fatal_tx,
+        )
+        .await
+        .unwrap()
+    } else {
+        BetfairRaceStreamClient::connect(
+            &cred,
+            "old-race-token".to_string(),
+            handler,
+            config,
+            race_fatal_tx,
+        )
+        .await
+        .unwrap()
+    };
 
-    // Push refreshed token
+    initial_read_rx.await.unwrap();
     client.update_auth("test-app-key", "new-race-token".to_string());
+    assert!(client.request_reconnect());
 
     server.await.unwrap();
-
-    wait_until_async(
-        || {
-            let r = Arc::clone(&reconnected);
-            async move { r.load(Ordering::Relaxed) }
-        },
-        Duration::from_secs(5),
-    )
-    .await;
-
-    let session = reconnect_session.lock().await;
-    assert_eq!(
-        *session, "new-race-token",
-        "race stream reconnect should use the token pushed via update_auth"
-    );
 
     client.close().await;
 }

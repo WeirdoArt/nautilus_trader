@@ -9,7 +9,7 @@
 #
 #     scripts/check-no-build-packages.sh
 #
-# Exits 0 when both lock/manifest pairs are in sync, 1 otherwise.
+# Exits 0 when the lock and manifest are in sync, 1 otherwise.
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ for tool in awk sort comm uniq diff; do
   }
 done
 
-# Emit the names of third-party packages in a uv.lock — i.e. every package
+# Emit the names of third-party packages in a uv.lock - i.e. every package
 # whose source is a registry/git/url. Workspace members (source.editable or
 # source.virtual, or no source at all) are skipped.
 locked_third_party() {
@@ -69,7 +69,6 @@ declared_packages() {
 }
 
 pairs=(
-  "uv.lock:pyproject.toml"
   "python/uv.lock:python/pyproject.toml"
 )
 

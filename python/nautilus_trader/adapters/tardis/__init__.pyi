@@ -9,19 +9,8 @@ from nautilus_trader import model
 __all__ = [
     "ReplayNormalizedRequestOptions",
     "StreamNormalizedRequestOptions",
-    "TardisBatchedDeltasStreamIterator",
     "TardisDataClientConfig",
     "TardisDataClientFactory",
-    "TardisDeltaStreamIterator",
-    "TardisDepth10StreamIterator",
-    "TardisFundingRateStreamIterator",
-    "TardisHttpClient",
-    "TardisInstrumentMiniInfo",
-    "TardisMachineClient",
-    "TardisOptionsChainStreamIterator",
-    "TardisQuoteStreamIterator",
-    "TardisTradeStreamIterator",
-    "bar_spec_to_tardis_trade_bar_string",
     "convert_tardis_options_chain_csv",
     "load_tardis_deltas",
     "load_tardis_depth10_from_snapshot5",
@@ -39,11 +28,6 @@ __all__ = [
     "stream_tardis_options_chain",
     "stream_tardis_quotes",
     "stream_tardis_trades",
-    "tardis_exchange_from_venue_str",
-    "tardis_exchange_is_option_exchange",
-    "tardis_exchange_to_venue_str",
-    "tardis_exchanges",
-    "tardis_normalize_symbol_str",
 ]
 
 @typing.final
@@ -67,6 +51,16 @@ class TardisBatchedDeltasStreamIterator:
 
 @typing.final
 class TardisDataClientConfig:
+    @property
+    def tardis_ws_url(self) -> str | None: ...
+    @property
+    def normalize_symbols(self) -> bool: ...
+    @property
+    def extract_bbo_as_quotes(self) -> bool: ...
+    @property
+    def options(self) -> list[ReplayNormalizedRequestOptions]: ...
+    @property
+    def stream_options(self) -> list[StreamNormalizedRequestOptions]: ...
     def __init__(
         self,
         api_key: str | None = None,
@@ -77,6 +71,8 @@ class TardisDataClientConfig:
         stream_options: typing.Sequence[StreamNormalizedRequestOptions] | None = None,
         extract_bbo_as_quotes: bool | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class TardisDataClientFactory:

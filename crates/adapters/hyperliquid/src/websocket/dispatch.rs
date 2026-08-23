@@ -16,9 +16,9 @@
 //! WebSocket execution dispatch for the Hyperliquid execution client.
 //!
 //! Implements the two-tier execution dispatch contract from
-//! `docs/developer_guide/adapters.md` (lines 1232-1296):
+//! `docs/developer_guide/adapters.md#tracked-and-external-execution-updates`:
 //!
-//! 1. The execution client registers an [`OrderIdentity`] in [`WsDispatchState`]
+//! 1. The execution client registers an [`OrderContext`] in [`WsDispatchState`]
 //!    when it submits an order, and refreshes the cached venue order id when a
 //!    modify is sent so the WebSocket consumer can detect cancel-replace.
 //! 2. Incoming [`OrderStatusReport`] and [`FillReport`] messages are routed
@@ -28,7 +28,7 @@
 //!    external orders the dispatch falls back to forwarding the raw report.
 //!
 //! The dispatch state lives in an `Arc<WsDispatchState>` shared between the
-//! main client task (which registers identities at submission time) and the
+//! main client task (which registers contexts at submission time) and the
 //! spawned WebSocket consumer task.
 //!
 //! # GH-3827 cancel-replace handling
@@ -55,7 +55,7 @@
 //! promotes the binding directly (the same `OrderUpdated` path as the
 //! replacement `ACCEPTED`), so a dropped `ACCEPTED` does not strand the fill.
 //! A fill is buffered into [`WsDispatchState::buffered_fills`] only when the
-//! identity has no price to promote with; `handle_accepted` drains the buffer
+//! context has no price to promote with; `handle_accepted` drains the buffer
 //! on the replacement `ACCEPTED`. A delayed earlier-leg fill during a chained
 //! modify is a known limitation. See GH-3972.
 //!
@@ -66,123 +66,34 @@
 
 use std::{
     collections::VecDeque,
-    hash::Hash,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use ahash::AHashSet;
 use dashmap::{DashMap, DashSet};
+use nautilus_common::cache::fifo::FifoCache;
 use nautilus_core::{MUTEX_POISONED, UUID4, UnixNanos};
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType},
+    enums::{OrderStatus, OrderType},
     events::{
         OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFilled, OrderRejected,
         OrderTriggered, OrderUpdated,
     },
-    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
     types::{Price, Quantity},
 };
 use ustr::Ustr;
 
-use crate::http::models::HyperliquidExecPlaceOrderRequest;
+use crate::{
+    common::consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH,
+    http::models::HyperliquidExecPlaceOrderRequest,
+};
 
 pub const DEDUP_CAPACITY: usize = 10_000;
-
-/// Identity metadata captured when an order is submitted through this client.
-///
-/// Stored in [`WsDispatchState::order_identities`] keyed by the full Nautilus
-/// [`ClientOrderId`]. The dispatch functions use the identity to build typed
-/// order events for tracked orders without needing access to the engine cache
-/// (which is `!Send` and unreachable from the spawned WebSocket task).
-#[derive(Debug, Clone)]
-pub struct OrderIdentity {
-    /// Strategy that owns the order.
-    pub strategy_id: StrategyId,
-    /// Instrument the order targets.
-    pub instrument_id: InstrumentId,
-    /// Order side captured at submission.
-    pub order_side: OrderSide,
-    /// Order type captured at submission.
-    pub order_type: OrderType,
-    /// Order quantity captured at submission.
-    pub quantity: Quantity,
-    /// Last known order price. Populated on submission and refreshed from
-    /// subsequent status reports so a cancel-replace `ACCEPTED` that omits
-    /// `price` can still produce an `OrderUpdated` carrying an accurate value.
-    pub price: Option<Price>,
-}
-
-/// Bounded FIFO deduplication set.
-///
-/// When the capacity is reached, the oldest entry is evicted on the next
-/// insert. A simple `clear()` at the threshold would drop every recent trade
-/// id at once, opening a window where a reconnect or replay right after the
-/// rollover could re-emit duplicate `OrderFilled` events; the FIFO window
-/// slides instead.
-#[derive(Debug)]
-pub struct BoundedDedup<T>
-where
-    T: Eq + Hash + Clone,
-{
-    order: VecDeque<T>,
-    set: AHashSet<T>,
-    capacity: usize,
-}
-
-impl<T> BoundedDedup<T>
-where
-    T: Eq + Hash + Clone,
-{
-    /// Creates a new bounded dedup set with the given `capacity`.
-    #[must_use]
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            set: AHashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Inserts a value. Returns `true` when the value was already present.
-    pub fn insert(&mut self, value: T) -> bool {
-        if self.set.contains(&value) {
-            return true;
-        }
-
-        if self.order.len() >= self.capacity
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.set.remove(&evicted);
-        }
-
-        self.order.push_back(value.clone());
-        self.set.insert(value);
-        false
-    }
-
-    /// Returns the number of entries currently tracked.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.set.len()
-    }
-
-    /// Returns whether the dedup set is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
-    }
-
-    /// Returns whether the value is currently tracked.
-    #[must_use]
-    pub fn contains(&self, value: &T) -> bool {
-        self.set.contains(value)
-    }
-}
 
 /// Maximum in-flight modify intents tracked per order. Rapid repricing rarely
 /// queues more than one or two unacknowledged modifies at once; the cap bounds
@@ -232,9 +143,21 @@ struct ModifyChain {
 #[derive(Debug)]
 pub struct WsDispatchState {
     /// Tracked orders keyed by full Nautilus [`ClientOrderId`].
-    pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
+    ///
+    /// The dispatch functions read the context to build typed order events for
+    /// tracked orders without needing access to the engine cache (which is
+    /// `!Send` and unreachable from the spawned WebSocket task). `quantity` and
+    /// `price` are refreshed from subsequent status reports so a cancel-replace
+    /// `ACCEPTED` that omits `price` can still produce an `OrderUpdated`
+    /// carrying an accurate value.
+    pub order_contexts: DashMap<ClientOrderId, OrderContext>,
     /// Client order IDs for which an `OrderAccepted` event has been emitted.
     pub emitted_accepted: DashSet<ClientOrderId>,
+    /// Tracked submissions whose POST response has not resolved yet.
+    pending_submissions: DashSet<ClientOrderId>,
+    /// Submission-time rejections held until the POST path can preserve its
+    /// more detailed venue error string.
+    pending_submission_rejections: DashMap<ClientOrderId, OrderStatusReport>,
     /// Client order IDs that have reached the filled terminal state.
     ///
     /// Retained past `cleanup_terminal` so that late replay of the same
@@ -244,10 +167,10 @@ pub struct WsDispatchState {
     ///
     /// Bounded FIFO dedup to bound memory while keeping recent trade ids
     /// deduped across reconnects.
-    pub emitted_trades: Mutex<BoundedDedup<TradeId>>,
+    emitted_trades: Mutex<FifoCache<TradeId, DEDUP_CAPACITY>>,
     /// Raw Hyperliquid CLOIDs that reached a terminal state through the post
     /// response path before the matching `orderUpdates` event arrived.
-    pub terminal_cloids: Mutex<BoundedDedup<Ustr>>,
+    terminal_cloids: Mutex<FifoCache<Ustr, DEDUP_CAPACITY>>,
     /// Last venue order id observed for a tracked client order id.
     ///
     /// Populated on the first `OrderAccepted` and refreshed on every
@@ -268,12 +191,12 @@ pub struct WsDispatchState {
     /// next intent's old leg advances to the promoted replacement.
     pending_modify_chains: DashMap<ClientOrderId, ModifyChain>,
     /// `FillReport`s buffered only when a cancel-replace fill cannot be promoted
-    /// (the identity carries no price); drained by the cancel-replace branch of
+    /// (the context carries no price); drained by the cancel-replace branch of
     /// `handle_accepted`. The common path promotes on the fill instead. See
     /// GH-3972.
     pub buffered_fills: DashMap<ClientOrderId, Vec<FillReport>>,
     /// Cumulative filled quantity per tracked order. Compared against
-    /// `OrderIdentity::quantity` to decide when to clean up tracked state.
+    /// `OrderContext::quantity` to decide when to clean up tracked state.
     pub order_filled_qty: DashMap<ClientOrderId, Quantity>,
     /// Corrective reduce queued by the cancel-replace promotion: client order
     /// id to (new venue order id, reduced request). Drained by the WS loop.
@@ -284,11 +207,13 @@ pub struct WsDispatchState {
 impl Default for WsDispatchState {
     fn default() -> Self {
         Self {
-            order_identities: DashMap::new(),
+            order_contexts: DashMap::new(),
             emitted_accepted: DashSet::default(),
+            pending_submissions: DashSet::default(),
+            pending_submission_rejections: DashMap::new(),
             filled_orders: DashSet::default(),
-            emitted_trades: Mutex::new(BoundedDedup::new(DEDUP_CAPACITY)),
-            terminal_cloids: Mutex::new(BoundedDedup::new(DEDUP_CAPACITY)),
+            emitted_trades: Mutex::new(FifoCache::new()),
+            terminal_cloids: Mutex::new(FifoCache::new()),
             cached_venue_order_ids: DashMap::new(),
             pending_modify_chains: DashMap::new(),
             buffered_fills: DashMap::new(),
@@ -306,33 +231,62 @@ impl WsDispatchState {
         Self::default()
     }
 
-    /// Registers an order identity. Called by the execution client at order
+    /// Registers an order context. Called by the execution client at order
     /// submission time, before any WebSocket events for the order can arrive.
-    pub fn register_identity(&self, client_order_id: ClientOrderId, identity: OrderIdentity) {
-        self.order_identities.insert(client_order_id, identity);
+    pub fn register_context(&self, context: OrderContext) {
+        self.order_contexts
+            .insert(context.identity.client_order_id, context);
     }
 
-    /// Returns a clone of the identity for the given client order id, if any.
+    /// Returns a copy of the context for the given client order id, if any.
     #[must_use]
-    pub fn lookup_identity(&self, client_order_id: &ClientOrderId) -> Option<OrderIdentity> {
-        self.order_identities
-            .get(client_order_id)
-            .map(|r| r.clone())
+    pub fn lookup_context(&self, client_order_id: &ClientOrderId) -> Option<OrderContext> {
+        self.order_contexts.get(client_order_id).map(|r| *r)
+    }
+
+    /// Marks a tracked order as awaiting its submission POST response.
+    pub fn mark_submission_pending(&self, client_order_id: ClientOrderId) {
+        self.pending_submissions.insert(client_order_id);
+    }
+
+    /// Returns whether the order still awaits its submission POST response.
+    #[must_use]
+    pub fn submission_pending(&self, client_order_id: &ClientOrderId) -> bool {
+        self.pending_submissions.contains(client_order_id)
+    }
+
+    /// Holds a submission-time rejection until the POST response resolves.
+    pub fn buffer_submission_rejection(
+        &self,
+        client_order_id: ClientOrderId,
+        report: OrderStatusReport,
+    ) {
+        self.pending_submission_rejections
+            .insert(client_order_id, report);
+    }
+
+    /// Resolves submission tracking and returns any early rejection report.
+    #[must_use]
+    pub fn resolve_submission(&self, client_order_id: &ClientOrderId) -> Option<OrderStatusReport> {
+        self.pending_submissions.remove(client_order_id);
+        self.pending_submission_rejections
+            .remove(client_order_id)
+            .map(|(_, report)| report)
     }
 
     /// Refreshes the tracked price for a modify ack when the new report
     /// carries an updated price.
-    pub fn update_identity_price(&self, client_order_id: &ClientOrderId, price: Option<Price>) {
+    pub fn update_context_price(&self, client_order_id: &ClientOrderId, price: Option<Price>) {
         if let Some(price) = price
-            && let Some(mut entry) = self.order_identities.get_mut(client_order_id)
+            && let Some(mut entry) = self.order_contexts.get_mut(client_order_id)
         {
             entry.price = Some(price);
         }
     }
 
     /// Refreshes the tracked quantity for a modify ack.
-    pub fn update_identity_quantity(&self, client_order_id: &ClientOrderId, quantity: Quantity) {
-        if let Some(mut entry) = self.order_identities.get_mut(client_order_id) {
+    pub fn update_context_quantity(&self, client_order_id: &ClientOrderId, quantity: Quantity) {
+        if let Some(mut entry) = self.order_contexts.get_mut(client_order_id) {
             entry.quantity = quantity;
         }
     }
@@ -362,7 +316,7 @@ impl WsDispatchState {
     )]
     pub fn check_and_insert_trade(&self, trade_id: TradeId) -> bool {
         let mut set = self.emitted_trades.lock().expect(MUTEX_POISONED);
-        set.insert(trade_id)
+        !set.insert(trade_id)
     }
 
     /// Records a terminal raw Hyperliquid CLOID.
@@ -377,7 +331,7 @@ impl WsDispatchState {
     )]
     pub fn insert_terminal_cloid(&self, cloid: Ustr) {
         let mut set = self.terminal_cloids.lock().expect(MUTEX_POISONED);
-        set.insert(cloid);
+        let _ = set.insert(cloid);
     }
 
     /// Returns whether a raw Hyperliquid CLOID reached a terminal state through
@@ -470,6 +424,7 @@ impl WsDispatchState {
         chain
             .intents
             .retain(|intent| intent.generation != generation);
+
         if let Some(old) = removed_front_old
             && let Some(new_front) = chain.intents.front_mut()
         {
@@ -641,10 +596,12 @@ impl WsDispatchState {
     /// Removes all dispatch state for an order that has reached a terminal state.
     ///
     /// `filled_orders` is intentionally *not* cleared here: the marker is
-    /// used to suppress stale replays and must outlive the identity cleanup.
+    /// used to suppress stale replays and must outlive the context cleanup.
     pub fn cleanup_terminal(&self, client_order_id: &ClientOrderId) {
-        self.order_identities.remove(client_order_id);
+        self.order_contexts.remove(client_order_id);
         self.emitted_accepted.remove(client_order_id);
+        self.pending_submissions.remove(client_order_id);
+        self.pending_submission_rejections.remove(client_order_id);
         self.cached_venue_order_ids.remove(client_order_id);
         self.pending_modify_chains.remove(client_order_id);
         self.pending_corrective.remove(client_order_id);
@@ -721,25 +678,25 @@ pub fn dispatch_order_event(
         return DispatchOutcome::Skip;
     }
 
-    let Some(identity) = state.lookup_identity(&client_order_id) else {
+    let Some(context) = state.lookup_context(&client_order_id) else {
         return DispatchOutcome::External;
     };
 
     match report.order_status {
         OrderStatus::Accepted => {
-            handle_accepted(report, client_order_id, &identity, state, emitter, ts_init)
+            handle_accepted(report, client_order_id, &context, state, emitter, ts_init)
         }
         OrderStatus::Triggered => {
-            handle_triggered(report, client_order_id, &identity, state, emitter, ts_init)
+            handle_triggered(report, client_order_id, &context, state, emitter, ts_init)
         }
         OrderStatus::Canceled => {
-            handle_canceled(report, client_order_id, &identity, state, emitter, ts_init)
+            handle_canceled(report, client_order_id, &context, state, emitter, ts_init)
         }
         OrderStatus::Expired => {
-            handle_expired(report, client_order_id, &identity, state, emitter, ts_init)
+            handle_expired(report, client_order_id, &context, state, emitter, ts_init)
         }
         OrderStatus::Rejected => {
-            handle_rejected(report, client_order_id, &identity, state, emitter, ts_init)
+            handle_rejected(report, client_order_id, &context, state, emitter, ts_init)
         }
         OrderStatus::Filled => handle_filled_marker(client_order_id, state),
         OrderStatus::PartiallyFilled => {
@@ -785,7 +742,7 @@ pub fn dispatch_order_fill(
         return DispatchOutcome::Skip;
     }
 
-    let Some(mut identity) = state.lookup_identity(&client_order_id) else {
+    let Some(mut context) = state.lookup_context(&client_order_id) else {
         return DispatchOutcome::External;
     };
 
@@ -800,12 +757,12 @@ pub fn dispatch_order_fill(
     {
         let target = state.pending_modify_target_qty(&client_order_id);
         let sent_request = state.modify_request(&client_order_id);
-        // Prefer the modify target price over the stale cached identity price
+        // Prefer the modify target price over the stale cached context price
         let price = sent_request
             .as_ref()
-            .zip(identity.price)
+            .zip(context.price)
             .and_then(|(r, cached)| Price::from_decimal_dp(r.price, cached.precision).ok())
-            .or(identity.price);
+            .or(context.price);
         let Some(price) = price else {
             log::warn!(
                 "Cannot promote cancel-replace for {client_order_id} from fill: no target \
@@ -814,10 +771,10 @@ pub fn dispatch_order_fill(
             state.buffer_fill(client_order_id, report.clone());
             return DispatchOutcome::Tracked;
         };
-        let updated_quantity = target.unwrap_or(identity.quantity);
+        let updated_quantity = target.unwrap_or(context.quantity);
         promote_cancel_replace(
             client_order_id,
-            &identity,
+            &context,
             state,
             emitter,
             report.venue_order_id,
@@ -828,9 +785,9 @@ pub fn dispatch_order_fill(
             report.ts_event,
             ts_init,
         );
-        // Re-read the identity advanced by the promotion (quantity and price)
-        if let Some(updated) = state.lookup_identity(&client_order_id) {
-            identity = updated;
+        // Re-read the context advanced by the promotion (quantity and price)
+        if let Some(updated) = state.lookup_context(&client_order_id) {
+            context = updated;
         }
 
         if let (Some(target), Some(sent_request)) = (target, sent_request) {
@@ -851,7 +808,7 @@ pub fn dispatch_order_fill(
         .unwrap_or_else(|| Quantity::zero(report.last_qty.precision));
     let cumulative = previous + report.last_qty;
 
-    let is_terminal_fill = cumulative >= identity.quantity;
+    let is_terminal_fill = cumulative >= context.quantity;
     if is_terminal_fill && !claim_terminal_order(client_order_id, state, OrderStatus::Filled) {
         return DispatchOutcome::Skip;
     }
@@ -860,7 +817,7 @@ pub fn dispatch_order_fill(
         client_order_id,
         report.venue_order_id,
         report.account_id,
-        &identity,
+        &context,
         state,
         emitter,
         report.ts_event,
@@ -869,14 +826,14 @@ pub fn dispatch_order_fill(
 
     let filled = OrderFilled::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         report.venue_order_id,
         report.account_id,
         report.trade_id,
-        identity.order_side,
-        identity.order_type,
+        context.identity.order_side,
+        context.identity.order_type,
         report.last_qty,
         report.last_px,
         report.commission.currency,
@@ -914,7 +871,7 @@ pub fn dispatch_order_fill(
 fn handle_accepted(
     report: &OrderStatusReport,
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_init: UnixNanos,
@@ -930,11 +887,11 @@ fn handle_accepted(
     if let Some(cached_voi) = state.cached_venue_order_id(&client_order_id)
         && cached_voi != venue_order_id
     {
-        let price = report.price.or(identity.price);
+        let price = report.price.or(context.price);
         let Some(price) = price else {
             log::warn!(
                 "Cannot emit OrderUpdated for cancel-replace {client_order_id}: \
-                 no price on report and no cached price on identity",
+                 no price on report and no cached price on context",
             );
             return DispatchOutcome::Skip;
         };
@@ -947,7 +904,7 @@ fn handle_accepted(
 
         promote_cancel_replace(
             client_order_id,
-            identity,
+            context,
             state,
             emitter,
             venue_order_id,
@@ -976,18 +933,18 @@ fn handle_accepted(
         // Repeat ACCEPTED for an already-accepted order. Nothing to emit;
         // refresh the cached price so a subsequent cancel-replace without a
         // report price can still recover an accurate value.
-        state.update_identity_price(&client_order_id, report.price);
+        state.update_context_price(&client_order_id, report.price);
         return DispatchOutcome::Tracked;
     }
 
     state.insert_accepted(client_order_id);
     state.record_venue_order_id(client_order_id, venue_order_id);
-    state.update_identity_price(&client_order_id, report.price);
+    state.update_context_price(&client_order_id, report.price);
 
     let accepted = OrderAccepted::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         venue_order_id,
         account_id,
@@ -1008,7 +965,7 @@ fn handle_accepted(
 )]
 fn promote_cancel_replace(
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     venue_order_id: VenueOrderId,
@@ -1020,15 +977,15 @@ fn promote_cancel_replace(
     ts_init: UnixNanos,
 ) {
     state.record_venue_order_id(client_order_id, venue_order_id);
-    state.update_identity_quantity(&client_order_id, quantity);
-    state.update_identity_price(&client_order_id, Some(price));
+    state.update_context_quantity(&client_order_id, quantity);
+    state.update_context_price(&client_order_id, Some(price));
     // Claim the front intent; the next queued modify advances to this replacement
     state.claim_front_modify(&client_order_id, venue_order_id);
 
     let updated = OrderUpdated::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         quantity,
         UUID4::new(),
@@ -1084,14 +1041,14 @@ pub fn promote_replacement_from_query(
         return false;
     }
 
-    let Some(identity) = state.lookup_identity(&client_order_id) else {
+    let Some(context) = state.lookup_context(&client_order_id) else {
         return false;
     };
 
-    let Some(price) = report.price.or(identity.price) else {
+    let Some(price) = report.price.or(context.price) else {
         log::warn!(
             "Cannot promote cancel-replace from query for {client_order_id}: \
-             no price on report and no cached price on identity",
+             no price on report and no cached price on context",
         );
         return false;
     };
@@ -1103,7 +1060,7 @@ pub fn promote_replacement_from_query(
 
     promote_cancel_replace(
         client_order_id,
-        &identity,
+        &context,
         state,
         emitter,
         report.venue_order_id,
@@ -1161,18 +1118,18 @@ fn maybe_queue_corrective_reduce(
 fn handle_triggered(
     report: &OrderStatusReport,
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_init: UnixNanos,
 ) -> DispatchOutcome {
     if !matches!(
-        identity.order_type,
+        context.identity.order_type,
         OrderType::StopLimit | OrderType::TrailingStopLimit | OrderType::LimitIfTouched
     ) {
         log::debug!(
             "Ignoring TRIGGERED status for non-triggerable order type {:?}: {client_order_id}",
-            identity.order_type,
+            context.identity.order_type,
         );
         return DispatchOutcome::Tracked;
     }
@@ -1181,7 +1138,7 @@ fn handle_triggered(
         client_order_id,
         report.venue_order_id,
         report.account_id,
-        identity,
+        context,
         state,
         emitter,
         report.ts_last,
@@ -1190,8 +1147,8 @@ fn handle_triggered(
 
     let triggered = OrderTriggered::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         UUID4::new(),
         report.ts_last,
@@ -1207,7 +1164,7 @@ fn handle_triggered(
 fn handle_canceled(
     report: &OrderStatusReport,
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_init: UnixNanos,
@@ -1246,7 +1203,7 @@ fn handle_canceled(
         client_order_id,
         venue_order_id,
         report.account_id,
-        identity,
+        context,
         state,
         emitter,
         report.ts_last,
@@ -1255,8 +1212,8 @@ fn handle_canceled(
 
     let canceled = OrderCanceled::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         UUID4::new(),
         report.ts_last,
@@ -1274,7 +1231,7 @@ fn handle_canceled(
 fn handle_expired(
     report: &OrderStatusReport,
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_init: UnixNanos,
@@ -1287,7 +1244,7 @@ fn handle_expired(
         client_order_id,
         report.venue_order_id,
         report.account_id,
-        identity,
+        context,
         state,
         emitter,
         report.ts_last,
@@ -1296,8 +1253,8 @@ fn handle_expired(
 
     let expired = OrderExpired::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         UUID4::new(),
         report.ts_last,
@@ -1314,11 +1271,16 @@ fn handle_expired(
 fn handle_rejected(
     report: &OrderStatusReport,
     client_order_id: ClientOrderId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_init: UnixNanos,
 ) -> DispatchOutcome {
+    if state.submission_pending(&client_order_id) {
+        state.buffer_submission_rejection(client_order_id, report.clone());
+        return DispatchOutcome::Skip;
+    }
+
     if !claim_terminal_order(client_order_id, state, report.order_status) {
         return DispatchOutcome::Skip;
     }
@@ -1329,8 +1291,8 @@ fn handle_rejected(
         .unwrap_or_else(|| "Order rejected by exchange".to_string());
     let rejected = OrderRejected::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         report.account_id,
         Ustr::from(&reason),
@@ -1338,7 +1300,7 @@ fn handle_rejected(
         report.ts_last,
         ts_init,
         false,
-        false,
+        report.post_only && reason.contains(HYPERLIQUID_POST_ONLY_WOULD_MATCH),
     );
     emitter.send_order_event(OrderEventAny::Rejected(rejected));
     state.cleanup_terminal(&client_order_id);
@@ -1384,7 +1346,7 @@ fn ensure_accepted_emitted(
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
     account_id: AccountId,
-    identity: &OrderIdentity,
+    context: &OrderContext,
     state: &WsDispatchState,
     emitter: &ExecutionEventEmitter,
     ts_event: UnixNanos,
@@ -1398,8 +1360,8 @@ fn ensure_accepted_emitted(
 
     let accepted = OrderAccepted::new(
         emitter.trader_id(),
-        identity.strategy_id,
-        identity.instrument_id,
+        context.identity.strategy_id,
+        context.identity.instrument_id,
         client_order_id,
         venue_order_id,
         account_id,
@@ -1413,7 +1375,11 @@ fn ensure_accepted_emitted(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::identifiers::{ClientOrderId, InstrumentId, StrategyId, TradeId};
+    use nautilus_live::execution::context::OrderIdentity;
+    use nautilus_model::{
+        enums::{OrderSide, TimeInForce},
+        identifiers::{ClientOrderId, InstrumentId, StrategyId, TradeId},
+    };
     use rstest::rstest;
     use rust_decimal::Decimal;
 
@@ -1422,35 +1388,74 @@ mod tests {
         HyperliquidExecLimitParams, HyperliquidExecOrderKind, HyperliquidExecTif,
     };
 
-    fn make_identity() -> OrderIdentity {
-        OrderIdentity {
-            strategy_id: StrategyId::from("S-001"),
-            instrument_id: InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Limit,
+    fn make_context(client_order_id: ClientOrderId) -> OrderContext {
+        OrderContext {
+            identity: OrderIdentity {
+                client_order_id,
+                strategy_id: StrategyId::from("S-001"),
+                instrument_id: InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
             quantity: Quantity::from("0.0001"),
             price: None,
+            trigger_price: None,
+            trigger_type: None,
+            time_in_force: TimeInForce::Gtc,
+            is_post_only: false,
+            is_reduce_only: false,
+            is_quote_quantity: false,
         }
     }
 
     #[rstest]
-    fn test_register_and_lookup_identity() {
+    fn test_register_and_lookup_context() {
         let state = WsDispatchState::new();
         let cid = ClientOrderId::new("O-001");
-        state.register_identity(cid, make_identity());
+        state.register_context(make_context(cid));
 
-        let found = state.lookup_identity(&cid);
-        assert!(found.is_some());
-        let identity = found.unwrap();
-        assert_eq!(identity.strategy_id.as_str(), "S-001");
-        assert_eq!(identity.order_side, OrderSide::Buy);
+        assert_eq!(state.lookup_context(&cid), Some(make_context(cid)));
     }
 
     #[rstest]
-    fn test_lookup_identity_missing_returns_none() {
+    fn test_lookup_context_missing_returns_none() {
         let state = WsDispatchState::new();
         let cid = ClientOrderId::new("not-tracked");
-        assert!(state.lookup_identity(&cid).is_none());
+        assert!(state.lookup_context(&cid).is_none());
+    }
+
+    #[rstest]
+    fn test_update_context_refreshes_price_and_quantity() {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-003");
+        state.register_context(make_context(cid));
+
+        state.update_context_price(&cid, Some(Price::from("56731.5")));
+        state.update_context_quantity(&cid, Quantity::from("0.0002"));
+
+        assert_eq!(
+            state.lookup_context(&cid),
+            Some(OrderContext {
+                price: Some(Price::from("56731.5")),
+                quantity: Quantity::from("0.0002"),
+                ..make_context(cid)
+            }),
+        );
+    }
+
+    #[rstest]
+    fn test_update_context_price_without_price_keeps_cached_price() {
+        let state = WsDispatchState::new();
+        let cid = ClientOrderId::new("O-004");
+        let cached = OrderContext {
+            price: Some(Price::from("56730.0")),
+            ..make_context(cid)
+        };
+        state.register_context(cached);
+
+        state.update_context_price(&cid, None);
+
+        assert_eq!(state.lookup_context(&cid), Some(cached));
     }
 
     #[rstest]
@@ -1470,22 +1475,6 @@ mod tests {
         let trade = TradeId::new("trade-1");
         assert!(!state.check_and_insert_trade(trade));
         assert!(state.check_and_insert_trade(trade));
-    }
-
-    #[rstest]
-    fn test_bounded_dedup_fifo_eviction_preserves_recent_ids() {
-        let mut dedup: BoundedDedup<TradeId> = BoundedDedup::new(3);
-        assert!(!dedup.insert(TradeId::new("t-0")));
-        assert!(!dedup.insert(TradeId::new("t-1")));
-        assert!(!dedup.insert(TradeId::new("t-2")));
-        assert_eq!(dedup.len(), 3);
-
-        // Overflow evicts the oldest.
-        assert!(!dedup.insert(TradeId::new("t-3")));
-        assert_eq!(dedup.len(), 3);
-        assert!(!dedup.contains(&TradeId::new("t-0")));
-        assert!(dedup.contains(&TradeId::new("t-1")));
-        assert!(dedup.contains(&TradeId::new("t-3")));
     }
 
     #[rstest]
@@ -1509,13 +1498,13 @@ mod tests {
     fn test_cleanup_terminal_preserves_filled_marker() {
         let state = WsDispatchState::new();
         let cid = ClientOrderId::new("O-020");
-        state.register_identity(cid, make_identity());
+        state.register_context(make_context(cid));
         state.insert_accepted(cid);
         state.mark_pending_modify(cid, VenueOrderId::new("v-1"), Quantity::from("0.0001"));
         state.insert_filled(cid);
         state.cleanup_terminal(&cid);
 
-        assert!(state.lookup_identity(&cid).is_none());
+        assert!(state.lookup_context(&cid).is_none());
         assert!(!state.emitted_accepted.contains(&cid));
         assert!(state.pending_modify(&cid).is_none());
         assert!(state.pending_modify_target_qty(&cid).is_none());

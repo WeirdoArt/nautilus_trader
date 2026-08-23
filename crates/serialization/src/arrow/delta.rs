@@ -145,22 +145,16 @@ impl EncodeToRecordBatch for OrderBookDelta {
         )
     }
 
-    /// Extract metadata from first two deltas
+    /// Extracts metadata from the first non-clear delta, falling back to the first clear.
     ///
-    /// Use the second delta if the first one has 0 precision
+    /// Clear deltas use sentinel values whose precision does not describe the following book data.
     fn chunk_metadata(chunk: &[Self]) -> HashMap<String, String> {
-        let delta = chunk
-            .first()
-            .expect("Chunk should have at least one element to encode");
-
-        if delta.order.price.precision == 0
-            && delta.order.size.precision == 0
-            && let Some(delta) = chunk.get(1)
-        {
-            return EncodeToRecordBatch::metadata(delta);
-        }
-
-        EncodeToRecordBatch::metadata(delta)
+        chunk
+            .iter()
+            .find(|delta| delta.action != BookAction::Clear)
+            .or_else(|| chunk.first())
+            .map(EncodeToRecordBatch::metadata)
+            .expect("Chunk must have at least one element to encode")
     }
 }
 
@@ -267,7 +261,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::arrow::get_raw_price;
+    use crate::arrow::{fixed_size_binary, get_raw_price};
 
     #[rstest]
     fn test_get_schema() {
@@ -413,11 +407,11 @@ mod tests {
 
         let action = UInt8Array::from(vec![1, 2]);
         let side = UInt8Array::from(vec![1, 1]);
-        let price = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![
             &((101.10 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((101.20 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let size = fixed_size_binary(vec![
             &((10000.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
             &((9000.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
@@ -455,11 +449,11 @@ mod tests {
         // Create test data with 'R' (clear) action which has PRICE_UNDEF and QUANTITY_UNDEF
         let action = UInt8Array::from(vec![4, 1]); // 4 = Clear, 1 = Add
         let side = UInt8Array::from(vec![0, 1]); // NoOrderSide for Clear, Buy for Add
-        let price = FixedSizeBinaryArray::from(vec![
+        let price = fixed_size_binary(vec![
             &PRICE_UNDEF.to_le_bytes(),
             &((100.50 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
-        let size = FixedSizeBinaryArray::from(vec![
+        let size = fixed_size_binary(vec![
             &QUANTITY_UNDEF.to_le_bytes(),
             &((1000.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes(),
         ]);
@@ -504,10 +498,8 @@ mod tests {
         let side = UInt8Array::from(vec![1]);
 
         let invalid_price: PriceRaw = PriceRaw::MAX - 1000;
-        let price = FixedSizeBinaryArray::from(vec![&invalid_price.to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let price = fixed_size_binary(vec![&invalid_price.to_le_bytes()]);
+        let size = fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let order_id = UInt64Array::from(vec![1]);
         let flags = UInt8Array::from(vec![0]);
         let sequence = UInt64Array::from(vec![1]);
@@ -546,11 +538,8 @@ mod tests {
 
         let action = UInt8Array::from(vec![99]);
         let side = UInt8Array::from(vec![1]);
-        let price =
-            FixedSizeBinaryArray::from(vec![&((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let price = fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes()]);
+        let size = fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let order_id = UInt64Array::from(vec![1]);
         let flags = UInt8Array::from(vec![0]);
         let sequence = UInt64Array::from(vec![1]);
@@ -590,11 +579,8 @@ mod tests {
 
         let action = UInt8Array::from(vec![1]);
         let side = UInt8Array::from(vec![1]);
-        let price =
-            FixedSizeBinaryArray::from(vec![&((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes()]);
-        let size = FixedSizeBinaryArray::from(vec![
-            &((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes(),
-        ]);
+        let price = fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as PriceRaw).to_le_bytes()]);
+        let size = fixed_size_binary(vec![&((100.0 * FIXED_SCALAR) as QuantityRaw).to_le_bytes()]);
         let order_id = UInt64Array::from(vec![1]);
         let flags = UInt8Array::from(vec![0]);
         let sequence = UInt64Array::from(vec![1]);

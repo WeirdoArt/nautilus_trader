@@ -8,60 +8,27 @@ from nautilus_trader import model
 from nautilus_trader import network
 
 __all__ = [
-    "BYBIT_NAUTILUS_BROKER_ID",
-    "BybitAccountDetails",
-    "BybitAccountType",
-    "BybitApiKeyPermissions",
-    "BybitCancelType",
+    "BYBIT",
+    "BYBIT_CLIENT_ID",
+    "BYBIT_VENUE",
     "BybitDataClientConfig",
     "BybitDataClientFactory",
     "BybitEnvironment",
     "BybitExecClientConfig",
     "BybitExecutionClientFactory",
-    "BybitFeeRate",
-    "BybitHttpClient",
     "BybitMarginAction",
     "BybitMarginBorrowResult",
-    "BybitMarginMode",
     "BybitMarginRepayResult",
     "BybitMarginStatusResult",
-    "BybitNativeTpSlParams",
-    "BybitOpenOnly",
-    "BybitOrder",
-    "BybitOrderCursorList",
-    "BybitOrderFilter",
-    "BybitOrderSide",
-    "BybitOrderStatus",
-    "BybitOrderType",
     "BybitPositionIdx",
     "BybitPositionMode",
     "BybitProductType",
-    "BybitRawHttpClient",
-    "BybitServerTime",
-    "BybitStopOrderType",
     "BybitTickerData",
-    "BybitTickersParams",
-    "BybitTimeInForce",
-    "BybitTpSlMode",
-    "BybitTriggerDirection",
-    "BybitTriggerType",
-    "BybitWebSocketClient",
-    "BybitWebSocketError",
-    "BybitWsAmendOrderParams",
-    "BybitWsCancelOrderParams",
-    "BybitWsPlaceOrderParams",
-    "bybit_bar_spec_to_interval",
-    "bybit_extract_raw_symbol",
-    "bybit_make_hedge_venue_position_id",
-    "bybit_product_type_from_symbol",
-    "bybit_resolve_position_idx",
-    "get_bybit_http_base_url",
-    "get_bybit_ws_url_private",
-    "get_bybit_ws_url_public",
-    "get_bybit_ws_url_trade",
 ]
 
-BYBIT_NAUTILUS_BROKER_ID: str
+BYBIT: str
+BYBIT_CLIENT_ID: model.ClientId
+BYBIT_VENUE: model.Venue
 
 @typing.final
 class BybitAccountDetails: ...
@@ -71,6 +38,32 @@ class BybitApiKeyPermissions: ...
 
 @typing.final
 class BybitDataClientConfig:
+    @property
+    def product_types(self) -> list[BybitProductType]: ...
+    @property
+    def environment(self) -> BybitEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_ws_public(self) -> str | None: ...
+    @property
+    def base_url_ws_private(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def recv_window_ms(self) -> int: ...
+    @property
+    def update_instruments_interval_mins(self) -> int | None: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         product_types: typing.Sequence[BybitProductType] | None = None,
@@ -91,6 +84,10 @@ class BybitDataClientConfig:
         instrument_status_poll_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def instrument_status_poll_secs(self) -> int | None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class BybitDataClientFactory:
@@ -99,6 +96,40 @@ class BybitDataClientFactory:
 
 @typing.final
 class BybitExecClientConfig:
+    @property
+    def product_types(self) -> list[BybitProductType]: ...
+    @property
+    def environment(self) -> BybitEnvironment: ...
+    @property
+    def base_url_http(self) -> str | None: ...
+    @property
+    def base_url_ws_private(self) -> str | None: ...
+    @property
+    def base_url_ws_trade(self) -> str | None: ...
+    @property
+    def http_timeout_secs(self) -> int: ...
+    @property
+    def max_retries(self) -> int: ...
+    @property
+    def retry_delay_initial_ms(self) -> int: ...
+    @property
+    def retry_delay_max_ms(self) -> int: ...
+    @property
+    def heartbeat_interval_secs(self) -> int: ...
+    @property
+    def auth_timeout_secs(self) -> int | None: ...
+    @property
+    def recv_window_ms(self) -> int: ...
+    @property
+    def account_id(self) -> model.AccountId | None: ...
+    @property
+    def use_spot_position_reports(self) -> bool: ...
+    @property
+    def auto_repay_spot_borrows(self) -> bool: ...
+    @property
+    def margin_mode(self) -> BybitMarginMode | None: ...
+    @property
+    def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
         product_types: typing.Sequence[BybitProductType] | None = None,
@@ -114,12 +145,16 @@ class BybitExecClientConfig:
         retry_delay_initial_ms: int | None = None,
         retry_delay_max_ms: int | None = None,
         heartbeat_interval_secs: int | None = None,
+        auth_timeout_secs: int | None = None,
         recv_window_ms: int | None = None,
         account_id: model.AccountId | None = None,
         use_spot_position_reports: bool | None = None,
+        auto_repay_spot_borrows: bool | None = None,
         margin_mode: BybitMarginMode | None = None,
         transport_backend: network.TransportBackend | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class BybitExecutionClientFactory:
@@ -169,6 +204,9 @@ class BybitHttpClient:
     def get_spot_borrow_amount(self, coin: str) -> typing.Any: ...
     def borrow_spot(self, coin: str, amount: model.Quantity) -> typing.Any: ...
     def repay_spot_borrow(self, coin: str, amount: model.Quantity | None = None) -> typing.Any: ...
+    def repay_spot_borrow_with_conversion(
+        self, coin: str, amount: model.Quantity | None = None
+    ) -> typing.Any: ...
     def request_instruments(
         self,
         product_type: BybitProductType,
@@ -892,11 +930,8 @@ class BybitTriggerType(enum.Enum):
     IndexPrice = ...
     MarkPrice = ...
 
-def bybit_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
+def bybit_bar_spec_to_interval(aggregation: model.BarAggregation, step: int) -> str: ...
 def bybit_extract_raw_symbol(symbol: str) -> str: ...
-def bybit_make_hedge_venue_position_id(
-    instrument_id: model.InstrumentId, position_idx: BybitPositionIdx | None = None
-) -> model.PositionId | None: ...
 def bybit_product_type_from_symbol(symbol: str) -> BybitProductType: ...
 def bybit_resolve_position_idx(
     position_mode: BybitPositionMode | None,
@@ -904,9 +939,3 @@ def bybit_resolve_position_idx(
     is_reduce_only: bool,
     manual_override: BybitPositionIdx | None = None,
 ) -> BybitPositionIdx | None: ...
-def get_bybit_http_base_url(environment: BybitEnvironment) -> str: ...
-def get_bybit_ws_url_private(environment: BybitEnvironment) -> str: ...
-def get_bybit_ws_url_public(
-    product_type: BybitProductType, environment: BybitEnvironment
-) -> str: ...
-def get_bybit_ws_url_trade(environment: BybitEnvironment) -> str: ...

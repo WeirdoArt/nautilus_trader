@@ -49,7 +49,7 @@ impl ClientConfig for BitmexDataClientConfig {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -63,6 +63,13 @@ pub struct BitmexExecFactoryConfig {
     /// The underlying execution client configuration.
     pub config: BitmexExecClientConfig,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BitmexExecFactoryConfig {
+    trader_id: TraderId,
+    account_id: AccountId,
+    config: BitmexExecClientConfig,
+});
 
 impl BitmexExecFactoryConfig {
     /// Creates a new [`BitmexExecFactoryConfig`].
@@ -89,7 +96,7 @@ impl ClientConfig for BitmexExecFactoryConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -147,7 +154,7 @@ impl DataClientFactory for BitmexDataClientFactory {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",

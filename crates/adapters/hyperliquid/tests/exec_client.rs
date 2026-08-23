@@ -31,6 +31,7 @@ use std::{
     time::Duration,
 };
 
+use ahash::AHashSet;
 use axum::{
     Router,
     extract::{
@@ -129,6 +130,8 @@ struct TestServerState {
     last_clearinghouse_user: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Optional override for `userFills` info responses; defaults to `[]`.
     user_fills_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    /// Optional override for `historicalOrders` info responses; defaults to `[]`.
+    historical_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     rate_limit_after: Arc<AtomicUsize>,
     /// When set, `handle_exchange` awaits `pause_release` before returning.
     /// Lets a test hold the response so it can assert on synchronous state
@@ -155,6 +158,7 @@ impl Default for TestServerState {
             perp_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
             user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
+            historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             rate_limit_after: Arc::new(AtomicUsize::new(usize::MAX)),
             pause_next_exchange: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_release: Arc::new(tokio::sync::Notify::new()),
@@ -247,6 +251,13 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         }
         "userFills" => {
             if let Some(body) = state.user_fills_response.lock().await.clone() {
+                Json(body).into_response()
+            } else {
+                Json(json!([])).into_response()
+            }
+        }
+        "historicalOrders" => {
+            if let Some(body) = state.historical_orders_response.lock().await.clone() {
                 Json(body).into_response()
             } else {
                 Json(json!([])).into_response()
@@ -2016,6 +2027,15 @@ async fn test_exec_client_creation() {
     assert_eq!(client.venue(), *HYPERLIQUID_VENUE);
     assert_eq!(client.oms_type(), OmsType::Netting);
     assert!(!client.is_connected());
+
+    let registry = client
+        .socket_reconnect_registry()
+        .expect("exec client must expose a socket reconnect registry");
+    assert!(
+        registry
+            .get(ustr::Ustr::from("hyperliquid-user-streams"))
+            .is_none()
+    );
 }
 
 #[rstest]
@@ -2204,9 +2224,9 @@ fn make_limit_order(id: &str) -> OrderAny {
 async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
     // When the exchange accepts the request envelope but rejects the
     // individual order via `statuses[0].error`, the submit-order spawn task
-    // must run `cleanup_terminal` on the dispatch state so the identity
+    // must run `cleanup_terminal` on the dispatch state so the context
     // registered at submission time is not left behind. A regression here
-    // would leak an order identity per failed submission in long-running
+    // would leak an order context per failed submission in long-running
     // sessions.
     //
     // The top-level `status="err"` envelope (`reject_next_order`) is
@@ -2216,7 +2236,7 @@ async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
     let state = TestServerState::default();
     state.inner_order_error_next.store(true, Ordering::Relaxed);
     // Hold the exchange response so the spawned submit task stays parked in
-    // `post_action_exec` while we assert the identity was registered. Without
+    // `post_action_exec` while we assert the context was registered. Without
     // the gate the rejection path can run `cleanup_terminal` before the
     // assertion observes the registration, racing the spawn task.
     state.pause_next_exchange.store(true, Ordering::Relaxed);
@@ -2237,9 +2257,9 @@ async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
     assert!(
         client
             .ws_dispatch_state()
-            .lookup_identity(&order.client_order_id())
+            .lookup_context(&order.client_order_id())
             .is_none(),
-        "identity should not be registered before submit",
+        "context should not be registered before submit",
     );
 
     let cmd = SubmitOrder::from_order(
@@ -2255,7 +2275,7 @@ async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
 
     // Wait until the mock has received the submit, proving the spawned task is
     // parked at the post await behind the pause. The rejection/cleanup cannot
-    // have run yet, so the identity registered synchronously inside
+    // have run yet, so the context registered synchronously inside
     // `submit_order` is deterministically still present here.
     wait_until_async(
         move || {
@@ -2269,13 +2289,13 @@ async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
     assert!(
         client
             .ws_dispatch_state()
-            .lookup_identity(&order.client_order_id())
+            .lookup_context(&order.client_order_id())
             .is_some(),
-        "identity should be registered immediately on submit",
+        "context should be registered immediately on submit",
     );
 
     // Release the held response: the spawn task processes the inner error and
-    // invokes `cleanup_terminal`. Poll until the identity is gone.
+    // invokes `cleanup_terminal`. Poll until the context is gone.
     pause_release.notify_one();
 
     let dispatch = client.ws_dispatch_state().clone();
@@ -2283,7 +2303,7 @@ async fn test_submit_order_inner_error_cleans_up_dispatch_state() {
     wait_until_async(
         move || {
             let dispatch = dispatch.clone();
-            async move { dispatch.lookup_identity(&cid).is_none() }
+            async move { dispatch.lookup_context(&cid).is_none() }
         },
         Duration::from_secs(5),
     )
@@ -5364,7 +5384,7 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
     // Two-order list where the venue returns one status per order: the first
     // is a success and the second carries an inline `error`. The execution
     // client must emit OrderRejected for the failing entry only and leave
-    // the successful order's identity in place.
+    // the successful order's context in place.
     let state = TestServerState::default();
     *state.order_response_override.lock().await = Some(json!({
         "status": "ok",
@@ -5447,14 +5467,14 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
         rejected[0].1,
     );
 
-    // Successful leg keeps its identity; failed leg is cleaned up.
+    // Successful leg keeps its context; failed leg is cleaned up.
     assert!(
-        client.ws_dispatch_state().lookup_identity(&cid_a).is_some(),
-        "successful order identity must remain",
+        client.ws_dispatch_state().lookup_context(&cid_a).is_some(),
+        "successful order context must remain",
     );
     assert!(
-        client.ws_dispatch_state().lookup_identity(&cid_b).is_none(),
-        "failed order identity must be cleaned up",
+        client.ws_dispatch_state().lookup_context(&cid_b).is_none(),
+        "failed order context must be cleaned up",
     );
 
     client.disconnect().await.unwrap();
@@ -5462,15 +5482,86 @@ async fn test_submit_order_list_per_order_inner_error_rejects_only_failing() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_submit_order_list_grouped_error_broadcast_to_all() {
-    // When the venue returns fewer statuses than orders (NormalTpsl/PositionTpsl
-    // grouping behavior) and one carries an error, the client must broadcast
-    // OrderRejected to every order in the group and clean up all dispatch
-    // identities and cloid mappings.
+async fn test_submit_order_list_single_inner_error_rejects_entire_batch() {
     let state = TestServerState::default();
     state.inner_order_error_next.store(true, Ordering::Relaxed);
     let addr = start_mock_server(state).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("S-001");
+    let instrument_id = InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT);
+    let cid_a = ClientOrderId::new("O-BATCH-A");
+    let cid_b = ClientOrderId::new("O-BATCH-B");
+    let order_a = make_limit_order(cid_a.as_str());
+    let order_b = make_limit_order(cid_b.as_str());
+
+    for order in [&order_a, &order_b] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    let order_list = OrderList::new(
+        OrderListId::from("test-list-single-error"),
+        instrument_id,
+        strategy_id,
+        vec![cid_a, cid_b],
+        UnixNanos::default(),
+    );
+    let cmd = SubmitOrderList::new(
+        trader_id,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        strategy_id,
+        order_list,
+        vec![order_a.init_event().clone(), order_b.init_event().clone()],
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.submit_order_list(cmd).unwrap();
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let rejected = drain_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let rejected_ids = rejected
+        .iter()
+        .map(|(cid, _)| *cid)
+        .collect::<AHashSet<_>>();
+
+    assert_eq!(rejected_ids, AHashSet::from([cid_a, cid_b]));
+    assert!(
+        rejected
+            .iter()
+            .all(|(_, reason)| reason == "Order rejected: insufficient margin")
+    );
+    assert!(client.ws_dispatch_state().lookup_context(&cid_a).is_none());
+    assert!(client.ws_dispatch_state().lookup_context(&cid_b).is_none());
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_order_list_normal_tpsl_stages_children_until_parent_fill() {
+    // OrderFactory returns brackets as entry, SL, TP. Hyperliquid rejects a
+    // plain reduce-only limit TP while a passive entry is still resting, so
+    // only the parent may reach the venue before the first fill.
+    let state = TestServerState::default();
+    let last_action = state.last_exchange_action.clone();
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
     client.start().unwrap();
     client.connect().await.unwrap();
@@ -5525,7 +5616,7 @@ async fn test_submit_order_list_grouped_error_broadcast_to_all() {
         None,
         None,
         None,
-        Some(ContingencyType::Oco),
+        Some(ContingencyType::Ouo),
         None,
         Some(vec![cid_sl]),
         Some(cid_p),
@@ -5552,7 +5643,7 @@ async fn test_submit_order_list_grouped_error_broadcast_to_all() {
         None,
         None,
         None,
-        Some(ContingencyType::Oco),
+        Some(ContingencyType::Ouo),
         None,
         Some(vec![cid_tp]),
         Some(cid_p),
@@ -5585,7 +5676,7 @@ async fn test_submit_order_list_grouped_error_broadcast_to_all() {
         OrderListId::from("bracket-1"),
         instrument_id,
         strategy_id,
-        vec![cid_p, cid_tp, cid_sl],
+        vec![cid_p, cid_sl, cid_tp],
         UnixNanos::default(),
     );
 
@@ -5594,7 +5685,7 @@ async fn test_submit_order_list_grouped_error_broadcast_to_all() {
         Some(*HYPERLIQUID_CLIENT_ID),
         strategy_id,
         order_list,
-        vec![init_p, init_tp, init_sl],
+        vec![init_p, init_sl, init_tp],
         None,
         None,
         None,
@@ -5611,19 +5702,22 @@ async fn test_submit_order_list_grouped_error_broadcast_to_all() {
     )
     .await;
 
-    let rejected = drain_rejected_events(&mut rx, Duration::from_millis(250)).await;
-    let cids: std::collections::HashSet<_> = rejected.iter().map(|(c, _)| *c).collect();
-    assert!(
-        cids.contains(&cid_p) && cids.contains(&cid_tp) && cids.contains(&cid_sl),
-        "every order in the group must be rejected; got {cids:?}",
-    );
+    let action = last_action
+        .lock()
+        .await
+        .clone()
+        .expect("order action should have been sent");
+    let wire_orders = action["orders"].as_array().expect("order action array");
 
-    for cid in [cid_p, cid_tp, cid_sl] {
-        assert!(
-            client.ws_dispatch_state().lookup_identity(&cid).is_none(),
-            "{cid} identity should be cleaned up after grouped rejection",
-        );
-    }
+    assert_eq!(action["grouping"], "na");
+    assert_eq!(wire_orders.len(), 1);
+    assert_eq!(
+        wire_orders[0]["c"],
+        Cloid::from_client_order_id(cid_p).to_hex()
+    );
+    assert!(client.ws_dispatch_state().lookup_context(&cid_p).is_some());
+    assert!(client.ws_dispatch_state().lookup_context(&cid_tp).is_none());
+    assert!(client.ws_dispatch_state().lookup_context(&cid_sl).is_none());
 
     client.disconnect().await.unwrap();
 }
@@ -5905,6 +5999,104 @@ async fn test_generate_mass_status_lookback_filters_only_fills() {
         mass.fill_reports().is_empty(),
         "old fills must be excluded from the lookback window",
     );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_mass_status_reconstructs_filled_order_for_retained_fill() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([]));
+    *state.user_fills_response.lock().await = Some(json!([
+        {
+            "coin": "BTC", "px": "50000.0", "sz": "0.001", "side": "B",
+            "time": 1_754_000_000_000u64, "startPosition": "0",
+            "dir": "Open Long", "closedPnl": "0", "hash": "0xbbbb",
+            "oid": 200002u64, "crossed": true, "fee": "0.01", "tid": 2u64,
+            "feeToken": "USDC",
+        },
+        {
+            "coin": "BTC", "px": "49940.0", "sz": "0.001", "side": "A",
+            "time": 1_754_000_001_000u64, "startPosition": "0.001",
+            "dir": "Close Long", "closedPnl": "-0.06", "hash": "0xcccc",
+            "oid": 200003u64, "crossed": true, "fee": "0.01", "tid": 3u64,
+            "feeToken": "USDC",
+        }
+    ]));
+    *state.historical_orders_response.lock().await = Some(json!([
+        {
+            "order": {
+                "coin": "BTC", "side": "B", "limitPx": "50000.0", "sz": "0",
+                "oid": 200002u64, "timestamp": 1_754_000_000_000u64,
+                "origSz": "0.001", "reduceOnly": false, "orderType": "Limit",
+                "tif": "Ioc", "cloid": "0x00000000000000000000000000000002"
+            },
+            "status": "filled",
+            "statusTimestamp": 1_754_000_000_001u64
+        },
+        {
+            "order": {
+                "coin": "BTC", "side": "B", "limitPx": "50000.0", "sz": "0.001",
+                "oid": 200002u64, "timestamp": 1_754_000_000_000u64,
+                "origSz": "0.001", "reduceOnly": false, "orderType": "Limit",
+                "tif": "Ioc", "cloid": "0x00000000000000000000000000000002"
+            },
+            "status": "open",
+            "statusTimestamp": 1_754_000_000_000u64
+        },
+        {
+            "order": {
+                "coin": "BTC", "side": "A", "limitPx": "49940.0", "sz": "0",
+                "oid": 200003u64, "timestamp": 1_754_000_001_000u64,
+                "origSz": "0.001", "reduceOnly": true, "orderType": "Stop Market",
+                "triggerPx": "0.0", "isTrigger": false,
+                "tif": null, "cloid": "0x00000000000000000000000000000003"
+            },
+            "status": "filled",
+            "statusTimestamp": 1_754_000_001_001u64
+        },
+        {
+            "order": {
+                "coin": "BTC", "side": "A", "limitPx": "49940.0", "sz": "0.001",
+                "oid": 200003u64, "timestamp": 1_754_000_001_000u64,
+                "origSz": "0.001", "reduceOnly": true, "orderType": "Stop Market",
+                "triggerPx": "49950.0", "isTrigger": true,
+                "tif": null, "cloid": "0x00000000000000000000000000000003"
+            },
+            "status": "open",
+            "statusTimestamp": 1_754_000_001_000u64
+        }
+    ]));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+
+    let mass = client
+        .generate_mass_status(None)
+        .await
+        .unwrap()
+        .expect("mass status payload");
+    let order_reports = mass.order_reports();
+    let report = order_reports
+        .get(&VenueOrderId::from("200002"))
+        .expect("historical filled order report");
+
+    let stop_report = order_reports
+        .get(&VenueOrderId::from("200003"))
+        .expect("historical stop order report");
+
+    assert_eq!(order_reports.len(), 2);
+    assert_eq!(mass.fill_reports().len(), 2);
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(report.filled_qty, Quantity::from("0.001"));
+    assert_eq!(report.time_in_force, TimeInForce::Ioc);
+    assert_eq!(report.price, Some(Price::from("50000.0")));
+    assert_eq!(stop_report.order_status, OrderStatus::Filled);
+    assert_eq!(stop_report.order_type, OrderType::StopMarket);
+    assert_eq!(stop_report.trigger_price, Some(Price::from("49950.0")));
+    assert_eq!(stop_report.price, None);
 
     client.disconnect().await.unwrap();
 }

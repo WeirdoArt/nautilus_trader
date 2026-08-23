@@ -355,6 +355,7 @@ nautilus_strategy!(HurstVpinDirectional, {
             .cache()
             .order(&event.client_order_id)
             .is_some_and(|o| o.is_closed());
+
         if closed {
             self.clear_latch_for(event.client_order_id);
         }
@@ -412,8 +413,8 @@ impl DataActor for HurstVpinDirectional {
     fn on_trade(&mut self, tick: &TradeTick) -> anyhow::Result<()> {
         let size = tick.size.as_f64();
         match tick.aggressor_side {
-            AggressorSide::Buyer => self.bucket_buy_volume += size,
-            AggressorSide::Seller => self.bucket_sell_volume += size,
+            AggressorSide::Buy => self.bucket_buy_volume += size,
+            AggressorSide::Sell => self.bucket_sell_volume += size,
             _ => {}
         }
         Ok(())

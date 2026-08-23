@@ -343,7 +343,7 @@ impl MarketIfTouchedOrder {
     fn py_tags(&self) -> Option<Vec<&str>> {
         self.tags
             .as_ref()
-            .map(|vec| vec.iter().map(|s| s.as_str()).collect())
+            .map(|vec| vec.iter().map(Ustr::as_str).collect())
     }
 
     #[pyo3(name = "commission")]
@@ -499,7 +499,7 @@ impl MarketIfTouchedOrder {
         )?;
         self.avg_px.map_or_else(
             || dict.set_item("avg_px", py.None()),
-            |x| dict.set_item("avg_px", x),
+            |x| dict.set_item("avg_px", x.to_string()),
         )?;
         self.position_id.map_or_else(
             || dict.set_item("position_id", py.None()),
@@ -511,7 +511,7 @@ impl MarketIfTouchedOrder {
         )?;
         self.slippage.map_or_else(
             || dict.set_item("slippage", py.None()),
-            |x| dict.set_item("slippage", x),
+            |x| dict.set_item("slippage", x.to_string()),
         )?;
         self.account_id.map_or_else(
             || dict.set_item("account_id", py.None()),
@@ -567,7 +567,7 @@ impl MarketIfTouchedOrder {
             "tags",
             self.tags
                 .as_ref()
-                .map(|vec| vec.iter().map(|s| s.to_string()).collect::<Vec<String>>()),
+                .map(|vec| vec.iter().map(ToString::to_string).collect::<Vec<String>>()),
         )?;
         Ok(dict.into())
     }

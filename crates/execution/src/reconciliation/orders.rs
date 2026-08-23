@@ -19,8 +19,6 @@
 //! helper turns a venue-sourced report into zero or more `OrderEventAny`s that are
 //! safe to apply to the local order model.
 
-use std::str::FromStr;
-
 use nautilus_common::enums::LogColor;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
@@ -66,6 +64,7 @@ pub fn generate_reconciliation_order_events(
         instrument,
         ts_now,
         report.order_status == OrderStatus::Voided,
+        None,
     )
 }
 
@@ -82,7 +81,20 @@ pub fn generate_reconciliation_order_snapshot_events(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
 ) -> Vec<OrderEventAny> {
-    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true)
+    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true, None)
+}
+
+/// Generates reconciliation events for an authoritative venue snapshot with an inferred-fill
+/// commission supplied by the responsible execution client.
+#[must_use]
+pub fn generate_reconciliation_order_snapshot_events_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: Option<&InstrumentAny>,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
+) -> Vec<OrderEventAny> {
+    generate_reconciliation_order_events_inner(order, report, instrument, ts_now, true, commission)
 }
 
 fn generate_reconciliation_order_events_inner(
@@ -91,6 +103,7 @@ fn generate_reconciliation_order_events_inner(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
     allow_fill_decrease: bool,
+    commission: Option<Money>,
 ) -> Vec<OrderEventAny> {
     if is_superseded_cancel_report(order, report) {
         let _ = reconcile_order_report(order, report, instrument, ts_now);
@@ -155,7 +168,7 @@ fn generate_reconciliation_order_events_inner(
             &report.account_id,
             instrument,
             ts_now,
-            None,
+            commission,
         )
     {
         if let Err(e) = working.apply(filled.clone()) {
@@ -177,7 +190,9 @@ fn generate_reconciliation_order_events_inner(
         return events;
     }
 
-    if let Some(event) = reconcile_order_report(&working, report, instrument, ts_now) {
+    if let Some(event) =
+        reconcile_order_report_with_commission(&working, report, instrument, ts_now, commission)
+    {
         events.push(event);
     }
 
@@ -316,6 +331,18 @@ pub fn reconcile_order_report(
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
 ) -> Option<OrderEventAny> {
+    reconcile_order_report_with_commission(order, report, instrument, ts_now, None)
+}
+
+/// Reconciles an order with a venue status report using a precomputed inferred-fill commission.
+#[must_use]
+pub fn reconcile_order_report_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: Option<&InstrumentAny>,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
+) -> Option<OrderEventAny> {
     if matches!(
         report.order_status,
         OrderStatus::PendingUpdate | OrderStatus::PendingCancel
@@ -324,6 +351,14 @@ pub fn reconcile_order_report(
             "Order {} venue report in pending state: {:?}",
             order.client_order_id(),
             report.order_status,
+        );
+        return None;
+    }
+
+    if is_unchanged_accepted_report_during_pending_command(order, report) {
+        log::debug!(
+            "Order {} remains inflight while venue reports an unchanged accepted snapshot",
+            order.client_order_id(),
         );
         return None;
     }
@@ -385,7 +420,7 @@ pub fn reconcile_order_report(
         OrderStatus::Expired => Some(create_reconciliation_expired(order, report, ts_now)),
 
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {
-            reconcile_fill_quantity_mismatch(order, report, instrument, ts_now)
+            reconcile_fill_quantity_mismatch(order, report, instrument, ts_now, commission)
         }
 
         OrderStatus::Voided => {
@@ -410,6 +445,19 @@ pub fn reconcile_order_report(
     }
 }
 
+fn is_unchanged_accepted_report_during_pending_command(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+) -> bool {
+    matches!(
+        order.status(),
+        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+    ) && report.order_status == OrderStatus::Accepted
+        && order.venue_order_id() == Some(report.venue_order_id)
+        && order.filled_qty() == report.filled_qty
+        && !should_reconciliation_update(order, report)
+}
+
 /// Generates the appropriate order events for an external order and order status report.
 ///
 /// After creating an external order, we need to transition it to its actual state
@@ -422,6 +470,21 @@ pub fn generate_external_order_status_events(
     account_id: &AccountId,
     instrument: &InstrumentAny,
     ts_now: UnixNanos,
+) -> Vec<OrderEventAny> {
+    generate_external_order_status_events_with_commission(
+        order, report, account_id, instrument, ts_now, None,
+    )
+}
+
+/// Generates external-order status events with a precomputed inferred-fill commission.
+#[must_use]
+pub fn generate_external_order_status_events_with_commission(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    account_id: &AccountId,
+    instrument: &InstrumentAny,
+    ts_now: UnixNanos,
+    commission: Option<Money>,
 ) -> Vec<OrderEventAny> {
     let accepted = OrderEventAny::Accepted(OrderAccepted::new(
         order.trader_id(),
@@ -443,7 +506,7 @@ pub fn generate_external_order_status_events(
 
             if !report.filled_qty.is_zero()
                 && let Some(filled) =
-                    create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                    create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             {
                 events.push(filled);
             }
@@ -463,7 +526,7 @@ pub fn generate_external_order_status_events(
 
             if !report.filled_qty.is_zero()
                 && let Some(filled) =
-                    create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                    create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             {
                 if let Err(e) = working.apply(filled.clone()) {
                     log::warn!(
@@ -489,7 +552,7 @@ pub fn generate_external_order_status_events(
             let inferred_fill = if report.filled_qty.is_zero() {
                 None
             } else {
-                create_inferred_fill(order, report, *account_id, instrument, ts_now, None)
+                create_inferred_fill(order, report, *account_id, instrument, ts_now, commission)
             };
             let filled_to_quantity =
                 inferred_fill.is_some() && report.filled_qty >= report.quantity;
@@ -560,6 +623,11 @@ fn create_reconciliation_fill_voids(
             continue;
         }
         let removed = remaining.min(effective);
+        let voided_qty = prior_qty + removed;
+        let commission_voided = fill.commission.and_then(|commission| {
+            let fraction = voided_qty.as_decimal() / fill.last_qty.as_decimal();
+            Money::from_decimal(commission.as_decimal() * fraction, commission.currency).ok()
+        });
         let mut event = OrderFillVoided::new(
             fill.trader_id,
             fill.strategy_id,
@@ -572,8 +640,8 @@ fn create_reconciliation_fill_voids(
                 report.report_id, fill.trade_id
             )),
             fill.trade_id,
-            prior_qty + removed,
-            previous.and_then(|voided| voided.commission_voided),
+            voided_qty,
+            commission_voided,
             fill.order_side,
             fill.order_type,
             fill.last_px,
@@ -604,6 +672,11 @@ fn create_reconciliation_fill_voids(
     corrections
 }
 
+/// Creates a fill void reversing the remaining leaves of a terminally voided order.
+///
+/// An unresolved price falls back to zero rather than `None`: the price is a placeholder that
+/// never reaches `Position::avg_px_open`, whereas suppressing the void would leave the order
+/// open locally against a venue that considers it gone.
 fn create_reconciliation_terminal_fill_void(
     order: &OrderAny,
     report: &OrderStatusReport,
@@ -615,14 +688,10 @@ fn create_reconciliation_terminal_fill_void(
         return None;
     }
     let instrument = instrument?;
-    let last_px = if let Some(avg_px) = report.avg_px {
-        Price::from_decimal_dp(avg_px, instrument.price_precision()).ok()?
-    } else {
-        report
-            .price
-            .or_else(|| order.price())
-            .unwrap_or_else(|| Price::zero(instrument.price_precision()))
-    };
+
+    let last_px = resolve_fill_price(order, report, instrument)
+        .unwrap_or_else(|| Price::zero(instrument.price_precision()));
+
     let mut event = OrderFillVoided::new(
         order.trader_id(),
         order.strategy_id(),
@@ -935,7 +1004,7 @@ pub(super) fn create_reconciliation_updated(
 ) -> OrderEventAny {
     // Only pass trigger_price for order types that support it.
     // Limit, Market, and MarketToLimit orders assert trigger_price.is_none()
-    // in their update() methods — passing a spurious trigger_price from the
+    // in their update() methods - passing a spurious trigger_price from the
     // venue report (e.g. Bybit sends "0.00" for non-conditional orders)
     // causes a panic. Positive list ensures new order types without
     // trigger_price support won't accidentally receive one.
@@ -978,28 +1047,20 @@ pub(super) fn create_inferred_fill(
     commission: Option<Money>,
 ) -> Option<OrderEventAny> {
     let liquidity_side = match order.order_type() {
-        OrderType::Market | OrderType::StopMarket | OrderType::TrailingStopMarket => {
-            LiquiditySide::Taker
-        }
-        _ if report.post_only => LiquiditySide::Maker,
+        OrderType::Market
+        | OrderType::StopMarket
+        | OrderType::MarketToLimit
+        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
+        _ if order.is_post_only() => LiquiditySide::Maker,
         _ => LiquiditySide::NoLiquiditySide,
     };
 
-    let last_px = if let Some(avg_px) = report.avg_px {
-        match Price::from_decimal_dp(avg_px, instrument.price_precision()) {
-            Ok(px) => px,
-            Err(e) => {
-                log::warn!("Failed to create price from avg_px for inferred fill: {e}");
-                return None;
-            }
-        }
-    } else if let Some(price) = report.price {
-        price
-    } else {
+    let Some(last_px) = resolve_fill_price(order, report, instrument) else {
         log::warn!(
-            "Cannot create inferred fill for {}: no avg_px or price available",
+            "Cannot create inferred fill for {}: no avg_px, report price, or order price",
             order.client_order_id()
         );
+
         return None;
     };
     let last_px = clamp_inferred_fill_price(last_px, instrument);
@@ -1074,17 +1135,8 @@ pub fn create_incremental_inferred_fill(
         return None;
     }
 
-    let liquidity_side = match order.order_type() {
-        OrderType::Market
-        | OrderType::StopMarket
-        | OrderType::MarketToLimit
-        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
-        _ if order.is_post_only() => LiquiditySide::Maker,
-        _ => LiquiditySide::NoLiquiditySide,
-    };
-
-    let last_px = calculate_incremental_fill_price(order, report, instrument)?;
-    let last_px = clamp_inferred_fill_price(last_px, instrument);
+    let (last_px, liquidity_side) =
+        incremental_inferred_fill_price_and_liquidity(order, report, instrument)?;
 
     let venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
     let position_id = reconciliation_position_id(report, instrument);
@@ -1134,6 +1186,58 @@ pub fn create_incremental_inferred_fill(
     )))
 }
 
+/// Resolves the price and liquidity side that an incremental inferred fill will carry.
+///
+/// This uses the cached order's filled quantity and average price to derive the price of only the
+/// unbooked quantity. Callers that calculate commission for an incremental fill must use these
+/// values rather than the venue report's cumulative average.
+///
+/// Returns `None` when no fill price can be determined from the order, report, or instrument.
+#[must_use]
+pub fn incremental_inferred_fill_price_and_liquidity(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: &InstrumentAny,
+) -> Option<(Price, LiquiditySide)> {
+    let last_px = calculate_incremental_fill_price(order, report, instrument)?;
+
+    Some((
+        clamp_inferred_fill_price(last_px, instrument),
+        inferred_fill_liquidity_side(order),
+    ))
+}
+
+/// Resolves the price and liquidity side that an inferred fill will carry.
+///
+/// Callers that need the venue commission for an inferred fill resolve these values first, so the
+/// price and liquidity rules stay defined here rather than being restated at each call site.
+///
+/// Returns `None` when no fill price can be determined from the order, report, or instrument.
+#[must_use]
+pub fn inferred_fill_price_and_liquidity(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: &InstrumentAny,
+) -> Option<(Price, LiquiditySide)> {
+    let last_px = resolve_fill_price(order, report, instrument)?;
+
+    Some((
+        clamp_inferred_fill_price(last_px, instrument),
+        inferred_fill_liquidity_side(order),
+    ))
+}
+
+fn inferred_fill_liquidity_side(order: &OrderAny) -> LiquiditySide {
+    match order.order_type() {
+        OrderType::Market
+        | OrderType::StopMarket
+        | OrderType::MarketToLimit
+        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
+        _ if order.is_post_only() => LiquiditySide::Maker,
+        _ => LiquiditySide::NoLiquiditySide,
+    }
+}
+
 /// Creates an inferred fill with a specific quantity.
 ///
 /// Unlike `create_incremental_inferred_fill`, this takes the fill quantity directly
@@ -1152,29 +1256,16 @@ pub fn create_inferred_fill_for_qty(
         return None;
     }
 
-    let liquidity_side = match order.order_type() {
-        OrderType::Market
-        | OrderType::StopMarket
-        | OrderType::MarketToLimit
-        | OrderType::TrailingStopMarket => LiquiditySide::Taker,
-        _ if order.is_post_only() => LiquiditySide::Maker,
-        _ => LiquiditySide::NoLiquiditySide,
-    };
-
-    let last_px = if let Some(avg_px) = report.avg_px {
-        Price::from_decimal_dp(avg_px, instrument.price_precision()).ok()?
-    } else if let Some(price) = report.price {
-        price
-    } else if let Some(price) = order.price() {
-        price
-    } else {
+    let Some((last_px, liquidity_side)) =
+        inferred_fill_price_and_liquidity(order, report, instrument)
+    else {
         log::warn!(
-            "Cannot determine fill price for {}: no avg_px or price available",
+            "Cannot determine fill price for {}: no avg_px, report price, or order price",
             order.client_order_id()
         );
+
         return None;
     };
-    let last_px = clamp_inferred_fill_price(last_px, instrument);
 
     let venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
     let position_id = reconciliation_position_id(report, instrument);
@@ -1278,6 +1369,7 @@ fn reconcile_fill_quantity_mismatch(
     report: &OrderStatusReport,
     instrument: Option<&InstrumentAny>,
     ts_now: UnixNanos,
+    commission: Option<Money>,
 ) -> Option<OrderEventAny> {
     let order_filled_qty = order.filled_qty();
     let report_filled_qty = report.filled_qty;
@@ -1346,7 +1438,7 @@ fn reconcile_fill_quantity_mismatch(
             &account_id,
             instrument,
             ts_now,
-            None,
+            commission,
         );
     }
 
@@ -1382,6 +1474,10 @@ fn reconcile_fill_quantity_mismatch(
 }
 
 /// Calculates the fill price for an incremental inferred fill.
+///
+/// The back-solve is guarded because nothing downstream rejects a negative price:
+/// [`Price`] admits negatives, [`clamp_inferred_fill_price`] caps only the upper bound,
+/// and `Position` takes `OrderFilled::last_px` straight into `avg_px_open` and PnL.
 fn calculate_incremental_fill_price(
     order: &OrderAny,
     report: &OrderStatusReport,
@@ -1396,50 +1492,93 @@ fn calculate_incremental_fill_price(
         order.client_order_id(),
     );
 
-    // First fill - use avg_px from report or order price
+    // First fill - nothing booked locally to difference against
     if order_filled_qty.is_zero() {
-        if let Some(avg_px) = report.avg_px {
-            return Price::from_decimal_dp(avg_px, instrument.price_precision()).ok();
+        let last_px = resolve_fill_price(order, report, instrument);
+        if last_px.is_none() {
+            log::warn!(
+                "Cannot determine fill price for {}: no avg_px, report price, or order price",
+                order.client_order_id()
+            );
         }
 
-        if let Some(price) = report.price {
-            return Some(price);
-        }
-
-        if let Some(price) = order.price() {
-            return Some(price);
-        }
-        log::warn!(
-            "Cannot determine fill price for {}: no avg_px, report price, or order price",
-            order.client_order_id()
-        );
-        return None;
+        return last_px;
     }
 
     // Incremental fill - calculate price using weighted average
     if let Some(report_avg_px) = report.avg_px {
-        let Some(order_avg_px) = order.avg_px() else {
-            // No previous avg_px, use report avg_px
-            return Price::from_decimal_dp(report_avg_px, instrument.price_precision()).ok();
+        let last_px_decimal = match order.avg_px() {
+            // No previous average to difference against
+            None => report_avg_px,
+            Some(order_avg_px) => {
+                let report_filled_qty = report.filled_qty;
+                let last_qty = report_filled_qty - order_filled_qty;
+
+                let report_notional = report_avg_px * report_filled_qty.as_decimal();
+                let order_notional = order_avg_px * order_filled_qty.as_decimal();
+                let last_notional = report_notional - order_notional;
+                let back_solved = last_notional / last_qty.as_decimal();
+
+                if back_solved < Decimal::ZERO && !instrument.allows_negative_price() {
+                    if report_avg_px < Decimal::ZERO {
+                        log::warn!(
+                            "Cannot price inferred fill for {}: back-solved {back_solved} and venue average {report_avg_px} are both negative on an instrument that disallows negative prices",
+                            order.client_order_id(),
+                        );
+
+                        return None;
+                    }
+
+                    log::warn!(
+                        "Negative back-solved fill price {back_solved} for {}, using venue average {report_avg_px}",
+                        order.client_order_id(),
+                    );
+
+                    report_avg_px
+                } else {
+                    back_solved
+                }
+            }
         };
-        let report_filled_qty = report.filled_qty;
-        let last_qty = report_filled_qty - order_filled_qty;
 
-        let report_notional = report_avg_px * report_filled_qty.as_decimal();
-        let order_notional = Decimal::from_str(&order_avg_px.to_string()).unwrap_or_default()
-            * order_filled_qty.as_decimal();
-        let last_notional = report_notional - order_notional;
-        let last_px_decimal = last_notional / last_qty.as_decimal();
-
-        return Price::from_decimal_dp(last_px_decimal, instrument.price_precision()).ok();
+        return Price::from_decimal_dp(last_px_decimal, instrument.price_precision())
+            .inspect_err(|e| {
+                log::warn!(
+                    "Cannot price {} from incremental {last_px_decimal}, falling back: {e}",
+                    order.client_order_id(),
+                );
+            })
+            .ok()
+            .or_else(|| resolve_fill_price(order, report, instrument));
     }
 
-    // Fallback to report price or order price
-    if let Some(price) = report.price {
-        return Some(price);
-    }
+    resolve_fill_price(order, report, instrument)
+}
 
-    order.price()
+/// Resolves a fill price from the venue report, falling back to the order.
+///
+/// Rungs run from most to least direct evidence of what executed. Callers decide what an
+/// unresolved price means: booking a fill at an invented price corrupts position averages,
+/// whereas a void event only needs a placeholder.
+fn resolve_fill_price(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    instrument: &InstrumentAny,
+) -> Option<Price> {
+    report
+        .avg_px
+        .and_then(|avg_px| {
+            Price::from_decimal_dp(avg_px, instrument.price_precision())
+                .inspect_err(|e| {
+                    log::warn!(
+                        "Cannot price {} from venue average {avg_px}, trying next source: {e}",
+                        order.client_order_id(),
+                    );
+                })
+                .ok()
+        })
+        .or(report.price)
+        .or_else(|| order.price())
 }
 
 /// Caps an inferred fill price at the instrument's maximum price.
